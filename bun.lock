@@ -359,6 +359,7 @@
         "@opencode/codemode": "workspace:*",
         "@opencode/plugin": "workspace:*",
         "@opencode/plugin-browser": "workspace:*",
+        "@opencode/plugin-nemo-relay": "workspace:*",
         "@opencode/schema": "workspace:*",
         "@opencode/util": "workspace:*",
         "@parcel/watcher": "2.5.1",
@@ -657,6 +658,22 @@
         "@opencode/plugin": "workspace:*",
         "@opencode/schema": "workspace:*",
         "effect": "catalog:",
+      },
+      "devDependencies": {
+        "@tsconfig/bun": "catalog:",
+        "@types/bun": "catalog:",
+        "@typescript/native-preview": "catalog:",
+        "typescript": "catalog:",
+      },
+    },
+    "packages/plugin-nemo-relay": {
+      "name": "@opencode/plugin-nemo-relay",
+      "version": "2.0.25",
+      "dependencies": {
+        "@opencode/plugin": "workspace:*",
+        "@opencode/schema": "workspace:*",
+        "effect": "catalog:",
+        "nemo-relay-node": "0.10.0-rc.4",
       },
       "devDependencies": {
         "@tsconfig/bun": "catalog:",
@@ -2236,6 +2253,8 @@
     "@opencode/plugin": ["@opencode/plugin@workspace:packages/plugin"],
 
     "@opencode/plugin-browser": ["@opencode/plugin-browser@workspace:packages/plugin-browser"],
+
+    "@opencode/plugin-nemo-relay": ["@opencode/plugin-nemo-relay@workspace:packages/plugin-nemo-relay"],
 
     "@opencode/posts": ["@opencode/posts@workspace:packages/posts"],
 
@@ -4822,6 +4841,22 @@
     "nanoid": ["nanoid@3.3.18", "", { "bin": { "nanoid": "bin/nanoid.cjs" } }, "sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w=="],
 
     "negotiator": ["negotiator@1.0.0", "", {}, "sha512-8Ofs/AUQh8MaEcrlq5xOX0CQ9ypTF5dl78mjlMNfOK08fzpgTHQRQPBxcPlEtIw0yRpws+Zo/3r+5WRby7u3Gg=="],
+
+    "nemo-relay-node": ["nemo-relay-node@0.10.0-rc.4", "", { "optionalDependencies": { "nemo-relay-node-darwin-arm64": "0.10.0-rc.4", "nemo-relay-node-linux-arm64-gnu": "0.10.0-rc.4", "nemo-relay-node-linux-arm64-musl": "0.10.0-rc.4", "nemo-relay-node-linux-x64-gnu": "0.10.0-rc.4", "nemo-relay-node-linux-x64-musl": "0.10.0-rc.4", "nemo-relay-node-win32-arm64-msvc": "0.10.0-rc.4", "nemo-relay-node-win32-x64-msvc": "0.10.0-rc.4" } }, "sha512-smrWI5wzLm2zrSAl/g2cJC3Ucpem54nsZqmpmrtyshUMqPVt2pMItREOjont4vabIofeEqziweYAy5TyF5I54Q=="],
+
+    "nemo-relay-node-darwin-arm64": ["nemo-relay-node-darwin-arm64@0.10.0-rc.4", "", { "os": "darwin", "cpu": "arm64" }, "sha512-d13v4gyxp8oWHwWtCKvVy9biX8Gjd8WywhbNfcGLvZdJ6MS7BDOh8TiHeSXnFT67o+92qgp3HwVxFDroccFV+Q=="],
+
+    "nemo-relay-node-linux-arm64-gnu": ["nemo-relay-node-linux-arm64-gnu@0.10.0-rc.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-D9RVytBS9Rm00U+sHSxzVPcPsuf5Ku+3hec2D8W+0GRQ6Am/CnC+WwyF3r5MozvcDdfDywXYmU9l0n4a5Aw+Sw=="],
+
+    "nemo-relay-node-linux-arm64-musl": ["nemo-relay-node-linux-arm64-musl@0.10.0-rc.4", "", { "os": "linux", "cpu": "arm64" }, "sha512-h9AGG2/4OnXB1/sE69LRpKcYYhVl9kh0iLfJJbej0Ox9buqIQzM0ZlRjtaxCWE07bczoUW3NtAU+q349lD1w7w=="],
+
+    "nemo-relay-node-linux-x64-gnu": ["nemo-relay-node-linux-x64-gnu@0.10.0-rc.4", "", { "os": "linux", "cpu": "x64" }, "sha512-jzhTpCMHc6RC2kg7i9jEdiwBZo8Z+bpXG4vuOQQK3aE81CxM87AgVI3Z2BD/SS6ji1Sod46htOtb4bI2iPxTbw=="],
+
+    "nemo-relay-node-linux-x64-musl": ["nemo-relay-node-linux-x64-musl@0.10.0-rc.4", "", { "os": "linux", "cpu": "x64" }, "sha512-hFJQqNZclZFAAtlib7Vupdg+by5VALyE4LK0sjKVyNGR+JXmMeLtKkDI1bGlC+GLTNFznhT4BEsJqLqy/ternQ=="],
+
+    "nemo-relay-node-win32-arm64-msvc": ["nemo-relay-node-win32-arm64-msvc@0.10.0-rc.4", "", { "os": "win32", "cpu": "arm64" }, "sha512-kPYDQrX5JtQSe3sAJqiJBLRHsryoSqc+GzfSSIqPbQC5OcOFAm0CjOLqThHu1vjzqoI4x1bcZMbz9uLHnkx9cw=="],
+
+    "nemo-relay-node-win32-x64-msvc": ["nemo-relay-node-win32-x64-msvc@0.10.0-rc.4", "", { "os": "win32", "cpu": "x64" }, "sha512-QQlA9VZpDkkioRf8Z4cH67R/C9Xr+u2tH8zVLrVFTrH9stu2pBVHV13eYzWJ12Ztk/xr6RajeMHkJ4Oto0YSjA=="],
 
     "neotraverse": ["neotraverse@1.0.1", "", {}, "sha512-WmmLty1YWwJl9yZi77v2dVIV6X2kuYV8YYBI/G3LWGKdGHmHUvL1z7FW0iDvEvGAwNEoc5x1tOOOyDnf5jJw/w=="],
 

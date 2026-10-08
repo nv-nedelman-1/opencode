@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@opencode/plugin-nemo-relay",
+  "version": "2.0.25",
+  "description": "NVIDIA NeMo Relay integration for OpenCode",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anomalyco/opencode.git",
+    "directory": "packages/plugin-nemo-relay"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "imports": {
+    "#binding": {
+      "workerd": "./src/binding.workerd.ts",
+      "default": "./src/binding.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsgo --noEmit -p tsconfig.test.json",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "workspace:*",
+    "@opencode/schema": "workspace:*",
+    "effect": "catalog:",
+    "nemo-relay-node": "0.10.0-rc.4"
+  },
+  "devDependencies": {
+    "@tsconfig/bun": "catalog:",
+    "@types/bun": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "typescript": "catalog:"
+  }
+}
