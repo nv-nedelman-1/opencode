@@ -76,6 +76,7 @@ const run = Effect.fnUntraced(function* (events: ReadonlyArray<SessionEvent.Agen
           }
           return Effect.succeed({ dispose: Effect.void })
         },
+        middleware: () => Effect.die("unused tool.middleware"),
       },
       event: {
         subscribe: () => Stream.fromIterable(events),

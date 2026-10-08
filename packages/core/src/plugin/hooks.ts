@@ -1,9 +1,9 @@
 export * as PluginHooks from "./hooks.js"
 
 import type { AISDKHooks } from "@opencode/plugin/effect/aisdk"
-import type { SessionHooks } from "@opencode/plugin/effect/session"
+import type { SessionHooks, SessionMiddlewares } from "@opencode/plugin/effect/session"
 import type { ShellHooks } from "@opencode/plugin/effect/shell"
-import type { ToolFailures, ToolHooks } from "@opencode/plugin/effect/tool"
+import type { ToolFailures, ToolHooks, ToolMiddlewares } from "@opencode/plugin/effect/tool"
 import type { ModelHookOptions } from "@opencode/plugin/effect/registration"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
 import { Context, Effect, Layer, Scope } from "effect"
@@ -18,6 +18,11 @@ export interface Domains {
   readonly tool: ToolHooks
 }
 
+export interface Middlewares {
+  readonly session: SessionMiddlewares
+  readonly tool: ToolMiddlewares
+}
+
 type NoFailures<Spec> = { readonly [Name in keyof Spec]: never }
 
 // Failure channel for each hook event. Only tool execute.before may fail: a Tool.Error rejects the call before it runs.
@@ -30,7 +35,7 @@ interface Failures extends Record<keyof Domains, unknown> {
 }
 
 type Callback<Event, Error> = (event: Event) => Effect.Effect<void, Error>
-type Entry = { readonly callback: Function; readonly options?: ModelHookOptions }
+type Entry<Callback = Function> = { readonly callback: Callback; readonly options?: ModelHookOptions }
 
 const eventProviderID = (event: unknown) => {
   if (typeof event !== "object" || event === null || !("model" in event)) return undefined
@@ -56,6 +61,18 @@ export interface Interface {
     name: Name,
     event: Domains[Domain][Name],
   ) => Effect.Effect<Domains[Domain][Name], Failures[Domain][Name]>
+  readonly use: <Domain extends keyof Middlewares, Name extends keyof Middlewares[Domain]>(
+    domain: Domain,
+    name: Name,
+    middleware: Middlewares[Domain][Name],
+    options?: ModelHookOptions,
+  ) => Effect.Effect<State.Registration, never, Scope.Scope>
+  /** Middlewares in registration order, limited to those that apply to `providerID`. */
+  readonly middlewares: <Domain extends keyof Middlewares, Name extends keyof Middlewares[Domain]>(
+    domain: Domain,
+    name: Name,
+    providerID?: string,
+  ) => Effect.Effect<ReadonlyArray<Middlewares[Domain][Name]>>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/PluginHooks") {}
@@ -64,26 +81,45 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const callbacks = new Map<string, Entry[]>()
-    const key = (domain: keyof Domains, name: PropertyKey) => `${domain}.${String(name)}`
+    const wrappers = new Map<string, Entry<unknown>[]>()
+    const key = (domain: keyof Domains | keyof Middlewares, name: PropertyKey) => `${domain}.${String(name)}`
 
-    const register: Interface["register"] = Effect.fn("PluginHooks.register")(
-      function* (domain, name, callback, options) {
-        const scope = yield* Scope.Scope
-        const id = key(domain, name)
-        let active = true
-        const entry = { callback, options }
-        callbacks.set(id, [...(callbacks.get(id) ?? []), entry])
-        const dispose = Effect.sync(() => {
-          if (!active) return
-          active = false
-          const next = (callbacks.get(id) ?? []).filter((item) => item !== entry)
-          if (next.length === 0) callbacks.delete(id)
-          else callbacks.set(id, next)
-        })
-        yield* Scope.addFinalizer(scope, dispose)
-        return { dispose }
-      },
-    )
+    const add = Effect.fn("PluginHooks.add")(function* <T>(entries: Map<string, T[]>, id: string, entry: T) {
+      const scope = yield* Scope.Scope
+      let active = true
+      entries.set(id, [...(entries.get(id) ?? []), entry])
+      const dispose = Effect.sync(() => {
+        if (!active) return
+        active = false
+        const next = (entries.get(id) ?? []).filter((item) => item !== entry)
+        if (next.length === 0) entries.delete(id)
+        else entries.set(id, next)
+      })
+      yield* Scope.addFinalizer(scope, dispose)
+      return { dispose }
+    })
+
+    const register: Interface["register"] = (domain, name, callback, options) =>
+      add(callbacks, key(domain, name), { callback, options })
+
+    const use: Interface["use"] = (domain, name, middleware, options) =>
+      add(wrappers, key(domain, name), { callback: middleware, options })
+
+    const middlewares: Interface["middlewares"] = <
+      Domain extends keyof Middlewares,
+      Name extends keyof Middlewares[Domain],
+    >(
+      domain: Domain,
+      name: Name,
+      providerID?: string,
+    ) =>
+      Effect.sync(() =>
+        (wrappers.get(key(domain, name)) ?? []).flatMap((entry) =>
+          entry.options?.providerID === undefined || entry.options.providerID === providerID
+            ? [entry.callback as Middlewares[Domain][Name]]
+            : [],
+        ),
+      )
 
     const trigger: Interface["trigger"] = Effect.fnUntraced(function* (domain, name, event) {
       for (const entry of callbacks.get(key(domain, name)) ?? []) {
@@ -101,7 +137,7 @@ const layer = Layer.effect(
         ),
       )
 
-    return Service.of({ has, register, trigger })
+    return Service.of({ has, register, trigger, use, middlewares })
   }),
 )
 

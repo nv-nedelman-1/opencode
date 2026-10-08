@@ -337,32 +337,46 @@ export const layer = Layer.effect(
       const hasHttpHooks =
         (yield* hooks.has("session", "http.request", model.ref.providerID)) ||
         (yield* hooks.has("session", "http.response", model.ref.providerID))
-      const http: StreamOptions["http"] = hasHttpHooks
-        ? (req, handler) =>
-            Effect.gen(function* () {
-              const before = yield* hooks.trigger("session", "http.request", {
-                ...scope,
-                request: yield* HttpClientRequest.toWeb(req),
-              })
-              let sent = HttpClientRequest.fromWeb(before.request)
-              if (before.request.body)
-                sent = HttpClientRequest.bodyUint8Array(
-                  sent,
-                  new Uint8Array(yield* Effect.promise(() => before.request.clone().arrayBuffer())),
-                  before.request.headers.get("content-type") ?? undefined,
-                )
-              const res = yield* handler(sent)
-              const after = yield* hooks.trigger("session", "http.response", {
-                ...scope,
-                request: before.request,
-                response: new Response(
-                  [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
-                  { status: res.status, headers: res.headers },
-                ),
-              })
-              return HttpClientResponse.fromWeb(sent, after.response)
-            }).pipe(Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))))
-        : undefined
+      const middlewares = yield* hooks.middlewares("session", "http", model.ref.providerID)
+      const call = { ...scope, protocol: request.model.route.protocol }
+      const http: StreamOptions["http"] =
+        hasHttpHooks || middlewares.length > 0
+          ? (req, handler) =>
+              Effect.gen(function* () {
+                const before = yield* hooks.trigger("session", "http.request", {
+                  ...scope,
+                  request: yield* HttpClientRequest.toWeb(req),
+                })
+                // A middleware may answer without sending, so the response belongs to the last request sent, if any.
+                let sent = req
+                const send = (input: Request) =>
+                  Effect.gen(function* () {
+                    sent = input.body
+                      ? HttpClientRequest.bodyUint8Array(
+                          HttpClientRequest.fromWeb(input),
+                          new Uint8Array(yield* Effect.promise(() => input.clone().arrayBuffer())),
+                          input.headers.get("content-type") ?? undefined,
+                        )
+                      : HttpClientRequest.fromWeb(input)
+                    const res = yield* handler(sent)
+                    return new Response(
+                      [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
+                      { status: res.status, headers: res.headers },
+                    )
+                  })
+                const response = yield* middlewares.reduceRight(
+                  (next: (input: Request) => Effect.Effect<Response, Error>, middleware) => (input: Request) =>
+                    middleware({ ...call, request: input }, next),
+                  send,
+                )(before.request)
+                const after = yield* hooks.trigger("session", "http.response", {
+                  ...scope,
+                  request: before.request,
+                  response,
+                })
+                return HttpClientResponse.fromWeb(sent, after.response)
+              }).pipe(Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))))
+          : undefined
       // HTTP hooks wrap every HTTP request, including the WebSocket fallback path. The route decides
       // which transport actually carries the request, so both hook families are always offered.
       const webSocket =

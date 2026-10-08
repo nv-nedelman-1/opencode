@@ -116,7 +116,20 @@ const layer = Layer.effect(
       input: unknown,
       context: Tool.Context,
     ) {
-      const execution = yield* execute(tool, input, context).pipe(
+      const middlewares = yield* hooks.middlewares("tool", "execute")
+      const call = {
+        tool: name,
+        sessionID: context.sessionID,
+        agent: context.agent,
+        messageID: context.messageID,
+        id: context.id,
+      }
+      const run = middlewares.reduceRight(
+        (next: (input: unknown) => Effect.Effect<Tool.Result, Tool.Error>, middleware) => (input: unknown) =>
+          middleware({ ...call, input }, next),
+        (input: unknown): Effect.Effect<Tool.Result, Tool.Error> => execute(tool, input, context),
+      )
+      const execution = yield* run(input).pipe(
         Effect.map((value) => ({ value })),
         Effect.catchTag("Tool.Error", (failure) => Effect.succeed({ failure })),
       )
