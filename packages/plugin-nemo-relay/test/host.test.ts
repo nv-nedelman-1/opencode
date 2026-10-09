@@ -150,6 +150,30 @@ test("parent close waits for child close and its final lease; release is idempot
   }
 })
 
+test("host marks emit parented metric instruments once per admitted event", async () => {
+  const native = await fixture()
+  try {
+    const session = id("metrics")
+    const parent = native.runtime.open(session)
+    for (const _ of [0, 1])
+      native.runtime.mark(
+        session,
+        "opencode.agent.run.completed",
+        { count: 1, outcome: "success", duration_ms: 25 },
+        { "opencode.event_id": "metric-event" },
+        123_000,
+      )
+    await native.relay.flushSubscribers()
+    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed")).toHaveLength(1)
+    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
+      expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
+    ])
+    native.runtime.close(session, "success")
+  } finally {
+    await native.dispose()
+  }
+})
+
 test("shutdown cancels and drains live work once, closes scopes, then rejects new leases", async () => {
   const native = await fixture()
   try {

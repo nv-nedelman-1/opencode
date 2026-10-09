@@ -8,6 +8,7 @@ import type { PluginConfig, PluginHostActivation } from "nemo-relay-node/plugin"
 import { access } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { RelayMetrics } from "./metrics.js"
 
 export type Relay = Awaited<ReturnType<typeof RelayBinding.load>>[0]
 export type Outcome = "success" | "failed" | "cancelled"
@@ -265,9 +266,12 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
       if (marks.size > 1024) marks.delete(marks.values().next().value!)
     }
     const entry = sessionID === undefined ? undefined : sessions.get(sessionID)
-    relay.withScopeStack(entry?.stack ?? neutral, () =>
-      relay.event(name, entry?.handle ?? null, json(data), json(metadata), timestamp),
-    )
+    const measurements = RelayMetrics.measurements(name, data)
+    relay.withScopeStack(entry?.stack ?? neutral, () => {
+      relay.event(name, entry?.handle ?? null, json(data), json(metadata), timestamp)
+      if (measurements.length > 0)
+        relay.metric(`${name}.metrics`, measurements, entry?.handle ?? null, json(metadata), timestamp)
+    })
   }
 
   const finalize = Effect.gen(function* () {
