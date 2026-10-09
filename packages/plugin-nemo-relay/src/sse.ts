@@ -113,6 +113,68 @@ export const aggregate = (protocol: string, chunks: ReadonlyArray<unknown>): unk
 const list = (value: unknown) => (Array.isArray(value) ? value.filter(RelayHost.isRecord) : [])
 const text = (value: unknown) => (typeof value === "string" ? value : "")
 
+/** Provider output, not role frames, accounting, signatures, or stream lifecycle events. */
+export const outputKind = (protocol: string, chunk: unknown): "text" | "reasoning" | "tool" | undefined => {
+  if (!RelayHost.isRecord(chunk)) return
+  if (protocol === "openai-chat" || protocol === "openai-compatible-chat") {
+    for (const choice of list(chunk.choices)) {
+      const delta = RelayHost.isRecord(choice.delta)
+        ? choice.delta
+        : RelayHost.isRecord(choice.message)
+          ? choice.message
+          : {}
+      if (text(delta.reasoning_content) || text(delta.reasoning)) return "reasoning"
+      if (text(delta.content)) return "text"
+      if (
+        list(delta.tool_calls).some(
+          (call) => RelayHost.isRecord(call.function) && (text(call.function.name) || text(call.function.arguments)),
+        )
+      )
+        return "tool"
+    }
+  }
+  if (protocol === "anthropic-messages") {
+    const delta = chunk.type === "content_block_delta" && RelayHost.isRecord(chunk.delta) ? chunk.delta : {}
+    const block =
+      chunk.type === "content_block_start" && RelayHost.isRecord(chunk.content_block) ? chunk.content_block : {}
+    if (text(delta.text) || (block.type === "text" && text(block.text))) return "text"
+    if (text(delta.thinking) || (block.type === "thinking" && text(block.thinking))) return "reasoning"
+    if (text(delta.partial_json) || (block.type === "tool_use" && text(block.name))) return "tool"
+    for (const block of list(chunk.content)) {
+      if (block.type === "text" && text(block.text)) return "text"
+      if (block.type === "thinking" && text(block.thinking)) return "reasoning"
+      if (block.type === "tool_use" && text(block.name)) return "tool"
+    }
+  }
+  if (RESPONSES.has(protocol)) {
+    if (chunk.type === "response.output_text.delta" && text(chunk.delta)) return "text"
+    if (
+      ["response.reasoning_text.delta", "response.reasoning_summary_text.delta"].includes(text(chunk.type)) &&
+      text(chunk.delta)
+    )
+      return "reasoning"
+    const item = RelayHost.isRecord(chunk.item) ? chunk.item : {}
+    if (
+      (chunk.type === "response.function_call_arguments.delta" && text(chunk.delta)) ||
+      (chunk.type === "response.output_item.added" && item.type === "function_call" && text(item.name))
+    )
+      return "tool"
+    for (const item of list(chunk.output)) {
+      if (item.type === "function_call" && text(item.name)) return "tool"
+      if (list(item.content).some((part) => part.type === "output_text" && text(part.text))) return "text"
+      if (item.type === "reasoning" && list(item.summary).some((part) => text(part.text))) return "reasoning"
+    }
+  }
+  if (protocol === "gemini") {
+    const content = list(chunk.candidates)[0]?.content
+    if (!RelayHost.isRecord(content)) return
+    for (const part of list(content.parts)) {
+      if (text(part.text)) return part.thought === true ? "reasoning" : "text"
+      if (RelayHost.isRecord(part.functionCall) && text(part.functionCall.name)) return "tool"
+    }
+  }
+}
+
 const chat = () => {
   const metadata: Record<string, unknown> = {}
   const choices = new Map<

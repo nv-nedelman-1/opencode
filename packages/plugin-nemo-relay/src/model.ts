@@ -5,6 +5,7 @@ import type { Session } from "@opencode/schema/session"
 import { Cause, Effect, Exit } from "effect"
 import type { LlmStream, ScopeHandle } from "nemo-relay-node"
 import { RelayHost } from "./host.js"
+import { RelayMetrics } from "./metrics.js"
 import { RelaySSE } from "./sse.js"
 
 type Next = Parameters<SessionMiddlewares["http"]>[1]
@@ -144,55 +145,73 @@ const stream = (managed: Managed) =>
 
     const produce = async (producer: Producer) => {
       const id = producer.__nemo_relay_stream_id
-      const exit = await run(managed.send(producer.__nemo_relay_native), { signal: abort.signal })
-      if (Exit.isFailure(exit)) {
-        upstream.resolve({ type: "failed", cause: exit.cause })
-        return fail(relay, id, "provider request failed")
-      }
-      if (!exit.value.ok || !exit.value.body) {
-        const text = await run(
-          Effect.tryPromise({
-            try: () => exit.value.text(),
-            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-          }),
-          { signal: abort.signal },
-        )
-        if (Exit.isFailure(text)) {
-          upstream.resolve({ type: "failed", cause: text.cause })
-          return fail(relay, id, "provider response body failed")
+      const attempt = new ProviderAttempt(managed, true)
+      try {
+        const exit = await run(managed.send(producer.__nemo_relay_native), { signal: abort.signal })
+        if (Exit.isFailure(exit)) {
+          attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
+          upstream.resolve({ type: "failed", cause: exit.cause })
+          return fail(relay, id, "provider request failed")
         }
-        upstream.resolve({ type: "response", response: exit.value, body: text.value })
-        return fail(relay, id, `provider returned HTTP ${exit.value.status}`)
+        attempt.headers(exit.value.status)
+        if (!exit.value.ok || !exit.value.body) {
+          const text = await run(
+            Effect.tryPromise({
+              try: () => exit.value.text(),
+              catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+            }),
+            { signal: abort.signal },
+          )
+          if (Exit.isFailure(text)) {
+            attempt.finish(Cause.hasInterrupts(text.cause) ? "cancelled" : "failed", "body")
+            upstream.resolve({ type: "failed", cause: text.cause })
+            return fail(relay, id, "provider response body failed")
+          }
+          attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
+          upstream.resolve({ type: "response", response: exit.value, body: text.value })
+          return fail(relay, id, `provider returned HTTP ${exit.value.status}`)
+        }
+        upstream.resolve({ type: "stream", response: exit.value })
+        const failure = await RelaySSE.read(
+          exit.value.body,
+          async (event) => {
+            source.named ||= event.event !== undefined
+            // Match the host's SSE framing; a JSON null is also Relay's consumer EOF sentinel.
+            if (event.data === "" || event.data === "null" || event.data === ": keepalive") return true
+            if (event.data === "[DONE]") {
+              source.done = true
+              return false
+            }
+            const chunk = RelayHost.parse(event.data)
+            if (chunk === undefined) {
+              source.invalid = event
+              throw new Error("Provider returned invalid JSON SSE data")
+            }
+            attempt.output(chunk)
+            aggregate.push(chunk)
+            return await push(id, chunk)
+          },
+          abort.signal,
+        ).then(
+          () => undefined,
+          (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+        )
+        // The pushed producer must settle before native close can finish; cancellation is not a successful EOF.
+        if (abort.signal.aborted) {
+          attempt.finish("cancelled", "cancelled")
+          return fail(relay, id, "Provider request was aborted", "AbortError")
+        }
+        if (failure === undefined) {
+          attempt.finish("success")
+          return relay.endStream(id)
+        }
+        attempt.finish("failed", source.invalid ? "protocol" : "body")
+        source.failure = failure
+        fail(relay, id, failure.message)
+      } catch (error) {
+        attempt.finish(abort.signal.aborted ? "cancelled" : "failed", "body")
+        throw error
       }
-      upstream.resolve({ type: "stream", response: exit.value })
-      const failure = await RelaySSE.read(
-        exit.value.body,
-        async (event) => {
-          source.named ||= event.event !== undefined
-          // Match the host's SSE framing; a JSON null is also Relay's consumer EOF sentinel.
-          if (event.data === "" || event.data === "null" || event.data === ": keepalive") return true
-          if (event.data === "[DONE]") {
-            source.done = true
-            return false
-          }
-          const chunk = RelayHost.parse(event.data)
-          if (chunk === undefined) {
-            source.invalid = event
-            throw new Error("Provider returned invalid JSON SSE data")
-          }
-          aggregate.push(chunk)
-          return await push(id, chunk)
-        },
-        abort.signal,
-      ).then(
-        () => undefined,
-        (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
-      )
-      // The pushed producer must settle before native close can finish; cancellation is not a successful EOF.
-      if (abort.signal.aborted) return fail(relay, id, "Provider request was aborted", "AbortError")
-      if (failure === undefined) return relay.endStream(id)
-      source.failure = failure
-      fail(relay, id, failure.message)
     }
 
     const opened = yield* Effect.tryPromise({
@@ -319,6 +338,7 @@ const unary = (managed: Managed) =>
     const abort = new AbortController()
     managed.operation.onCancel(() => abort.abort())
     const captured: {
+      pending?: Promise<unknown>
       called?: boolean
       failure?: Cause.Cause<Error>
       response?: {
@@ -330,7 +350,7 @@ const unary = (managed: Managed) =>
     } = {}
     const executed = yield* Effect.tryPromise({
       try: (signal) =>
-        managed.operation.run(() =>
+        (captured.pending = managed.operation.run(() =>
           withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
             relay.llmCallExecuteAsync(
               managed.call.model.providerID,
@@ -339,11 +359,14 @@ const unary = (managed: Managed) =>
                 if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
                 captured.called = true
                 const requestSignal = AbortSignal.any([signal, abort.signal, managed.call.request.signal])
+                const attempt = new ProviderAttempt(managed, false)
                 const exit = await run(managed.send(intercepted), { signal: requestSignal })
                 if (Exit.isFailure(exit)) {
+                  attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
                   captured.failure = exit.cause
                   throw new Error("provider request failed")
                 }
+                attempt.headers(exit.value.status)
                 const body = await run(
                   Effect.tryPromise({
                     try: () => exit.value.text(),
@@ -352,6 +375,7 @@ const unary = (managed: Managed) =>
                   { signal: requestSignal },
                 )
                 if (Exit.isFailure(body)) {
+                  attempt.finish(Cause.hasInterrupts(body.cause) ? "cancelled" : "failed", "body")
                   captured.failure = body.cause
                   throw new Error("provider response body failed")
                 }
@@ -362,8 +386,11 @@ const unary = (managed: Managed) =>
                   headers: exit.value.headers,
                   text,
                 }
+                const response = RelayHost.parse(text) ?? text
+                if (exit.value.ok) attempt.output(response)
+                attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
                 if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
-                return RelayHost.parse(text) ?? text
+                return response
               },
               managed.parent,
               0,
@@ -373,9 +400,20 @@ const unary = (managed: Managed) =>
               ...codecs,
             ),
           ),
-        ),
+        )),
       catch: (error) => error,
-    }).pipe(Effect.exit)
+    }).pipe(
+      Effect.onExit((exit) =>
+        Exit.isFailure(exit)
+          ? Effect.promise(async () => {
+              abort.abort()
+              // Interruption stops waiting for tryPromise, not the native managed call or its intercept tail.
+              await captured.pending?.catch(() => undefined)
+            })
+          : Effect.void,
+      ),
+      Effect.exit,
+    )
     if (
       captured.failure &&
       (Exit.isFailure(executed) || Cause.hasDies(captured.failure) || Cause.hasInterrupts(captured.failure))
@@ -454,11 +492,74 @@ const bodyHeaders = (source: Headers) => {
 }
 
 const metadata = (call: SessionHttpCall) => ({
+  provider_name: call.model.providerID,
   "opencode.session_id": call.sessionID,
   "opencode.agent": call.agent,
   "opencode.request_kind": call.kind,
   "opencode.protocol": call.protocol,
 })
+
+// These observations own only physical provider I/O; the host decides whether and when to retry it.
+class ProviderAttempt {
+  private readonly started = performance.now()
+  private readonly attributes
+  private completed = false
+  private emittedOutput = false
+
+  constructor(
+    private readonly managed: Managed,
+    streaming: boolean,
+  ) {
+    this.attributes = {
+      ...RelayMetrics.route(managed.call.model, managed.call.protocol),
+      call_role: managed.call.kind,
+      streaming,
+    }
+    this.mark("started", { count: 1 })
+  }
+
+  headers(status: number) {
+    this.mark("headers", {
+      count: 1,
+      duration_ms: performance.now() - this.started,
+      http_status_class: status >= 200 && status < 600 ? `${Math.floor(status / 100)}xx` : "other",
+    })
+  }
+
+  output(chunk: unknown) {
+    if (this.emittedOutput || this.completed) return
+    const output_kind = RelaySSE.outputKind(this.managed.call.protocol, chunk)
+    if (output_kind === undefined) return
+    this.emittedOutput = true
+    this.managed.runtime.mark(this.managed.call.sessionID, "opencode.llm.first_output", {
+      ...this.attributes,
+      count: 1,
+      duration_ms: performance.now() - this.started,
+      output_kind,
+    })
+  }
+
+  finish(
+    outcome: "success" | "failed" | "cancelled",
+    error_category?: "http" | "transport" | "body" | "protocol" | "cancelled",
+  ) {
+    if (this.completed) return
+    this.completed = true
+    this.mark("completed", {
+      count: 1,
+      duration_ms: performance.now() - this.started,
+      outcome,
+      ...(outcome === "success" ? {} : { error_category: outcome === "cancelled" ? "cancelled" : error_category }),
+    })
+  }
+
+  private mark(name: string, data: Record<string, unknown>) {
+    this.managed.runtime.mark(this.managed.call.sessionID, `opencode.llm.provider_attempt.${name}`, {
+      ...this.attributes,
+      ...data,
+    })
+  }
+}
 
 // Older bindings cannot fail a pushed stream; ending it keeps the partial output and the consumer still errors.
 const fail = (relay: RelayHost.Relay, id: number, message: string, exceptionType?: string) => {

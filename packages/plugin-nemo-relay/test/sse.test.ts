@@ -303,3 +303,39 @@ describe("RelaySSE.accumulator", () => {
     expect(unknown.value()).toEqual({ id: "last" })
   })
 })
+
+describe("RelaySSE.outputKind", () => {
+  test.each([
+    ["openai-chat", { choices: [{ delta: { role: "assistant", content: "" } }] }, undefined],
+    ["openai-chat", { choices: [], usage: { total_tokens: 2 } }, undefined],
+    ["openai-chat", { choices: [{ delta: { content: "Hi" } }] }, "text"],
+    ["openai-compatible-chat", { choices: [{ delta: { reasoning_content: "Think" } }] }, "reasoning"],
+    ["openai-chat", { choices: [{ delta: { tool_calls: [{ id: "tc" }] } }] }, undefined],
+    ["openai-chat", { choices: [{ delta: { tool_calls: [{ function: { name: "read" } }] } }] }, "tool"],
+    ["anthropic-messages", { type: "content_block_start", content_block: { type: "text", text: "" } }, undefined],
+    ["anthropic-messages", { type: "content_block_delta", delta: { type: "text_delta", text: "Hi" } }, "text"],
+    [
+      "anthropic-messages",
+      { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "Think" } },
+      "reasoning",
+    ],
+    [
+      "anthropic-messages",
+      { type: "content_block_delta", delta: { type: "signature_delta", signature: "sig" } },
+      undefined,
+    ],
+    ["anthropic-messages", { type: "content_block_start", content_block: { type: "tool_use", name: "read" } }, "tool"],
+    ["anthropic-messages", { content: [{ type: "text", text: "Hi" }] }, "text"],
+    ["openai-responses", { type: "response.created", response: { id: "r" } }, undefined],
+    ["openai-compatible-responses", { type: "response.output_text.delta", delta: "Hi" }, "text"],
+    ["openai-responses", { output: [{ type: "message", content: [{ type: "output_text", text: "Hi" }] }] }, "text"],
+    ["xai-responses", { type: "response.reasoning_text.delta", delta: "Think" }, "reasoning"],
+    ["open-responses", { type: "response.function_call_arguments.delta", delta: "{}" }, "tool"],
+    ["gemini", { candidates: [{ content: { parts: [{ text: "Hi" }] } }] }, "text"],
+    ["gemini", { candidates: [{ content: { parts: [{ text: "Think", thought: true }] } }] }, "reasoning"],
+    ["gemini", { candidates: [{ content: { parts: [{ functionCall: { name: "read" } }] } }] }, "tool"],
+    ["future-protocol", { choices: [{ delta: { content: "not a known protocol" } }] }, undefined],
+  ] as const)("classifies %s %j without lifecycle/usage false positives", (protocol, chunk, expected) => {
+    expect(RelaySSE.outputKind(protocol, chunk)).toBe(expected)
+  })
+})
