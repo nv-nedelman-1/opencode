@@ -36,6 +36,9 @@ export default Plugin.define({
       yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
       const observed = RelayObserve.make(runtime)
       yield* ctx.session.hook("context", (event) => observe(observed.context(event)))
+      yield* ctx.session.hook("compaction", (event) => observe(observed.context(event, "compaction")))
+      yield* ctx.session.hook("generate", (event) => observe(observed.context(event, "generate")))
+      yield* ctx.session.hook("title", (event) => observe(observed.context(event, "title")))
       yield* ctx.event.subscribe().pipe(
         Stream.filter(EventManifest.isServer),
         Stream.runForEach((event) => observe(observed.event(event))),

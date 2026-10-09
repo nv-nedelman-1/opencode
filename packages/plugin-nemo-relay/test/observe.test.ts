@@ -2,13 +2,17 @@ import { expect, test } from "bun:test"
 import type { SessionContext } from "@opencode/plugin/effect/session"
 import { Agent } from "@opencode/schema/agent"
 import { Event } from "@opencode/schema/event"
+import { Form } from "@opencode/schema/form"
+import { McpEvent } from "@opencode/schema/mcp-event"
 import { Model } from "@opencode/schema/model"
 import { Money } from "@opencode/schema/money"
 import { Provider } from "@opencode/schema/provider"
+import { Permission } from "@opencode/schema/permission"
 import { RelativePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import { SessionEvent } from "@opencode/schema/session-event"
 import { SessionMessage } from "@opencode/schema/session-message"
+import { Skill } from "@opencode/schema/skill"
 import { Effect, Schema } from "effect"
 import type { ScopeHandle } from "nemo-relay-node"
 import { RelayHost } from "../src/host"
@@ -35,11 +39,16 @@ const published = <D extends Event.Definition>(
       : {}),
   }) as Event.Payload<D>
 
-const makeFixture = () => {
+const makeFixture = (seen = new Set<string>()) => {
   const marks: Parameters<RelayHost.Runtime["mark"]>[] = []
   const opened: Parameters<RelayHost.Runtime["open"]>[] = []
   const closed: Parameters<RelayHost.Runtime["close"]>[] = []
   const observer = RelayObserve.make({
+    admit: (id) => {
+      if (seen.has(id)) return false
+      seen.add(id)
+      return true
+    },
     open: (...args) => {
       opened.push(args)
       return {} as ScopeHandle
@@ -171,5 +180,82 @@ test("context observations count structure, not request content or invented toke
     system_character_count: 6,
     tool_count: 1,
   })
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("shared event admission prevents a second Location observer reopening or closing the same execution", () => {
+  const seen = new Set<string>()
+  const first = makeFixture(seen)
+  const second = makeFixture(seen)
+  const started = published(SessionEvent.Execution.Started, { sessionID }, 100)
+  const ended = published(SessionEvent.Execution.Succeeded, { sessionID }, 200)
+  ;[started, ended].forEach((event) => Effect.runSync(first.observer.event(event)))
+  ;[started, ended].forEach((event) => Effect.runSync(second.observer.event(event)))
+
+  expect(first.opened).toHaveLength(1)
+  expect(first.closed).toHaveLength(1)
+  expect(second.opened).toEqual([])
+  expect(second.closed).toEqual([])
+  expect(second.marks).toEqual([])
+})
+
+test("skill requests and successful loads are distinct from user activation and never export skill content", () => {
+  const fixture = makeFixture()
+  ;[
+    published(
+      SessionEvent.Skill.Activated,
+      { sessionID, id: Skill.ID.make("SECRET"), name: Skill.Name.make("SECRET"), text: "SECRET" },
+      100,
+    ),
+    published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "call1", name: "skill" }, 110),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "unrelated", content: [{ type: "text", text: "SECRET" }], executed: false },
+      120,
+    ),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "call1", content: [{ type: "text", text: "SECRET" }], executed: false },
+      130,
+    ),
+    published(Skill.Event.Updated, {}, 140),
+    published(McpEvent.StatusChanged, { server: "SECRET" }, 150),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  expect(fixture.marks.map((mark) => [mark[1], mark[2]])).toEqual([
+    ["opencode.skill.activated", { count: 1, source: "user", character_count: 6 }],
+    ["opencode.skill.tool.requested", { count: 1 }],
+    ["opencode.skill.tool.completed", { count: 1, outcome: "success", execution: "host" }],
+    ["opencode.skill.catalog.updated", { count: 1 }],
+    ["opencode.mcp.status.changed", { count: 1 }],
+  ])
+  expect(fixture.marks.slice(-2).map((mark) => mark[0])).toEqual([undefined, undefined])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("parallel permission and form waits use their own source timestamps and omit human answers", () => {
+  const fixture = makeFixture()
+  const permission = Permission.ID.create()
+  const form = Form.ID.create()
+  ;[
+    published(
+      Permission.Event.Asked,
+      { sessionID, id: permission, action: "bash", resources: ["SECRET"], message: "SECRET" },
+      100,
+    ),
+    published(
+      Form.Event.Created,
+      { form: { id: form, sessionID: "global", title: "SECRET", fields: [{ type: "string", key: "SECRET" }] } },
+      120,
+    ),
+    published(Permission.Event.Replied, { sessionID, requestID: permission, reply: "reject" }, 180),
+    published(Form.Event.Replied, { id: form, sessionID: "global", answer: { SECRET: "SECRET" } }, 220),
+    published(Form.Event.Cancelled, { id: Form.ID.create(), sessionID }, 230),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  expect(fixture.marks[2][2]).toEqual({ count: 1, resolution: "reject", family: "terminal", duration_ms: 80 })
+  expect(fixture.marks[3][0]).toBeUndefined()
+  expect(fixture.marks[3][2]).toEqual({ count: 1, resolution: "answered", duration_ms: 100 })
+  expect(fixture.marks[4][2]).toEqual({ count: 1, resolution: "cancelled" })
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
 })
