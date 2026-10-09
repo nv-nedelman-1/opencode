@@ -1,6 +1,7 @@
 import { Plugin } from "@opencode/plugin/effect"
 import { EventManifest } from "@opencode/schema/event-manifest"
 import type { Session } from "@opencode/schema/session"
+import { Tool } from "@opencode/schema/tool"
 import { Cause, Effect, Stream } from "effect"
 import { RelayHost } from "./host.js"
 import { RelayModel } from "./model.js"
@@ -18,7 +19,7 @@ const observe = (effect: Effect.Effect<void>) =>
 
 /**
  * Built-in NeMo Relay integration. It activates when Relay is configured through its user or system
- * `plugins.toml` (or `OPENCODE_NEMO_RELAY_PLUGINS_TOML`), and runs every model request and tool call
+ * `plugins.toml` (or `OPENCODE_NEMO_RELAY_PLUGINS_TOML`), and runs eligible HTTP model and local-tool calls
  * through Relay managed execution beneath one Relay scope per session execution.
  */
 export default Plugin.define({
@@ -27,6 +28,19 @@ export default Plugin.define({
     Effect.gen(function* () {
       const runtime = yield* RelayHost.acquire()
       if (!runtime) return
+      if (runtime instanceof RelayHost.StartupFailure) {
+        yield* ctx.tool.middleware("execute", () =>
+          Effect.fail(
+            new Tool.Error({
+              message: runtime.error.message,
+              metadata: { "nemo_relay.failure_stage": "startup" },
+            }),
+          ),
+        )
+        yield* ctx.session.middleware("http", () => Effect.fail(runtime.error))
+        yield* ctx.session.hook("experimental.ws.handshake", () => Effect.die(runtime.error))
+        return
+      }
       const parentID = (sessionID: Session.ID) =>
         ctx.session.get({ sessionID }).pipe(
           Effect.map((session) => session.parentID),

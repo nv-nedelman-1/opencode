@@ -116,6 +116,30 @@ test("overlapping sessions and operation stacks retain isolated propagation acro
   }
 })
 
+test("host marks emit parented metric instruments once per admitted event", async () => {
+  const native = await fixture()
+  try {
+    const session = id("metrics")
+    const parent = native.runtime.open(session)
+    for (const _ of [0, 1])
+      native.runtime.mark(
+        session,
+        "opencode.agent.run.completed",
+        { count: 1, outcome: "success", duration_ms: 25 },
+        { "opencode.event_id": "metric-event" },
+        123_000,
+      )
+    await native.relay.flushSubscribers()
+    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed")).toHaveLength(1)
+    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
+      expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
+    ])
+    native.runtime.close(session, "success")
+  } finally {
+    await native.dispose()
+  }
+})
+
 test("parent close waits for child close and its final lease; release is idempotent", async () => {
   const native = await fixture()
   try {
@@ -145,30 +169,6 @@ test("parent close waits for child close and its final lease; release is idempot
       [child.uuid, "ERROR"],
       [parent.uuid, "OK"],
     ])
-  } finally {
-    await native.dispose()
-  }
-})
-
-test("host marks emit parented metric instruments once per admitted event", async () => {
-  const native = await fixture()
-  try {
-    const session = id("metrics")
-    const parent = native.runtime.open(session)
-    for (const _ of [0, 1])
-      native.runtime.mark(
-        session,
-        "opencode.agent.run.completed",
-        { count: 1, outcome: "success", duration_ms: 25 },
-        { "opencode.event_id": "metric-event" },
-        123_000,
-      )
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed")).toHaveLength(1)
-    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
-      expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
-    ])
-    native.runtime.close(session, "success")
   } finally {
     await native.dispose()
   }
@@ -220,6 +220,24 @@ test("concurrent shutdown callers both await the accepted work", async () => {
     expect(completedEarly).toBe(0)
     expect(state.cancellations).toBe(1)
     expect(native.state).toEqual({ flushes: 1, closes: 1 })
+  } finally {
+    await native.dispose()
+  }
+})
+
+test("retired hosts reject stale observations without reopening scopes or publishing marks", async () => {
+  const native = await fixture()
+  try {
+    native.runtime.open(id("observation_shutdown"))
+    await Effect.runPromise(native.runtime.shutdown)
+    await native.runtime.retired
+    const before = native.events.length
+    expect(native.runtime.admit("stale-event")).toBe(false)
+    expect(() => native.runtime.open(id("stale_observation"))).toThrow("runtime is stopping")
+    native.runtime.mark(id("stale_observation"), "review.stale.mark", {})
+    native.runtime.mark(undefined, "review.stale.global", {})
+    await native.relay.flushSubscribers()
+    expect(native.events).toHaveLength(before)
   } finally {
     await native.dispose()
   }
@@ -287,7 +305,13 @@ test("Location owners share process startup and only the last release closes ses
         ),
       ),
     )
-    if (!runtimes[0] || !runtimes[1]) throw new Error("Expected native Relay runtimes")
+    if (
+      !runtimes[0] ||
+      !runtimes[1] ||
+      runtimes[0] instanceof RelayHost.StartupFailure ||
+      runtimes[1] instanceof RelayHost.StartupFailure
+    )
+      throw new Error("Expected native Relay runtimes")
     expect(runtimes[0]).toBe(runtimes[1])
     const session = runtimes[0].open(id("owners"))
     await Effect.runPromise(Scope.close(scopes[0], Exit.void))
@@ -313,7 +337,7 @@ test("a new Location waits for a timed-out previous native host to retire", asyn
         Scope.provide(scopes[0]),
       ),
     )
-    if (!first) throw new Error("Expected an active native host")
+    if (!first || first instanceof RelayHost.StartupFailure) throw new Error("Expected an active native host")
     const operation = await Effect.runPromise(first.lease(id("restart"), noParent))
     await Effect.runPromise(Scope.close(scopes[0], Exit.void))
     const state = { acquired: false }

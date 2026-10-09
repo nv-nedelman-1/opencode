@@ -13,8 +13,21 @@ import { RelayMetrics } from "./metrics.js"
 export type Relay = Awaited<ReturnType<typeof RelayBinding.load>>[0]
 export type Outcome = "success" | "failed" | "cancelled"
 
+/** A requested policy could not activate; keep dispatch blocked instead of disabling the adapter. */
+export class StartupFailure {
+  readonly _tag = "StartupFailure"
+  readonly error: Error
+
+  constructor(
+    message = "NeMo Relay plugin configuration failed; check plugins.toml and plugin installation",
+    readonly retained = false,
+  ) {
+    this.error = new Error(message)
+  }
+}
+
 export interface Options {
-  /** Programmatic plugin configuration layered over the discovered files. Activates Relay without a file. */
+  /** Lowest-precedence configuration; discovered files override it. Activates Relay without a file. */
   readonly config?: PluginConfig
   /** Explicit user-layer `plugins.toml`. Relay's system layer still applies above it. */
   readonly pluginsToml?: string
@@ -47,7 +60,7 @@ export interface Operation {
 
 interface Active extends Runtime {
   readonly shutdown: Effect.Effect<void>
-  readonly retired: Promise<void>
+  readonly retired: Promise<StartupFailure | undefined>
 }
 
 const OFF = new Set(["0", "false", "no", "off"])
@@ -58,22 +71,23 @@ const SHUTDOWN_BUDGET_MS = 2_000
 const STATUS = { success: "OK", failed: "ERROR", cancelled: "UNSET" } as const
 // `ScopeType.Agent`. The binding declares an ambient const enum, which isolated modules cannot read.
 const AGENT_SCOPE = 0
+const RETAINED_HOST = "NeMo Relay native plugin teardown failed; restart OpenCode before retrying"
 
 // Relay allows one plugin-host activation per process, while plugins start once per Location.
 let owners = 0
-let current: Promise<Active | undefined> | undefined
-let closing = Promise.resolve()
+let current: Promise<Active | StartupFailure | undefined> | undefined
+let closing: Promise<StartupFailure | undefined> = Promise.resolve(undefined)
 
 /**
  * Shares one process-wide Relay runtime between plugin instances. The runtime starts only when Relay
  * is configured, and the last release drains open scopes, flushes subscribers, and closes the host.
  */
-export const acquire = (options: Options = {}): Effect.Effect<Runtime | undefined, never, Scope.Scope> =>
+export const acquire = (options: Options = {}): Effect.Effect<Runtime | StartupFailure | undefined, never, Scope.Scope> =>
   Effect.acquireRelease(
     Effect.gen(function* () {
       const context = yield* Effect.context<never>()
       owners++
-      const runtime = (current ??= closing.then(() => Effect.runPromiseWith(context)(start(options))))
+      const runtime = (current ??= closing.then((failure) => failure ?? Effect.runPromiseWith(context)(start(options))))
       return yield* Effect.promise(() => runtime)
     }),
     () => Effect.promise(release),
@@ -81,11 +95,15 @@ export const acquire = (options: Options = {}): Effect.Effect<Runtime | undefine
 
 const release = () => {
   owners--
-  if (owners > 0 || current === undefined) return closing
+  if (owners > 0 || current === undefined) return closing.then(() => undefined)
   const runtime = current
   current = undefined
-  const stopped = runtime.then((active) => (active ? Effect.runPromise(active.shutdown) : undefined))
-  closing = stopped.then(() => runtime).then((active) => active?.retired)
+  const stopped = runtime.then((active) =>
+    active && !(active instanceof StartupFailure) ? Effect.runPromise(active.shutdown) : undefined,
+  )
+  closing = stopped
+    .then(() => runtime)
+    .then((active) => (active instanceof StartupFailure ? (active.retained ? active : undefined) : active?.retired))
   return stopped
 }
 
@@ -106,28 +124,58 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
   if (!forced && !(yield* configured(pluginsToml))) return undefined
   const modules = yield* Effect.tryPromise(RelayBinding.load).pipe(
     Effect.map(Option.some),
-    Effect.catch((error) =>
-      Effect.logWarning("NeMo Relay is configured but its native runtime could not be loaded", {
-        error: String(error),
-      }).pipe(Effect.as(Option.none())),
-    ),
-  )
-  if (Option.isNone(modules)) return undefined
-  const [relay, plugin] = modules.value
-  const activation = yield* Effect.tryPromise(() =>
-    plugin.initialize(options.config ?? plugin.defaultConfig(), pluginsToml),
-  ).pipe(
-    Effect.map(Option.some),
-    Effect.catch((error) =>
-      Effect.logWarning("NeMo Relay plugin host failed to start", { error: String(error) }).pipe(
+    Effect.catch(() =>
+      Effect.logWarning("NeMo Relay is configured but its optional native runtime could not be loaded").pipe(
         Effect.as(Option.none()),
       ),
     ),
   )
-  if (Option.isNone(activation)) return undefined
+  if (Option.isNone(modules)) return undefined
+  const [relay, plugin] = modules.value
+  if (!supportsStreaming(relay)) {
+    const failure = new StartupFailure(
+      "NeMo Relay native runtime lacks required streaming APIs; install a Node binding with failStream and pushStreamChunkAsync before enabling Relay",
+    )
+    yield* Effect.logWarning(failure.error.message)
+    return failure
+  }
+  const activation = yield* Effect.tryPromise(() =>
+    plugin.initialize(options.config ?? plugin.defaultConfig(), pluginsToml),
+  ).pipe(Effect.option)
+  if (Option.isNone(activation)) {
+    const failure = new StartupFailure()
+    yield* Effect.logWarning(`${failure.error.message}; model and tool execution is blocked`)
+    return failure
+  }
+  const active = activation.value
+  const healthy = yield* Effect.try(() => {
+    const report = active.report
+    return (
+      active.isActive &&
+      !report.config.diagnostics.some(
+        (diagnostic) =>
+          diagnostic.level === "error" ||
+          (pluginsToml !== undefined && diagnostic.code === "plugin.configuration_file_missing"),
+      ) &&
+      !report.dynamic_plugins.some((plugin) => plugin.selected && plugin.failure != null)
+    )
+  }).pipe(Effect.orElseSucceed(() => false))
+  if (!healthy) {
+    const closed = yield* Effect.tryPromise(() => active.close()).pipe(Effect.option)
+    const failure = Option.isSome(closed) ? new StartupFailure() : new StartupFailure(RETAINED_HOST, true)
+    yield* Effect.logWarning(`${failure.error.message}; model and tool execution is blocked`)
+    return failure
+  }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
-  return make(relay, activation.value, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
+  return make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
 })
+
+// Checking separately keeps compatibility with declarations that predate these optional exports.
+const supportsStreaming = (relay: object): boolean =>
+  "failStream" in relay &&
+  typeof relay.failStream === "function" &&
+  "pushStreamChunkAsync" in relay &&
+  typeof relay.pushStreamChunkAsync === "function"
 
 // Core also runs on Node and workerd, so this avoids Bun-only file APIs.
 const configured = (explicit: string | undefined) =>
@@ -168,7 +216,7 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
   const events = new Set<string>()
   const state: { accepting: boolean; shutdown?: Promise<void> } = { accepting: true }
   const neutral = relay.createScopeStack()
-  const retirement = Promise.withResolvers<void>()
+  const retirement = Promise.withResolvers<StartupFailure | undefined>()
 
   const open = (sessionID: Session.ID, parentID?: Session.ID, timestamp?: number) => {
     const existing = sessions.get(sessionID)
@@ -258,6 +306,7 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
     })
 
   const mark: Runtime["mark"] = (sessionID, name, data, metadata, timestamp) => {
+    if (!state.accepting) return
     const id = isRecord(metadata) ? metadata["opencode.event_id"] : undefined
     if (typeof id === "string") {
       const key = `${name}:${id}`
@@ -277,8 +326,18 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
   const finalize = Effect.gen(function* () {
     Array.from(sessions.keys()).forEach((sessionID) => close(sessionID, "cancelled"))
     yield* Effect.tryPromise(() => relay.flushSubscribers()).pipe(Effect.ignore)
-    yield* Effect.tryPromise(() => activation.close()).pipe(Effect.ignore)
-  }).pipe(Effect.ensuring(Effect.sync(retirement.resolve)))
+    yield* Effect.tryPromise(() => activation.close())
+  }).pipe(
+    Effect.matchCauseEffect({
+      onSuccess: () => Effect.sync(() => retirement.resolve(undefined)),
+      onFailure: () => {
+        const failure = new StartupFailure(RETAINED_HOST, true)
+        return Effect.logWarning(failure.error.message).pipe(
+          Effect.andThen(Effect.sync(() => retirement.resolve(failure))),
+        )
+      },
+    }),
+  )
 
   const shutdown = Effect.gen(function* () {
     state.accepting = false
@@ -296,12 +355,15 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
 
   return {
     relay,
-    open: (sessionID, parentID, timestamp) => open(sessionID, parentID, timestamp).handle,
+    open: (sessionID, parentID, timestamp) => {
+      if (!state.accepting) throw new Error("NeMo Relay runtime is stopping")
+      return open(sessionID, parentID, timestamp).handle
+    },
     scope: (sessionID, parentID) => resolve(sessionID, parentID).pipe(Effect.map((entry) => entry.handle)),
     lease,
     mark,
     admit: (id) => {
-      if (events.has(id)) return false
+      if (!state.accepting || events.has(id)) return false
       events.add(id)
       if (events.size > 1024) events.delete(events.values().next().value!)
       return true

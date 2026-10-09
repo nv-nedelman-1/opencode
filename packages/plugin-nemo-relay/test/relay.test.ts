@@ -41,7 +41,7 @@ beforeAll(async () => {
   ]
   scope = Effect.runSync(Scope.make())
   const acquired = await Effect.runPromise(RelayHost.acquire({ config, pluginsToml }).pipe(Scope.provide(scope)))
-  if (!acquired) throw new Error("Expected an active Relay runtime")
+  if (!acquired || acquired instanceof RelayHost.StartupFailure) throw new Error("Expected an active Relay runtime")
   runtime = acquired
 })
 
