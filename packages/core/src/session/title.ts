@@ -6,6 +6,7 @@ import type { Agent } from "@opencode/schema/agent"
 import { Context, DateTime, Effect, Layer, Stream } from "effect"
 import { Database } from "../database/database.js"
 import { Bus } from "../bus.js"
+import { PluginHooks } from "../plugin/hooks.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { isExactRootFallback } from "@opencode/util/session-title-fallback"
 import { llmClient } from "../effect/app-node-platform.js"
@@ -44,6 +45,7 @@ export const layer = Layer.effect(
     const context = yield* SessionContext.Service
     const store = yield* SessionStore.Service
     const db = (yield* Database.Service).db
+    const hooks = yield* PluginHooks.Service
 
     const attempt = Effect.fn("SessionTitle.attempt")(function* (input: {
       readonly session: SessionSchema.Info
@@ -56,11 +58,28 @@ export const layer = Layer.effect(
       let usage: SessionUsage.Recorded | undefined
       const recordUsage = Effect.suspend(() =>
         usage
-          ? bus.publish(SessionEvent.UsageRecorded, {
-              sessionID: input.session.id,
-              source: "title",
-              ...usage,
-            })
+          ? bus
+              .publish(SessionEvent.UsageRecorded, {
+                sessionID: input.session.id,
+                source: "title",
+                ...usage,
+              })
+              .pipe(
+                Effect.andThen(
+                  hooks.trigger(
+                    "session",
+                    "usage",
+                    Object.freeze({
+                      sessionID: input.session.id,
+                      agent: input.agent.id,
+                      model: input.model.ref,
+                      source: "title",
+                      ...SessionUsage.snapshot(usage),
+                      costSource: "host_calculated",
+                    }),
+                  ),
+                ),
+              )
           : Effect.void,
       )
       const prepared = yield* context.request.title({
@@ -153,5 +172,5 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, llmClient, SessionContext.node, SessionStore.node, Database.node],
+  deps: [Bus.node, llmClient, SessionContext.node, SessionStore.node, Database.node, PluginHooks.node],
 })

@@ -40,6 +40,33 @@ const transport = SessionModelTransport.Service.of({
 })
 
 describe("SessionModelRequest HTTP hooks", () => {
+  it.effect("exposes host context sizing without treating compaction budgets as measured prompts", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const seen: PluginHooks.Domains["session"]["context.usage"][] = []
+      yield* hooks.register("session", "context.usage", (event) =>
+        Effect.sync(() => {
+          seen.push(event)
+        }),
+      )
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+      const input = {
+        session,
+        agent: Agent.ID.make("build"),
+        model,
+        system: [],
+        messages: [],
+        inputTokens: { measured: 180_000, estimated: 25_000 },
+      }
+      yield* requests.primary(input)
+      yield* requests.primary({ ...input, model: { ...model, limit: { context: 0, output: 0 } } })
+      yield* requests.compaction(input)
+      expect(seen).toHaveLength(2)
+      expect(seen[0]).toMatchObject({ measured: 180_000, estimated: 25_000, limit: 200_000, kind: "primary" })
+      expect(seen[1]).not.toHaveProperty("limit")
+      expect(Object.isFrozen(seen[0])).toBe(true)
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
   it.effect("tags every Session request kind on http.request and http.response", () =>
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service

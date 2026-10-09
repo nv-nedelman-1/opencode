@@ -2,6 +2,7 @@ import type { SessionApi } from "@opencode/client/promise/api"
 import type { GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
+import type { Money } from "@opencode/schema/money"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
@@ -135,6 +136,58 @@ export interface SessionRetry {
   decision: SessionRetryDecision
 }
 
+/** Final host retry choice, after mutable retry hooks and delay normalization. */
+export interface SessionRetryObservation {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly error: SessionError.Error
+  readonly attempt: number
+  readonly retryable: boolean
+  readonly decision: Readonly<SessionRetryDecision>
+  readonly source: "policy" | "retry-after" | "hook"
+  readonly reason: "scheduled" | "rejected" | "timeout-limit" | "exhausted"
+}
+
+/** Host prompt sizing before request hooks. Zero/unknown catalog limits are omitted. */
+export interface SessionContextUsage {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly measured: number
+  readonly estimated: number
+  readonly limit?: number
+}
+
+/** Local token estimates, not provider-billed usage. Encrypted native sizes remain unknown. */
+export interface SessionCompactionOutcome {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly trigger: "auto" | "overflow" | "manual"
+  readonly status: "skipped" | "completed" | "failed" | "interrupted"
+  readonly before?: number
+  readonly after?: number
+  readonly limit?: number
+  readonly summaryEstimatedTokens?: number
+  readonly retainedEstimatedTokens?: number
+  /** Selected summary input before the summary instruction and overflow shrinking. */
+  readonly sourceEstimatedTokens?: number
+}
+
+/** One auxiliary usage charge; compaction's terminal aggregate must not be charged again. */
+export interface SessionUsage {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly source: "title" | "compaction"
+  readonly tokens: TokenUsage.Info
+  readonly cost: Money.USD
+  readonly costSource: "host_calculated"
+}
+
 export interface SessionHooks {
   readonly prompt: SessionPrompt
   readonly context: SessionContext
@@ -148,6 +201,10 @@ export interface SessionHooks {
   readonly "experimental.ws.send": SessionWebSocketSend
   readonly "experimental.ws.receive": SessionWebSocketReceive
   readonly retry: SessionRetry
+  readonly "retry.decision": SessionRetryObservation
+  readonly "context.usage": SessionContextUsage
+  readonly "compaction.outcome": SessionCompactionOutcome
+  readonly usage: SessionUsage
 }
 
 export type SessionDomain = Pick<

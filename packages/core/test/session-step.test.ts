@@ -107,6 +107,7 @@ for (const fixture of [
           model,
           prepared: {
             retry: () => Effect.void,
+            retryDecision: () => Effect.void,
             request: LLM.request({ model: model.model, prompt: "Run one tool", toolChoice: fixture.toolChoice }),
             options: {},
             executeTool: () =>

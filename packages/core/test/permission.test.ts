@@ -9,6 +9,7 @@ import { Location } from "@opencode/core/location"
 import { Permission } from "@opencode/core/permission"
 import { PermissionTable } from "@opencode/core/permission/sql"
 import { PermissionSaved } from "@opencode/core/permission/saved"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -26,7 +27,15 @@ const current = Layer.succeed(
 )
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, PermissionSaved.node, Agent.node, Permission.node]),
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      SessionStore.node,
+      PermissionSaved.node,
+      Agent.node,
+      Permission.node,
+      PluginHooks.node,
+    ]),
     [Location.node.replace(current)],
   ),
 )
@@ -138,6 +147,13 @@ describe("Permission", () => {
 
   it.effect("allows and denies from explicit rules without asking", () =>
     Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const seen: PluginHooks.Domains["permission"]["decision"][] = []
+      yield* hooks.register("permission", "decision", (event) =>
+        Effect.sync(() => {
+          seen.push(event)
+        }),
+      )
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])
       const service = yield* Permission.Service
       yield* service.assert(assertion())
@@ -145,6 +161,19 @@ describe("Permission", () => {
       const blocked = yield* service.assert(assertion()).pipe(Effect.flip)
       expect(blocked).toBeInstanceOf(Permission.BlockedError)
       expect(yield* service.list()).toEqual([])
+      expect(seen.map((event) => [event.effect, event.origin])).toEqual([
+        ["allow", "rules"],
+        ["deny", "rules"],
+      ])
+      expect(seen.every(Object.isFrozen)).toBe(true)
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          event.effect = "allow"
+        }),
+      )
+      yield* setRules([])
+      yield* service.assert(assertion())
+      expect(seen.at(-1)).toMatchObject({ effect: "allow", origin: "hook" })
     }),
   )
 

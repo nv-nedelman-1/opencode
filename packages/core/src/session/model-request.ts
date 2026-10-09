@@ -64,6 +64,7 @@ export interface Prepared<Event = SessionRequest> {
   readonly request: LLMRequest
   readonly options: StreamOptions
   readonly retry: (event: PluginHooks.Domains["session"]["retry"]) => Effect.Effect<void>
+  readonly retryDecision: (event: PluginHooks.Domains["session"]["retry.decision"]) => Effect.Effect<void>
   /** Runs a tool call against the tools this request advertised. */
   readonly executeTool: (
     input: Parameters<Tool.Snapshot["execute"]>[0],
@@ -239,6 +240,16 @@ export const layer = Layer.effect(
       const session = input.session
       const model = input.model
       const scope = { sessionID: session.id, agent: input.agent, model: model.ref, kind }
+      if (kind === "primary" && input.inputTokens)
+        yield* hooks.trigger(
+          "session",
+          "context.usage",
+          Object.freeze({
+            ...scope,
+            ...input.inputTokens,
+            ...(model.limit.context > 0 ? { limit: model.limit.context } : {}),
+          }),
+        )
       const tools = input.tools ?? {
         definitions: [],
         execute: () => new Tool.Error({ message: "Tools are not available for this request" }),
@@ -411,6 +422,8 @@ export const layer = Layer.effect(
         options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
+        retryDecision: (event: Parameters<Prepared["retryDecision"]>[0]) =>
+          hooks.trigger("session", "retry.decision", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot
         // catch them and turn a "no" into model-visible output. Recover them here as failures.
         executeTool: (call: Parameters<Prepared["executeTool"]>[0]) =>

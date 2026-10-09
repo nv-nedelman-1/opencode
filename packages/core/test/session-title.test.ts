@@ -200,6 +200,13 @@ const enableTitleAgent = Effect.gen(function* () {
 
 it.effect("generates a title from the sole user message and renames the session", () =>
   Effect.gen(function* () {
+    const hooks = yield* PluginHooks.Service
+    const usage: PluginHooks.Domains["session"]["usage"][] = []
+    yield* hooks.register("session", "usage", (event) =>
+      Effect.sync(() => {
+        usage.push(event)
+      }),
+    )
     yield* enableTitleAgent
     const sessionID = Session.ID.make("ses_title_generate")
     yield* insertSession(sessionID)
@@ -227,6 +234,14 @@ it.effect("generates a title from the sole user message and renames the session"
     expect(renamed?.title).toBe("Generated Title")
     expect(renamed?.tokens).toEqual({ input: 10, output: 4, reasoning: 2, cache: { read: 3, write: 2 } })
     expect(renamed?.cost).toBeCloseTo(0.0000233)
+    expect(usage).toHaveLength(1)
+    expect(usage[0]).toMatchObject({
+      source: "title",
+      costSource: "host_calculated",
+      tokens: renamed?.tokens,
+      cost: renamed?.cost,
+    })
+    expect(Object.isFrozen(usage[0]?.tokens.cache)).toBe(true)
   }),
 )
 
