@@ -13,27 +13,41 @@ export interface Event {
  */
 export const read = async (
   body: ReadableStream<Uint8Array>,
-  onEvent: (event: Event) => boolean,
+  onEvent: (event: Event) => boolean | Promise<boolean>,
   signal: AbortSignal,
 ) => {
   const reader = body.getReader()
   const decoder = new TextDecoder()
-  const cancel = () => void reader.cancel().catch(() => undefined)
-  signal.addEventListener("abort", cancel, { once: true })
+  const cleanup: { cancelled?: Promise<void> } = {}
+  const cancel = () => (cleanup.cancelled ??= reader.cancel().catch(() => undefined))
+  const onAbort = () => {
+    void cancel()
+  }
+  signal.addEventListener("abort", onAbort, { once: true })
+  if (signal.aborted) onAbort()
   const consume = async () => {
     let buffer = ""
     while (true) {
       const chunk = await reader.read()
       const text = chunk.done ? decoder.decode() + "\n\n" : decoder.decode(chunk.value, { stream: true })
-      buffer = (buffer + text).replaceAll("\r\n", "\n")
+      const incoming = buffer + text
+      const trailingCR = !chunk.done && incoming.endsWith("\r") ? "\r" : ""
+      buffer = (trailingCR ? incoming.slice(0, -1) : incoming).replaceAll(/\r\n?|\n/g, "\n")
       const blocks = buffer.split("\n\n")
-      buffer = blocks.pop() ?? ""
-      const events = blocks.map(parse).filter((event): event is Event => event !== undefined)
-      if (!events.every(onEvent)) return cancel()
+      buffer = (blocks.pop() ?? "") + trailingCR
+      for (const block of blocks) {
+        if (signal.aborted) return cancel()
+        const event = parse(block)
+        if (event && (!(await onEvent(event)) || signal.aborted)) return cancel()
+      }
       if (chunk.done) return
     }
   }
-  await consume().finally(() => signal.removeEventListener("abort", cancel))
+  await consume().finally(async () => {
+    signal.removeEventListener("abort", onAbort)
+    await cancel()
+    reader.releaseLock()
+  })
 }
 
 const parse = (block: string): Event | undefined => {
@@ -58,29 +72,59 @@ export const encode = (chunk: unknown, named: boolean) => {
   return `${name}data: ${JSON.stringify(chunk)}\n\n`
 }
 
-/** Folds streamed chunks into the provider's non-streaming response shape so response codecs can read usage. */
-export const aggregate = (protocol: string, chunks: ReadonlyArray<unknown>): unknown => {
-  const records = chunks.filter(RelayHost.isRecord)
-  if (protocol === "openai-chat" || protocol === "openai-compatible-chat") return chat(records)
-  if (protocol === "anthropic-messages") return messages(records)
-  if (RESPONSES.has(protocol)) return responses(records)
-  if (protocol === "gemini") return gemini(records)
-  return records.at(-1) ?? null
-}
+/** Keep malformed provider data visible to the host's own protocol parser. */
+export const encodeEvent = (event: Event) =>
+  `${event.event === undefined ? "" : `event: ${event.event}\n`}data: ${event.data.replaceAll("\n", "\ndata: ")}\n\n`
 
 export const RESPONSES = new Set(["openai-responses", "open-responses", "openai-compatible-responses", "xai-responses"])
+
+export interface Accumulator {
+  readonly push: (chunk: unknown) => void
+  readonly value: () => unknown
+}
+
+/** Retains response output/accounting state, not the history of raw streamed frames. */
+export const accumulator = (protocol: string): Accumulator => {
+  const state =
+    protocol === "openai-chat" || protocol === "openai-compatible-chat"
+      ? chat()
+      : protocol === "anthropic-messages"
+        ? messages()
+        : RESPONSES.has(protocol)
+          ? responses()
+          : protocol === "gemini"
+            ? gemini()
+            : latest()
+  return {
+    push: (chunk) => {
+      if (RelayHost.isRecord(chunk)) state.push(chunk)
+    },
+    value: state.value,
+  }
+}
+
+/** Convenience fold using the same incremental state as the live streaming bridge. */
+export const aggregate = (protocol: string, chunks: ReadonlyArray<unknown>): unknown => {
+  const state = accumulator(protocol)
+  chunks.forEach(state.push)
+  return state.value()
+}
 
 const list = (value: unknown) => (Array.isArray(value) ? value.filter(RelayHost.isRecord) : [])
 const text = (value: unknown) => (typeof value === "string" ? value : "")
 
-const chat = (records: ReadonlyArray<Record<string, unknown>>) => {
+const chat = () => {
+  const metadata: Record<string, unknown> = {}
   const choices = new Map<
     number,
     { content: string; reasoning: string; finish: unknown; calls: Map<number, Record<string, unknown>> }
   >()
-  records
-    .flatMap((chunk) => list(chunk.choices))
-    .forEach((choice) => {
+  const push = (chunk: Record<string, unknown>) => {
+    for (const key of ["id", "created", "model"]) {
+      if (metadata[key] === undefined && chunk[key] !== undefined) metadata[key] = chunk[key]
+    }
+    if (RelayHost.isRecord(chunk.usage)) metadata.usage = chunk.usage
+    for (const choice of list(chunk.choices)) {
       const index = typeof choice.index === "number" ? choice.index : 0
       const entry = choices.get(index) ?? { content: "", reasoning: "", finish: null, calls: new Map() }
       choices.set(index, entry)
@@ -102,13 +146,13 @@ const chat = (records: ReadonlyArray<Record<string, unknown>>) => {
           },
         })
       })
-    })
-  const usage = records.findLast((chunk) => RelayHost.isRecord(chunk.usage))?.usage
-  return {
-    id: records.find((chunk) => chunk.id !== undefined)?.id,
+    }
+  }
+  const value = () => ({
+    id: metadata.id,
     object: "chat.completion",
-    created: records.find((chunk) => chunk.created !== undefined)?.created,
-    model: records.find((chunk) => chunk.model !== undefined)?.model,
+    created: metadata.created,
+    model: metadata.model,
     choices: Array.from(choices, ([index, entry]) => ({
       index,
       message: {
@@ -119,15 +163,25 @@ const chat = (records: ReadonlyArray<Record<string, unknown>>) => {
       },
       finish_reason: entry.finish,
     })),
-    ...(usage === undefined ? {} : { usage }),
-  }
+    ...(metadata.usage === undefined ? {} : { usage: metadata.usage }),
+  })
+  return { push, value }
 }
 
-const messages = (records: ReadonlyArray<Record<string, unknown>>) => {
-  const start = records.find((chunk) => chunk.type === "message_start" && RelayHost.isRecord(chunk.message))?.message
+const messages = () => {
+  const state: {
+    start?: Record<string, unknown>
+    delta?: Record<string, unknown>
+    usage: Record<string, unknown>
+  } = { usage: {} }
   const blocks = new Map<number, Record<string, unknown>>()
-  const deltas = records.filter((chunk) => chunk.type === "message_delta")
-  records.forEach((chunk) => {
+  const push = (chunk: Record<string, unknown>) => {
+    if (state.start === undefined && chunk.type === "message_start" && RelayHost.isRecord(chunk.message))
+      state.start = chunk.message
+    if (chunk.type === "message_delta") {
+      state.delta = RelayHost.isRecord(chunk.delta) ? chunk.delta : undefined
+      if (RelayHost.isRecord(chunk.usage)) Object.assign(state.usage, chunk.usage)
+    }
     const index = typeof chunk.index === "number" ? chunk.index : 0
     if (chunk.type === "content_block_start" && RelayHost.isRecord(chunk.content_block))
       blocks.set(index, { ...chunk.content_block })
@@ -138,40 +192,55 @@ const messages = (records: ReadonlyArray<Record<string, unknown>>) => {
     if (delta.type === "thinking_delta") block.thinking = text(block.thinking) + text(delta.thinking)
     if (delta.type === "signature_delta") block.signature = text(block.signature) + text(delta.signature)
     if (delta.type === "input_json_delta") block.partial_json = text(block.partial_json) + text(delta.partial_json)
-  })
-  const base = RelayHost.isRecord(start) ? start : {}
-  const last = deltas.at(-1)
-  const usage = deltas.reduce(
-    (merged, delta) => (RelayHost.isRecord(delta.usage) ? { ...merged, ...delta.usage } : merged),
-    RelayHost.isRecord(base.usage) ? base.usage : {},
-  )
-  return {
-    ...base,
+  }
+  const value = () => ({
+    ...state.start,
     content: Array.from(blocks.values()).map((block) => {
       if (block.partial_json === undefined) return block
       const { partial_json, ...rest } = block
       return { ...rest, input: RelayHost.parse(text(partial_json)) ?? rest.input }
     }),
-    ...(last && RelayHost.isRecord(last.delta) ? { ...last.delta } : {}),
-    usage,
+    ...state.delta,
+    usage: { ...(RelayHost.isRecord(state.start?.usage) ? state.start.usage : {}), ...state.usage },
+  })
+  return { push, value }
+}
+
+const responses = () => {
+  const state = { response: { object: "response", status: "incomplete", output: [] } as Record<string, unknown> }
+  return {
+    push: (chunk: Record<string, unknown>) => {
+      if (
+        ["response.completed", "response.incomplete", "response.failed"].includes(text(chunk.type)) &&
+        RelayHost.isRecord(chunk.response)
+      )
+        state.response = chunk.response
+    },
+    value: () => state.response,
   }
 }
 
-const responses = (records: ReadonlyArray<Record<string, unknown>>) =>
-  records.findLast(
-    (chunk) =>
-      (chunk.type === "response.completed" ||
-        chunk.type === "response.incomplete" ||
-        chunk.type === "response.failed") &&
-      RelayHost.isRecord(chunk.response),
-  )?.response ?? { object: "response", status: "incomplete", output: [] }
+const gemini = () => {
+  const state: { last: Record<string, unknown>; parts: Record<string, unknown>[] } = { last: {}, parts: [] }
+  return {
+    push: (chunk: Record<string, unknown>) => {
+      state.last = chunk
+      const content = list(chunk.candidates)[0]?.content
+      if (RelayHost.isRecord(content)) state.parts.push(...list(content.parts))
+    },
+    value: () => ({
+      ...state.last,
+      candidates: [{ ...list(state.last.candidates)[0], content: { role: "model", parts: state.parts } }],
+    }),
+  }
+}
 
-const gemini = (records: ReadonlyArray<Record<string, unknown>>) => {
-  const last = records.at(-1) ?? {}
-  const candidate = list(last.candidates)[0] ?? {}
-  const parts = records.flatMap((chunk) => {
-    const content = list(chunk.candidates)[0]?.content
-    return RelayHost.isRecord(content) ? list(content.parts) : []
-  })
-  return { ...last, candidates: [{ ...candidate, content: { role: "model", parts } }] }
+const latest = () => {
+  const state: { last: Record<string, unknown> | null } = { last: null }
+  return {
+    push: (chunk: Record<string, unknown>) => {
+      state.last = chunk
+    },
+    value: () => state.last,
+  }
 }

@@ -11,7 +11,7 @@ import { Cause, Effect, Exit, Scope } from "effect"
 import relay from "nemo-relay-node"
 import observability from "nemo-relay-node/observability"
 import plugin from "nemo-relay-node/plugin"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { RelayHost } from "../src/host"
@@ -27,6 +27,8 @@ let runtime: RelayHost.Runtime
 
 beforeAll(async () => {
   directory = await mkdtemp(path.join(os.tmpdir(), "opencode-relay-"))
+  const pluginsToml = path.join(directory, "plugins.toml")
+  await writeFile(pluginsToml, "version = 1\n")
   const config = plugin.defaultConfig()
   config.components = [
     observability.ComponentSpec({
@@ -38,12 +40,15 @@ beforeAll(async () => {
     }),
   ]
   scope = Effect.runSync(Scope.make())
-  const acquired = await Effect.runPromise(RelayHost.acquire({ config }).pipe(Scope.provide(scope)))
+  const acquired = await Effect.runPromise(RelayHost.acquire({ config, pluginsToml }).pipe(Scope.provide(scope)))
   if (!acquired) throw new Error("Expected an active Relay runtime")
   runtime = acquired
 })
 
-afterAll(() => rm(directory, { recursive: true, force: true }))
+afterAll(async () => {
+  if (scope) await Effect.runPromise(Scope.close(scope, Exit.void))
+  if (directory) await rm(directory, { recursive: true, force: true })
+})
 
 const execution = (tool: string, input: unknown): ToolExecution => ({
   tool,
@@ -182,6 +187,25 @@ describe("managed model execution", () => {
     expect(sent[0]?.headers.get("traceparent")).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-0[01]$/)
   })
 
+  test("proxy keepalives cannot truncate a live SSE response", async () => {
+    const response = await runModel(call({ stream: true }), () =>
+      Effect.succeed(
+        new Response(
+          `data: ${JSON.stringify(chunks[0])}\n\ndata: null\n\ndata: : keepalive\n\ndata:\n\n` +
+            chunks
+              .slice(1)
+              .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+              .join("") +
+            "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+    )
+    const data = events(await response.text())
+    expect(data.slice(0, -1).map((item) => JSON.parse(item))).toEqual(chunks)
+    expect(data.at(-1)).toBe("[DONE]")
+  })
+
   test("answers a guardrail rejection locally with a final content-policy failure", async () => {
     relay.registerLlmConditionalExecutionGuardrail("test-block-prompt", 10, (request) =>
       JSON.stringify(request).includes("forbidden") ? "prompt violates policy" : null,
@@ -296,6 +320,70 @@ describe("managed model execution", () => {
     expect(response.status).toBe(200)
     expect(await response.text()).toBe(body)
   })
+
+  test("completes and cancels the provider body at DONE without waiting for HTTP EOF", async () => {
+    const state = { cancelled: false }
+    const response = await runModel(call({ stream: true }), () =>
+      Effect.succeed(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                new TextEncoder().encode(
+                  chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
+                ),
+              )
+            },
+            cancel() {
+              state.cancelled = true
+            },
+          }),
+          { headers: { "content-type": "text/event-stream" } },
+        ),
+      ),
+    )
+    expect(events(await response.text()).at(-1)).toBe("[DONE]")
+    expect(state.cancelled).toBe(true)
+  })
+
+  test.each(["body.cancel", "request.abort"])(
+    "%s drains a live provider stream and closes its LLM scope",
+    async (method) => {
+      const abort = new AbortController()
+      const cancelled = Promise.withResolvers<void>()
+      const input = {
+        ...call({ stream: true }),
+        model: { providerID: Provider.ID.make(`cancel_${method}`), id: Model.ID.make("m") },
+      }
+      const response = await runModel({ ...input, request: new Request(input.request, { signal: abort.signal }) }, () =>
+        Effect.succeed(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunks[0])}\n\n`))
+              },
+              cancel() {
+                cancelled.resolve()
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } },
+          ),
+        ),
+      )
+      if (method === "body.cancel") await response.body!.cancel()
+      if (method === "request.abort") {
+        abort.abort()
+        await expect(response.text()).rejects.toThrow("aborted")
+      }
+      await cancelled.promise
+      await relay.flushSubscribers()
+      const ends = (await recorded()).filter(
+        (event) => event.kind === "scope" && event.scope_category === "end" && event.name === `cancel_${method}`,
+      )
+      expect(ends).toHaveLength(1)
+      expect(ends[0].metadata?.["otel.status_code"]).not.toBe("OK")
+    },
+  )
 })
 
 const recorded = async () =>

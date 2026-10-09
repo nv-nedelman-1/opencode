@@ -23,6 +23,8 @@ interface Managed {
   readonly runtime: RelayHost.Runtime
   readonly call: SessionHttpCall
   readonly parent: ScopeHandle
+  readonly operation: RelayHost.Operation
+  readonly ownership: { body: boolean }
   readonly request: LlmRequest
   readonly send: (request: LlmRequest) => ReturnType<Next>
 }
@@ -57,7 +59,14 @@ export const middleware =
   ): SessionMiddlewares["http"] =>
   (call, next) =>
     Effect.gen(function* () {
-      if (UNMANAGED.has(call.protocol)) return yield* next(call.request)
+      if (
+        UNMANAGED.has(call.protocol) ||
+        call.request.headers.has("x-amz-date") ||
+        call.request.headers.get("authorization")?.startsWith("AWS4-HMAC-SHA256")
+      ) {
+        runtime.mark(call.sessionID, "opencode.llm.coverage", { managed: false, reason: "signed_transport" })
+        return yield* next(call.request)
+      }
       const text = yield* Effect.promise(() => call.request.clone().text())
       const content = RelayHost.parse(text)
       if (!RelayHost.isRecord(content)) return yield* next(call.request)
@@ -67,15 +76,34 @@ export const middleware =
         ),
         content,
       }
+      const operation = yield* runtime.lease(call.sessionID, parentID(call.sessionID))
+      const ownership = { body: false }
+      const dispatch = { sent: false }
       const managed: Managed = {
         runtime,
         call,
-        parent: yield* runtime.scope(call.sessionID, parentID(call.sessionID)),
+        parent: operation.parent,
+        operation,
+        ownership,
         request,
-        send: (intercepted) => next(rebuild(call.request, text, request, intercepted)),
+        send: (intercepted) =>
+          Effect.suspend(() => {
+            if (dispatch.sent) return Effect.fail(new Error("OpenCode HTTP middleware may call next at most once"))
+            dispatch.sent = true
+            return next(rebuild(call.request, text, request, intercepted))
+          }),
       }
-      if (content.stream === true || call.request.url.includes(":streamGenerateContent")) return yield* stream(managed)
-      return yield* unary(managed)
+      return yield* (
+        content.stream === true || call.request.url.includes(":streamGenerateContent")
+          ? stream(managed)
+          : unary(managed)
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (!ownership.body) operation.release()
+          }),
+        ),
+      )
     })
 
 const stream = (managed: Managed) =>
@@ -84,8 +112,35 @@ const stream = (managed: Managed) =>
     const run = Effect.runPromiseExitWith(yield* Effect.context<never>())
     const abort = new AbortController()
     const upstream = Promise.withResolvers<Upstream>()
-    const chunks: unknown[] = []
-    const source: { named: boolean; done: boolean; failure?: Error } = { named: false, done: false }
+    const aggregate = RelaySSE.accumulator(managed.call.protocol)
+    const push =
+      "pushStreamChunkAsync" in relay && typeof relay.pushStreamChunkAsync === "function"
+        ? relay.pushStreamChunkAsync.bind(relay)
+        : undefined
+    if (!push) return yield* Effect.fail(new Error("NeMo Relay native runtime lacks awaitable stream push support"))
+    const source: { named: boolean; done: boolean; failure?: Error; invalid?: RelaySSE.Event } = {
+      named: false,
+      done: false,
+    }
+    const lifecycle: { llm?: LlmStream; opening?: Promise<LlmStream>; closed?: Promise<void>; producing?: boolean } = {}
+    const close = () =>
+      (lifecycle.closed ??= (async () => {
+        abort.abort()
+        await lifecycle.opening?.catch(() => undefined)
+        await lifecycle.llm?.close().catch(() => undefined)
+        managed.call.request.signal.removeEventListener("abort", closeOnAbort)
+        managed.operation.release()
+      })())
+    const closeOnAbort = () => {
+      source.failure ??= new DOMException("Provider request was aborted", "AbortError")
+      void close()
+    }
+    managed.operation.onCancel(closeOnAbort)
+    managed.call.request.signal.addEventListener("abort", closeOnAbort, { once: true })
+    if (managed.call.request.signal.aborted) {
+      yield* Effect.promise(close)
+      return yield* Effect.fail(new DOMException("Provider request was aborted", "AbortError"))
+    }
 
     const produce = async (producer: Producer) => {
       const id = producer.__nemo_relay_stream_id
@@ -95,76 +150,123 @@ const stream = (managed: Managed) =>
         return fail(relay, id, "provider request failed")
       }
       if (!exit.value.ok || !exit.value.body) {
-        upstream.resolve({ type: "response", response: exit.value, body: await exit.value.text() })
+        const text = await run(
+          Effect.tryPromise({
+            try: () => exit.value.text(),
+            catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+          }),
+          { signal: abort.signal },
+        )
+        if (Exit.isFailure(text)) {
+          upstream.resolve({ type: "failed", cause: text.cause })
+          return fail(relay, id, "provider response body failed")
+        }
+        upstream.resolve({ type: "response", response: exit.value, body: text.value })
         return fail(relay, id, `provider returned HTTP ${exit.value.status}`)
       }
       upstream.resolve({ type: "stream", response: exit.value })
       const failure = await RelaySSE.read(
         exit.value.body,
-        (event) => {
+        async (event) => {
           source.named ||= event.event !== undefined
+          // Match the host's SSE framing; a JSON null is also Relay's consumer EOF sentinel.
+          if (event.data === "" || event.data === "null" || event.data === ": keepalive") return true
           if (event.data === "[DONE]") {
             source.done = true
-            return true
+            return false
           }
           const chunk = RelayHost.parse(event.data)
-          if (chunk === undefined) return true
-          chunks.push(chunk)
-          return relay.pushStreamChunk(id, chunk)
+          if (chunk === undefined) {
+            source.invalid = event
+            throw new Error("Provider returned invalid JSON SSE data")
+          }
+          aggregate.push(chunk)
+          return await push(id, chunk)
         },
         abort.signal,
       ).then(
         () => undefined,
         (error: unknown) => (error instanceof Error ? error : new Error(String(error))),
       )
-      if (failure === undefined || abort.signal.aborted) return relay.endStream(id)
+      // The pushed producer must settle before native close can finish; cancellation is not a successful EOF.
+      if (abort.signal.aborted) return fail(relay, id, "Provider request was aborted", "AbortError")
+      if (failure === undefined) return relay.endStream(id)
       source.failure = failure
       fail(relay, id, failure.message)
     }
 
     const opened = yield* Effect.tryPromise({
       try: () =>
-        withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
-          relay.llmStreamCallExecute(
-            managed.call.model.providerID,
-            managed.request,
-            (producer: Producer) => void produce(producer),
-            undefined,
-            () => RelaySSE.aggregate(managed.call.protocol, chunks),
-            managed.parent,
-            STREAMING,
-            null,
-            metadata(managed.call),
-            managed.call.model.id,
-            ...codecs,
-          ),
-        ),
+        (lifecycle.opening = managed.operation
+          .run(() =>
+            withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
+              relay.llmStreamCallExecute(
+                managed.call.model.providerID,
+                managed.request,
+                (producer: Producer) => {
+                  if (lifecycle.producing) throw new Error("OpenCode HTTP middleware may call next at most once")
+                  lifecycle.producing = true
+                  void produce(producer).catch((error: unknown) => {
+                    const failure = error instanceof Error ? error : new Error(String(error))
+                    source.failure = failure
+                    upstream.resolve({ type: "failed", cause: Cause.fail(failure) })
+                    fail(relay, producer.__nemo_relay_stream_id, failure.message)
+                  })
+                },
+                undefined,
+                aggregate.value,
+                managed.parent,
+                STREAMING,
+                null,
+                metadata(managed.call),
+                managed.call.model.id,
+                ...codecs,
+              ),
+            ),
+          )
+          .then((llm) => {
+            lifecycle.llm = llm
+            return llm
+          })),
       catch: (error) => error,
-    }).pipe(Effect.exit)
-    if (Exit.isFailure(opened)) return yield* fallback(managed, opened.cause)
+    }).pipe(
+      Effect.onExit((exit) => (Exit.isFailure(exit) ? Effect.promise(close) : Effect.void)),
+      Effect.exit,
+    )
+    if (Exit.isFailure(opened)) {
+      yield* Effect.promise(close)
+      return yield* fallback(opened.cause)
+    }
 
     const llm = opened.value
+    lifecycle.llm = llm
+    if (abort.signal.aborted) {
+      yield* Effect.promise(() => llm.close().catch(() => undefined))
+      return yield* Effect.fail(new Error("Provider request was aborted"))
+    }
     // Pull eagerly: Relay may defer the provider callback until the first read, and an execution
     // intercept may answer without calling the provider at all.
     const first = llm.next()
     const started = yield* Effect.promise((signal) => {
-      signal.addEventListener("abort", () => abort.abort(), { once: true })
+      signal.addEventListener("abort", closeOnAbort, { once: true })
       return Promise.race([upstream.promise, first.then(local, local)])
-    })
+    }).pipe(Effect.onExit((exit) => (Exit.isFailure(exit) ? Effect.promise(close) : Effect.void)))
     if (started.type === "failed") {
-      yield* Effect.promise(() => llm.close().catch(() => undefined))
+      yield* Effect.promise(close)
       return yield* Effect.failCause(started.cause)
     }
     if (started.type === "response") {
-      yield* Effect.promise(() => llm.close().catch(() => undefined))
-      return new Response(started.body, {
+      yield* Effect.promise(close)
+      return new Response(responseBody(started.response.status, started.body), {
         status: started.response.status,
         statusText: started.response.statusText,
         headers: bodyHeaders(started.response.headers),
       })
     }
-    return new Response(body(llm, first, source, abort), {
+    managed.ownership.body = true
+    return new Response(body(llm, first, source, close), {
       status: started.type === "stream" ? started.response.status : 200,
+      statusText: started.type === "stream" ? started.response.statusText : undefined,
       headers:
         started.type === "stream" ? bodyHeaders(started.response.headers) : { "content-type": "text/event-stream" },
     })
@@ -175,8 +277,13 @@ const local = (): Upstream => ({ type: "local" })
 const body = (
   llm: LlmStream,
   first: Promise<unknown>,
-  source: { readonly named: boolean; readonly done: boolean; readonly failure?: Error },
-  abort: AbortController,
+  source: {
+    readonly named: boolean
+    readonly done: boolean
+    readonly failure?: Error
+    readonly invalid?: RelaySSE.Event
+  },
+  close: () => Promise<void>,
 ) => {
   const encoder = new TextEncoder()
   const pending: { next?: Promise<unknown> } = { next: first }
@@ -188,7 +295,11 @@ const body = (
       )
       pending.next = undefined
       if (read.chunk !== null) return controller.enqueue(encoder.encode(RelaySSE.encode(read.chunk, source.named)))
-      await llm.close().catch(() => undefined)
+      await close()
+      if (source.invalid) {
+        controller.enqueue(encoder.encode(RelaySSE.encodeEvent(source.invalid)))
+        return controller.close()
+      }
       // The provider's own failure keeps its identity for retry classification; Relay reports it wrapped.
       if (source.failure) return controller.error(source.failure)
       if ("error" in read) return controller.error(read.error)
@@ -196,8 +307,7 @@ const body = (
       controller.close()
     },
     async cancel() {
-      abort.abort()
-      await llm.close().catch(() => undefined)
+      await close()
     },
   })
 }
@@ -206,7 +316,10 @@ const unary = (managed: Managed) =>
   Effect.gen(function* () {
     const relay = managed.runtime.relay
     const run = Effect.runPromiseExitWith(yield* Effect.context<never>())
+    const abort = new AbortController()
+    managed.operation.onCancel(() => abort.abort())
     const captured: {
+      called?: boolean
       failure?: Cause.Cause<Error>
       response?: {
         readonly status: number
@@ -217,65 +330,90 @@ const unary = (managed: Managed) =>
     } = {}
     const executed = yield* Effect.tryPromise({
       try: (signal) =>
-        withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
-          relay.llmCallExecuteAsync(
-            managed.call.model.providerID,
-            managed.request,
-            async (intercepted: LlmRequest) => {
-              const exit = await run(managed.send(intercepted), { signal })
-              if (Exit.isFailure(exit)) {
-                captured.failure = exit.cause
-                throw new Error("provider request failed")
-              }
-              const text = await exit.value.text()
-              captured.response = {
-                status: exit.value.status,
-                statusText: exit.value.statusText,
-                headers: exit.value.headers,
-                text,
-              }
-              if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
-              return RelayHost.parse(text) ?? text
-            },
-            managed.parent,
-            0,
-            null,
-            metadata(managed.call),
-            managed.call.model.id,
-            ...codecs,
+        managed.operation.run(() =>
+          withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
+            relay.llmCallExecuteAsync(
+              managed.call.model.providerID,
+              managed.request,
+              async (intercepted: LlmRequest) => {
+                if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
+                captured.called = true
+                const requestSignal = AbortSignal.any([signal, abort.signal, managed.call.request.signal])
+                const exit = await run(managed.send(intercepted), { signal: requestSignal })
+                if (Exit.isFailure(exit)) {
+                  captured.failure = exit.cause
+                  throw new Error("provider request failed")
+                }
+                const body = await run(
+                  Effect.tryPromise({
+                    try: () => exit.value.text(),
+                    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+                  }),
+                  { signal: requestSignal },
+                )
+                if (Exit.isFailure(body)) {
+                  captured.failure = body.cause
+                  throw new Error("provider response body failed")
+                }
+                const text = body.value
+                captured.response = {
+                  status: exit.value.status,
+                  statusText: exit.value.statusText,
+                  headers: exit.value.headers,
+                  text,
+                }
+                if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
+                return RelayHost.parse(text) ?? text
+              },
+              managed.parent,
+              0,
+              null,
+              metadata(managed.call),
+              managed.call.model.id,
+              ...codecs,
+            ),
           ),
         ),
       catch: (error) => error,
     }).pipe(Effect.exit)
-    if (captured.failure) return yield* Effect.failCause(captured.failure)
+    if (
+      captured.failure &&
+      (Exit.isFailure(executed) || Cause.hasDies(captured.failure) || Cause.hasInterrupts(captured.failure))
+    )
+      return yield* Effect.failCause(captured.failure)
     const upstream = captured.response
-    if (upstream && (upstream.status >= 400 || Exit.isFailure(executed)))
-      return new Response(upstream.text, {
+    if (upstream && Exit.isFailure(executed))
+      return new Response(responseBody(upstream.status, upstream.text), {
         status: upstream.status,
         statusText: upstream.statusText,
         headers: bodyHeaders(upstream.headers),
       })
-    if (Exit.isFailure(executed)) return yield* fallback(managed, executed.cause)
+    if (Exit.isFailure(executed)) return yield* fallback(executed.cause)
+    const status = upstream?.status !== undefined && upstream.status < 400 ? upstream.status : 200
     return new Response(
-      upstream && RelayHost.sameJson(executed.value, RelayHost.parse(upstream.text))
-        ? upstream.text
-        : JSON.stringify(executed.value),
+      responseBody(
+        status,
+        upstream && RelayHost.sameJson(executed.value, RelayHost.parse(upstream.text) ?? upstream.text)
+          ? upstream.text
+          : JSON.stringify(executed.value),
+      ),
       {
-        status: upstream?.status ?? 200,
+        status,
+        statusText: upstream?.status !== undefined && upstream.status < 400 ? upstream.statusText : undefined,
         headers: upstream ? bodyHeaders(upstream.headers) : { "content-type": "application/json" },
       },
     )
   })
 
-/** A guardrail block answers locally; any other Relay failure before the provider call fails open. */
-const fallback = (managed: Managed, cause: Cause.Cause<unknown>) =>
+const responseBody = (status: number, text: string) => ([204, 205, 304].includes(status) ? null : text)
+
+/** A guardrail block answers locally. Other managed failures never replay a provider request. */
+const fallback = (cause: Cause.Cause<unknown>) =>
   Effect.gen(function* () {
     const reason = RelayHost.rejection(cause)
     if (reason !== undefined) return blocked(reason)
-    yield* Effect.logWarning("NeMo Relay could not manage a model request; sending it unmanaged", {
-      cause: Cause.pretty(cause),
-    })
-    return yield* managed.send(managed.request)
+    if (Cause.hasInterrupts(cause) || Cause.hasDies(cause)) return yield* Effect.failCause(cause).pipe(Effect.orDie)
+    return yield* Effect.fail(new Error("NeMo Relay could not manage this model request"))
   })
 
 // A content-policy failure is final: the session reports it instead of retrying the request.
@@ -297,10 +435,11 @@ const rebuild = (original: Request, text: string, request: LlmRequest, intercept
   Object.keys(request.headers)
     .filter((key) => !(key in intercepted.headers))
     .forEach((key) => headers.delete(key))
-  Object.entries(intercepted.headers).forEach(([key, value]) => headers.set(key, value))
+  Object.entries(intercepted.headers)
+    .filter(([key]) => !CREDENTIALS.has(key.toLowerCase()) && !key.toLowerCase().startsWith("x-amz-"))
+    .forEach(([key, value]) => headers.set(key, value))
   headers.delete("content-length")
-  return new Request(original.url, {
-    method: original.method,
+  return new Request(original, {
     headers,
     body: RelayHost.sameJson(intercepted.content, request.content) ? text : JSON.stringify(intercepted.content),
   })
@@ -322,8 +461,9 @@ const metadata = (call: SessionHttpCall) => ({
 })
 
 // Older bindings cannot fail a pushed stream; ending it keeps the partial output and the consumer still errors.
-const fail = (relay: RelayHost.Relay, id: number, message: string) => {
-  if ("failStream" in relay && typeof relay.failStream === "function") return void relay.failStream(id, message)
+const fail = (relay: RelayHost.Relay, id: number, message: string, exceptionType?: string) => {
+  if ("failStream" in relay && typeof relay.failStream === "function")
+    return void relay.failStream(id, message, exceptionType)
   relay.endStream(id)
 }
 
