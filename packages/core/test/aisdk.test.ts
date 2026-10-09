@@ -24,7 +24,7 @@ import {
 import { LLMClient, RequestExecutor } from "@opencode/ai/route"
 import { compileRequest } from "@opencode/ai/route/client"
 import { expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Effect, Fiber, Layer } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { testEffect } from "./lib/effect"
 
@@ -776,6 +776,69 @@ it.effect("sends AI SDK requests directly when no HTTP hook middleware is attach
     expect(bodies).toHaveLength(1)
     expect(typeof bodies[0]).toBe("string")
     expect(response.events.filter(LLMEvent.is.textDelta).map((event) => event.text)).toEqual(["upstream"])
+  }),
+)
+
+it.effect("aborts an AI SDK request when its Effect is interrupted before headers", () =>
+  Effect.gen(function* () {
+    const aisdk = yield* AISDK.Service
+    const started = Promise.withResolvers<void>()
+    const observed: { signal?: AbortSignal } = {}
+    yield* aisdk.hook.sdk((event) => {
+      event.sdk = {
+        languageModel: () => ({
+          ...streamModel([]),
+          doStream: (options: { abortSignal?: AbortSignal }) => {
+            observed.signal = options.abortSignal
+            started.resolve()
+            return new Promise((_, reject) => {
+              options.abortSignal?.addEventListener("abort", () => reject(options.abortSignal?.reason), { once: true })
+            })
+          },
+        }),
+      }
+    })
+    const resolved = yield* aisdk.model(model("test-ai-sdk"))
+    const fiber = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+      Effect.provide(client),
+      Effect.forkChild,
+    )
+    yield* Effect.promise(() => started.promise)
+    yield* Fiber.interrupt(fiber)
+    expect(observed.signal?.aborted).toBeTrue()
+  }),
+)
+
+it.effect("aborts only the middleware's cancelled HTTP dispatch before returning a replacement", () =>
+  Effect.gen(function* () {
+    const started = Promise.withResolvers<void>()
+    const observed: { signal?: AbortSignal | null } = {}
+    const resolved = yield* compatibleModel(
+      Object.assign(
+        (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          observed.signal = init?.signal
+          started.resolve()
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true })
+          })
+        },
+        { preconnect: fetch.preconnect },
+      ),
+    )
+    const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" }), {
+      http: (request, handler) =>
+        Effect.gen(function* () {
+          const fiber = yield* handler(request).pipe(Effect.forkChild)
+          yield* Effect.promise(() => started.promise)
+          yield* Fiber.interrupt(fiber)
+          expect(observed.signal?.aborted).toBeTrue()
+          return HttpClientResponse.fromWeb(
+            request,
+            new Response(chatChunk("replacement"), { headers: { "content-type": "text/event-stream" } }),
+          )
+        }),
+    }).pipe(Effect.provide(client))
+    expect(response.events.filter(LLMEvent.is.textDelta).map((event) => event.text)).toEqual(["replacement"])
   }),
 )
 
