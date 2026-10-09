@@ -23,7 +23,12 @@ const call: ToolExecution = {
   input: { path: "a.txt" },
 }
 
-const run = (bridge: Bridge, next: Parameters<ToolMiddlewares["execute"]>[1], signal?: AbortSignal) => {
+const run = (
+  bridge: Bridge,
+  next: Parameters<ToolMiddlewares["execute"]>[1],
+  signal?: AbortSignal,
+  release = () => {},
+) => {
   const parent = { uuid: "scope_tool_unit" } as ScopeHandle
   const runtime: RelayHost.Runtime = {
     relay: {
@@ -38,7 +43,7 @@ const run = (bridge: Bridge, next: Parameters<ToolMiddlewares["execute"]>[1], si
         parent,
         run: (callback) => callback(),
         onCancel: () => {},
-        release: () => {},
+        release,
       }),
     close: () => {},
   }
@@ -167,6 +172,38 @@ describe("Relay tool middleware boundaries", () => {
     const exit = await pending
     expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
     expect(state).toEqual({ calls: 1, finalized: true })
+  })
+
+  test("holds the operation lease until native terminal processing settles after cancellation", async () => {
+    const started = Promise.withResolvers<void>()
+    const drained = Promise.withResolvers<void>()
+    const tail = Promise.withResolvers<void>()
+    const aborted = new AbortController()
+    const state = { released: false, settled: false }
+    const pending = run(
+      async (input, next) => {
+        await next(input, new AbortController().signal).catch(() => undefined)
+        drained.resolve()
+        await tail.promise
+        return { result: { content: "cancelled" } }
+      },
+      () => Effect.sync(() => started.resolve()).pipe(Effect.andThen(Effect.never)),
+      aborted.signal,
+      () => {
+        state.released = true
+      },
+    ).then((exit) => {
+      state.settled = true
+      return exit
+    })
+    await started.promise
+    aborted.abort()
+    await drained.promise
+    expect(state).toEqual({ released: false, settled: false })
+    tail.resolve()
+    const exit = await pending
+    expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+    expect(state).toEqual({ released: true, settled: true })
   })
 
   test("never bypasses selected plugins on managed failure or guardrail rejection", async () => {

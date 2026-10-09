@@ -32,12 +32,13 @@ export const middleware =
       const run = Effect.runPromiseExitWith(yield* Effect.context<never>())
       const inner: {
         task?: Promise<Exit.Exit<Tool.Result, Tool.Error>>
+        bridge?: Promise<unknown>
         result?: unknown
         aborted?: AbortSignal
       } = {}
       const managed = yield* Effect.tryPromise({
         try: (signal) =>
-          operation.run(() =>
+          (inner.bridge = operation.run(() =>
             runtime.relay.toolCallExecuteAsync(
               execution.tool,
               RelayHost.json(execution.input),
@@ -63,12 +64,14 @@ export const middleware =
               },
               execution.id,
             ),
-          ),
+          )),
         catch: (error) => error,
       }).pipe(
         Effect.ensuring(
           Effect.promise(async () => {
             await inner.task
+            // Cancellation stops Effect's wait, not the native operation's terminal processing.
+            await inner.bridge?.catch(() => undefined)
           }),
         ),
         Effect.onExit(() => Effect.sync(operation.release)),
