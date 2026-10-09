@@ -80,6 +80,9 @@ await $`bun ./packages/plugin/script/publish.ts`
 console.log("\n=== plugin-browser ===\n")
 await $`bun ./packages/plugin-browser/script/publish.ts`
 
+console.log("\n=== plugin-nemo-relay ===\n")
+await $`bun ./packages/plugin-nemo-relay/script/publish.ts`
+
 console.log("\n=== core ===\n")
 await $`bun ./packages/core/script/publish.ts`
 
