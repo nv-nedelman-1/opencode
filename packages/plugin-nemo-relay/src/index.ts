@@ -53,6 +53,11 @@ export default Plugin.define({
       yield* ctx.session.hook("compaction", (event) => observe(observed.context(event, "compaction")))
       yield* ctx.session.hook("generate", (event) => observe(observed.context(event, "generate")))
       yield* ctx.session.hook("title", (event) => observe(observed.context(event, "title")))
+      yield* ctx.session.hook("context.usage", (event) => observe(observed.contextUsage(event)))
+      yield* ctx.session.hook("retry.decision", (event) => observe(observed.retryDecision(event)))
+      yield* ctx.session.hook("compaction.outcome", (event) => observe(observed.compactionOutcome(event)))
+      yield* ctx.session.hook("usage", (event) => observe(observed.usage(event)))
+      yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
       yield* ctx.event.subscribe().pipe(
         Stream.filter(EventManifest.isServer),
         Stream.runForEach((event) => observe(observed.event(event))),
