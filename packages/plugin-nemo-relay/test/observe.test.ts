@@ -181,6 +181,25 @@ test("generic retries keep one observed step record and its earliest start", () 
 
   expect(fixture.marks).toHaveLength(2)
   expect(fixture.marks[1][2]).toMatchObject({ duration_ms: 200 })
+  Effect.runSync(
+    fixture.observer.event(
+      published(
+        SessionEvent.Step.Failed,
+        {
+          sessionID,
+          assistantMessageID: SessionMessage.ID.make("msg_missing_start"),
+          error: { type: "aborted", message: "SECRET" },
+        },
+        320,
+      ),
+    ),
+  )
+  expect(fixture.marks[2][2]).toEqual({
+    count: 1,
+    outcome: "cancelled",
+    accounting_source: "host_step",
+    error_type: "aborted",
+  })
 })
 
 test("context observations count structure, not request content or invented token estimates", () => {
@@ -246,14 +265,76 @@ test("skill requests and successful loads are distinct from user activation and 
     published(McpEvent.StatusChanged, { server: "SECRET" }, 150),
   ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
-  expect(fixture.marks.map((mark) => [mark[1], mark[2]])).toEqual([
+  expect(
+    fixture.marks.filter((mark) => mark[1] !== "opencode.tool.completed").map((mark) => [mark[1], mark[2]]),
+  ).toEqual([
     ["opencode.skill.activated", { count: 1, source: "user", character_count: 6 }],
     ["opencode.skill.tool.requested", { count: 1 }],
-    ["opencode.skill.tool.completed", { count: 1, outcome: "success", execution: "host" }],
+    ["opencode.skill.tool.completed", { count: 1, category: "skill", outcome: "success", provider_executed: false }],
     ["opencode.skill.catalog.updated", { count: 1 }],
     ["opencode.mcp.status.changed", { count: 1 }],
   ])
   expect(fixture.marks.slice(-2).map((mark) => mark[0])).toEqual([undefined, undefined])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("provider tools and concurrent host tools get distinct nonadditive host summaries", () => {
+  const fixture = makeFixture()
+  ;[
+    published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "shared", name: "websearch" }, 100),
+    published(
+      SessionEvent.Tool.Input.Started,
+      { sessionID: sibling, assistantMessageID, id: "shared", name: "bash" },
+      110,
+    ),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "shared", executed: true, content: [{ type: "text", text: "SECRET" }] },
+      120,
+    ),
+    published(
+      SessionEvent.Tool.Failed,
+      {
+        sessionID: sibling,
+        assistantMessageID,
+        id: "shared",
+        executed: false,
+        error: { type: "aborted", message: "SECRET" },
+      },
+      130,
+    ),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
+    [sessionID, "opencode.tool.completed", { count: 1, category: "web", outcome: "success", provider_executed: true }],
+    [
+      sibling,
+      "opencode.tool.completed",
+      { count: 1, category: "terminal", outcome: "cancelled", provider_executed: false },
+    ],
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("V2 subagent tool calls and their permissions are classified as delegation", () => {
+  const fixture = makeFixture()
+  const permission = Permission.ID.create()
+  ;[
+    published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "call", name: "subagent" }, 100),
+    published(Permission.Event.Asked, { sessionID, id: permission, action: "subagent", resources: ["SECRET"] }, 110),
+    published(Permission.Event.Replied, { sessionID, requestID: permission, reply: "once" }, 120),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "call", executed: false, content: [{ type: "text", text: "SECRET" }] },
+      130,
+    ),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  expect(fixture.marks.map((mark) => mark[2])).toEqual([
+    { count: 1, family: "delegation" },
+    { count: 1, family: "delegation", resolution: "once", duration_ms: 10 },
+    { count: 1, category: "delegation", outcome: "success", provider_executed: false },
+  ])
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
 })
 

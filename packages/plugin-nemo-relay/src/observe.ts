@@ -30,7 +30,7 @@ interface SessionState {
   compaction?: number
   readonly steps: Map<SessionMessage.ID, number>
   readonly permissions: Map<string, { readonly started: number; readonly family: string }>
-  readonly skills: Set<string>
+  readonly tools: Map<string, string>
 }
 
 /** Host accounting complements managed provider telemetry; it is not a second provider-token counter. */
@@ -41,7 +41,7 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
   const state = (id: Session.ID) => {
     const existing = sessions.get(id)
     if (existing) return existing
-    const created: SessionState = { steps: new Map(), permissions: new Map(), skills: new Set() }
+    const created: SessionState = { steps: new Map(), permissions: new Map(), tools: new Map() }
     sessions.set(id, created)
     return created
   }
@@ -114,7 +114,12 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
         case "session.step.failed":
           mark(event.data.sessionID, "opencode.agent.step.completed", {
             count: 1,
-            outcome: event.type === "session.step.ended" ? "success" : "failed",
+            outcome:
+              event.type === "session.step.ended"
+                ? "success"
+                : event.data.error.type === "aborted"
+                  ? "cancelled"
+                  : "failed",
             ...duration(sessions.get(event.data.sessionID)?.steps.get(event.data.assistantMessageID), event.created),
             ...(event.data.finish === undefined ? {} : { finish: event.data.finish }),
             accounting_source: "host_step",
@@ -141,7 +146,12 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           mark(event.data.sessionID, "opencode.compaction.completed", {
             count: 1,
             reason: event.data.reason,
-            outcome: event.type === "session.compaction.ended" ? "success" : "failed",
+            outcome:
+              event.type === "session.compaction.ended"
+                ? "success"
+                : event.data.error.type === "aborted"
+                  ? "cancelled"
+                  : "failed",
             ...duration(sessions.get(event.data.sessionID)?.compaction, event.created),
             accounting_source: "host_compaction",
             ...(event.data.cost === undefined ? {} : { cost_usd: event.data.cost }),
@@ -174,20 +184,35 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           })
           return
         case "session.tool.input.started":
+          state(event.data.sessionID).tools.set(
+            `${event.data.assistantMessageID}:${event.data.id}`,
+            toolCategory(event.data.name),
+          )
           if (event.data.name === "skill") {
-            state(event.data.sessionID).skills.add(`${event.data.assistantMessageID}:${event.data.id}`)
             mark(event.data.sessionID, "opencode.skill.tool.requested", { count: 1 })
           }
           return
         case "session.tool.success":
-        case "session.tool.failed":
-          if (sessions.get(event.data.sessionID)?.skills.delete(`${event.data.assistantMessageID}:${event.data.id}`))
-            mark(event.data.sessionID, "opencode.skill.tool.completed", {
-              count: 1,
-              outcome: event.type === "session.tool.success" ? "success" : "failed",
-              execution: event.data.executed ? "provider" : "host",
-            })
+        case "session.tool.failed": {
+          const key = `${event.data.assistantMessageID}:${event.data.id}`
+          const tools = sessions.get(event.data.sessionID)?.tools
+          const category = tools?.get(key) ?? "unknown"
+          const data = {
+            count: 1,
+            category,
+            outcome:
+              event.type === "session.tool.success"
+                ? "success"
+                : event.data.error.type === "aborted"
+                  ? "cancelled"
+                  : "failed",
+            provider_executed: event.data.executed,
+          }
+          mark(event.data.sessionID, "opencode.tool.completed", data)
+          if (category === "skill") mark(event.data.sessionID, "opencode.skill.tool.completed", data)
+          tools?.delete(key)
           return
+        }
         case "permission.asked": {
           const family = permissionFamily(event.data.action)
           state(event.data.sessionID).permissions.set(event.data.id, { started: event.created, family })
@@ -279,6 +304,21 @@ const permissionFamily = (action: string) => {
   if (["edit", "write", "apply_patch"].includes(action)) return "file_write"
   if (["bash", "shell", "terminal"].includes(action)) return "terminal"
   if (action === "skill") return "skill"
-  if (action === "task") return "delegation"
+  if (["task", "subagent"].includes(action)) return "delegation"
   return "other"
+}
+
+const toolCategory = (name: string) => {
+  if (["read", "list", "ls"].includes(name)) return "file_read"
+  if (["write", "edit", "apply_patch", "patch"].includes(name)) return "file_write"
+  if (["bash", "shell"].includes(name)) return "terminal"
+  if (["grep", "glob", "lsp", "code_search"].includes(name)) return "code_search"
+  if (["webfetch", "websearch"].includes(name)) return "web"
+  if (["todo", "todowrite", "plan", "plan_exit"].includes(name)) return "planning"
+  if (["task", "subagent"].includes(name)) return "delegation"
+  if (name === "question") return "human_input"
+  if (name === "skill") return "skill"
+  if (name === "execute") return "code_execution"
+  if (["list_mcp_resources", "read_mcp_resource"].includes(name)) return "mcp_resource"
+  return "extension"
 }
