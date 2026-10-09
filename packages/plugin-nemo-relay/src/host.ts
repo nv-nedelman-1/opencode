@@ -82,7 +82,9 @@ let closing: Promise<StartupFailure | undefined> = Promise.resolve(undefined)
  * Shares one process-wide Relay runtime between plugin instances. The runtime starts only when Relay
  * is configured, and the last release drains open scopes, flushes subscribers, and closes the host.
  */
-export const acquire = (options: Options = {}): Effect.Effect<Runtime | StartupFailure | undefined, never, Scope.Scope> =>
+export const acquire = (
+  options: Options = {},
+): Effect.Effect<Runtime | StartupFailure | undefined, never, Scope.Scope> =>
   Effect.acquireRelease(
     Effect.gen(function* () {
       const context = yield* Effect.context<never>()
@@ -167,7 +169,9 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
     return failure
   }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
-  return make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
+  const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
+  runtime.mark(undefined, "opencode.runtime.activation", { count: 1 })
+  return runtime
 })
 
 // Checking separately keeps compatibility with declarations that predate these optional exports.

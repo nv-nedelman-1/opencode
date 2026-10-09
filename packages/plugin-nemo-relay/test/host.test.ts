@@ -134,6 +134,19 @@ test("host marks emit parented metric instruments once per admitted event", asyn
     expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
       expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
     ])
+    // A terminal event may finish several waits; suffixes preserve each sample without replaying it.
+    for (const requestID of ["a", "b", "a", "b"])
+      native.runtime.mark(
+        session,
+        "opencode.permission.wait.completed",
+        { count: 1, family: "terminal", resolution: "cancelled", duration_ms: 25 },
+        { "opencode.event_id": `terminal-event:permission:${requestID}` },
+      )
+    await native.relay.flushSubscribers()
+    expect(native.events.filter((event) => event.name === "opencode.permission.wait.completed.metrics")).toEqual([
+      expect.objectContaining({ parent_uuid: parent.uuid }),
+      expect.objectContaining({ parent_uuid: parent.uuid }),
+    ])
     native.runtime.close(session, "success")
   } finally {
     await native.dispose()
@@ -317,6 +330,7 @@ test("Location owners share process startup and only the last release closes ses
     await Effect.runPromise(Scope.close(scopes[0], Exit.void))
     await relay.flushSubscribers()
     expect(events.filter((event) => event.scope_category === "end")).toEqual([])
+    expect(events.filter((event) => event.name === "opencode.runtime.activation.metrics")).toHaveLength(1)
     const operation = await Effect.runPromise(runtimes[1].lease(id("owners"), noParent))
     expect(operation.parent.uuid).toBe(session.uuid)
     operation.release()
