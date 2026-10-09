@@ -1,23 +1,20 @@
 import { Plugin } from "@opencode/plugin/effect"
+import { EventManifest } from "@opencode/schema/event-manifest"
 import type { Session } from "@opencode/schema/session"
-import type { SessionEvent } from "@opencode/schema/session-event"
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Stream } from "effect"
 import { RelayHost } from "./host.js"
 import { RelayModel } from "./model.js"
 import { RelayTool } from "./tool.js"
+import { RelayObserve } from "./observe.js"
 
-type Terminal =
-  | SessionEvent.Execution.Succeeded
-  | SessionEvent.Execution.Failed
-  | SessionEvent.Execution.Interrupted
-  | SessionEvent.Deleted
-
-const OUTCOMES = {
-  "session.execution.succeeded": "success",
-  "session.execution.failed": "failed",
-  "session.execution.interrupted": "cancelled",
-  "session.deleted": "cancelled",
-} as const satisfies Record<Terminal["type"], RelayHost.Outcome>
+const observe = (effect: Effect.Effect<void>) =>
+  effect.pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.failCause(cause).pipe(Effect.orDie)
+        : Effect.logWarning("NeMo Relay host observation failed"),
+    ),
+  )
 
 /**
  * Built-in NeMo Relay integration. It activates when Relay is configured through its user or system
@@ -37,9 +34,11 @@ export default Plugin.define({
         )
       yield* ctx.tool.middleware("execute", RelayTool.middleware(runtime, parentID))
       yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
+      const observed = RelayObserve.make(runtime)
+      yield* ctx.session.hook("context", (event) => observe(observed.context(event)))
       yield* ctx.event.subscribe().pipe(
-        Stream.filter((event): event is Terminal => event.type in OUTCOMES),
-        Stream.runForEach((event) => Effect.sync(() => runtime.close(event.data.sessionID, OUTCOMES[event.type]))),
+        Stream.filter(EventManifest.isServer),
+        Stream.runForEach((event) => observe(observed.event(event))),
         Effect.forkScoped({ startImmediately: true }),
       )
     }),
