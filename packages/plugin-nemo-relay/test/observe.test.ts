@@ -134,7 +134,7 @@ test("step, retry, and compaction observations whitelist host data without dupli
   expect(fixture.marks[1][2]).toEqual({
     count: 1,
     attempt: 2,
-    delay_ms: 50,
+    remaining_delay_ms: 50,
     error_type: "provider.rate-limit",
     status: 429,
   })
@@ -157,6 +157,30 @@ test("step, retry, and compaction observations whitelist host data without dupli
   })
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
   expect(fixture.opened).toEqual([])
+})
+
+test("generic retries keep one observed step record and its earliest start", () => {
+  const fixture = makeFixture()
+  ;[
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 100 },
+      120,
+    ),
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 200 },
+      220,
+    ),
+    published(
+      SessionEvent.Step.Ended,
+      { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0), tokens },
+      300,
+    ),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  expect(fixture.marks).toHaveLength(2)
+  expect(fixture.marks[1][2]).toMatchObject({ duration_ms: 200 })
 })
 
 test("context observations count structure, not request content or invented token estimates", () => {

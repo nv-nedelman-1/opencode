@@ -100,6 +100,7 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           return
         }
         case "session.step.started":
+          if (state(event.data.sessionID).steps.has(event.data.assistantMessageID)) return
           state(event.data.sessionID).steps.set(event.data.assistantMessageID, event.data.started)
           // This event is published after provider output starts, not at the dispatch boundary.
           mark(event.data.sessionID, "opencode.agent.step.started", { count: 1, started_ms: event.data.started })
@@ -127,7 +128,7 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           mark(event.data.sessionID, "opencode.llm.host_retry.scheduled", {
             count: 1,
             attempt: event.data.attempt,
-            delay_ms: Math.max(0, event.data.at - event.created),
+            remaining_delay_ms: Math.max(0, event.data.at - event.created),
             ...failure(event.data.error),
           })
           return
