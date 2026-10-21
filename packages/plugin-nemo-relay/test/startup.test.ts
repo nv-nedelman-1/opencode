@@ -98,7 +98,10 @@ test.each([
   }
 })
 
-test.each(["failStream", "pushStreamChunkAsync"])("a loaded binding without %s is a blocking startup failure", async (api) => {
+test.each([
+  ["keeps the push-based stream bridge", "pushStreamChunk: () => true"],
+  ["lacks llmStreamCallExecute", "llmStreamCallExecute: undefined"],
+])("a loaded binding that %s is a blocking startup failure", async (_, change) => {
   // Isolate module substitution so other native tests keep their real binding.
   const child = Bun.spawn(
     [
@@ -108,10 +111,10 @@ test.each(["failStream", "pushStreamChunkAsync"])("a loaded binding without %s i
        import { Effect } from "effect";
        import { RelayBinding } from "./src/binding.ts";
        const [relay, plugin] = await RelayBinding.load();
-       mock.module("./src/binding.ts", () => ({ RelayBinding: { load: async () => [{...relay, ${api}: undefined}, plugin] } }));
+       mock.module("./src/binding.ts", () => ({ RelayBinding: { load: async () => [{...relay, ${change}}, plugin] } }));
        const { RelayHost } = await import("./src/host.ts");
        const runtime = await Effect.runPromise(Effect.scoped(RelayHost.acquire({config: plugin.defaultConfig()})));
-       if (!(runtime instanceof RelayHost.StartupFailure) || !runtime.error.message.includes("${api}")) process.exit(1);`,
+       if (!(runtime instanceof RelayHost.StartupFailure) || !runtime.error.message.includes("pull-based streaming")) process.exit(1);`,
     ],
     { cwd: path.resolve(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" },
   )

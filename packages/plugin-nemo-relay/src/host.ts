@@ -136,7 +136,7 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
   const [relay, plugin] = modules.value
   if (!supportsStreaming(relay)) {
     const failure = new StartupFailure(
-      "NeMo Relay native runtime lacks required streaming APIs; install a Node binding with failStream and pushStreamChunkAsync before enabling Relay",
+      "NeMo Relay native runtime lacks pull-based streaming; install a Node binding whose stream providers return an AsyncIterable (NeMo Relay 0.11 or newer) before enabling Relay",
     )
     yield* Effect.logWarning(failure.error.message)
     return failure
@@ -174,12 +174,10 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
   return runtime
 })
 
-// Checking separately keeps compatibility with declarations that predate these optional exports.
+// Before NeMo Relay 0.11, stream producers pushed chunks with `pushStreamChunk` instead of returning an
+// AsyncIterable for Relay to pull, which is what bounds read-ahead and propagates provider failures.
 const supportsStreaming = (relay: object): boolean =>
-  "failStream" in relay &&
-  typeof relay.failStream === "function" &&
-  "pushStreamChunkAsync" in relay &&
-  typeof relay.pushStreamChunkAsync === "function"
+  "llmStreamCallExecute" in relay && typeof relay.llmStreamCallExecute === "function" && !("pushStreamChunk" in relay)
 
 // Core also runs on Node and workerd, so this avoids Bun-only file APIs.
 const configured = (explicit: string | undefined) =>

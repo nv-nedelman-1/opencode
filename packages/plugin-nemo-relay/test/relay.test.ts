@@ -412,8 +412,7 @@ describe("recorded telemetry", () => {
     )
   })
 
-  // Bindings without failStream can only end a pushed stream cleanly.
-  test.if("failStream" in relay)("records a provider stream that failed midway as a failed LLM call", async () => {
+  test("records a provider stream that failed midway as a failed LLM call", async () => {
     const end = (await recorded()).find(
       (event) => event.kind === "scope" && event.scope_category === "end" && event.name === "flaky",
     )

@@ -8,14 +8,10 @@ export interface Event {
 }
 
 /**
- * Reads server-sent events from `body` until it ends, `onEvent` returns false, or `signal` aborts.
- * Rejects when the body fails mid-stream.
+ * Yields server-sent events from `body` as they are pulled, until it ends or `signal` aborts.
+ * Stopping early or aborting cancels the body; a body failure mid-stream throws.
  */
-export const read = async (
-  body: ReadableStream<Uint8Array>,
-  onEvent: (event: Event) => boolean | Promise<boolean>,
-  signal: AbortSignal,
-) => {
+export async function* events(body: ReadableStream<Uint8Array>, signal: AbortSignal): AsyncGenerator<Event, void> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   const cleanup: { cancelled?: Promise<void> } = {}
@@ -25,7 +21,7 @@ export const read = async (
   }
   signal.addEventListener("abort", onAbort, { once: true })
   if (signal.aborted) onAbort()
-  const consume = async () => {
+  try {
     let buffer = ""
     while (true) {
       const chunk = await reader.read()
@@ -36,18 +32,30 @@ export const read = async (
       const blocks = buffer.split("\n\n")
       buffer = (blocks.pop() ?? "") + trailingCR
       for (const block of blocks) {
-        if (signal.aborted) return cancel()
+        if (signal.aborted) return
         const event = parse(block)
-        if (event && (!(await onEvent(event)) || signal.aborted)) return cancel()
+        if (event) yield event
+        if (signal.aborted) return
       }
       if (chunk.done) return
     }
-  }
-  await consume().finally(async () => {
+  } finally {
     signal.removeEventListener("abort", onAbort)
     await cancel()
     reader.releaseLock()
-  })
+  }
+}
+
+/**
+ * Reads server-sent events from `body` until it ends, `onEvent` returns false, or `signal` aborts.
+ * Rejects when the body fails mid-stream.
+ */
+export const read = async (
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: Event) => boolean | Promise<boolean>,
+  signal: AbortSignal,
+) => {
+  for await (const event of events(body, signal)) if (!(await onEvent(event))) return
 }
 
 const parse = (block: string): Event | undefined => {

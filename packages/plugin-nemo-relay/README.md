@@ -98,7 +98,7 @@ HTTP support must not be mistaken for universal transport coverage:
 
 The AI-SDK adapter identifies its route as `ai-sdk`, not the actual provider wire protocol. The Relay bridge therefore cannot promise structured provider decoding on that path. A protocol annotation must come from the component selecting the actual SDK/language model; guessing from model names or provider labels is unsafe because hooks can replace that selection.
 
-Serial producer pushes now await native consumption, bounding chunk-count read-ahead through the native bridge; the synchronous native push API remains available for compatibility and is not bounded. The integration retains incremental aggregate response output, not the full raw-frame history. This is not a byte-memory limit: large network chunks, oversized frames, and the accumulated response itself still need workload qualification and deployment limits.
+Relay pulls each chunk from the stream producer, an AsyncIterable over the provider's SSE body, so the body is read no faster than the stream is consumed. Closing the stream early aborts the producer's signal and runs its cleanup, and a producer failure ends the managed call as failed. The integration retains incremental aggregate response output, not the full raw-frame history. This is not a byte-memory limit: large network chunks, oversized frames, and the accumulated response itself still need workload qualification and deployment limits.
 
 ## Activation and cleanup
 
@@ -110,7 +110,7 @@ Configuration is process-global and selected by the first acquiring Location; pe
 
 ## Qualification
 
-The audit tests use a native addon built from the corresponding Relay source and its corrections, not just the originally pinned published `0.10.0-rc.4` package. Built-in codec-instance identity, explicit `failStream`, and awaitable `pushStreamChunkAsync` require the appropriate Node binding changes. The current pin cannot activate this hardened adapter. The latest inspected release, `0.10.0`, also lacks the required streaming APIs. A released dependency containing those changes must be selected and requalified before shipping; no speculative version bump is made here.
+The audit tests use a native addon built from the corresponding Relay source, not the pinned published `0.10.0-rc.4` package. The adapter needs NeMo Relay 0.11's pull-based stream bridge, in which stream producers return an AsyncIterable; a binding that still has the 0.10 push bridge (`pushStreamChunk`) is a blocking startup failure, so the current pin cannot activate it. No stable release has that bridge yet: `0.10.4` is the newest, and 0.11 exists only as nightly builds. Built-in codec instances, which keep the built-in identity Relay's export presets need, come from the corresponding Relay branch; a binding that takes only codec callbacks still works, through callbacks. A released dependency containing these changes must be selected and requalified before shipping; no speculative version bump is made here.
 
 Focused verification from this package:
 
