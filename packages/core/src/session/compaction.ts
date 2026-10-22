@@ -24,6 +24,7 @@ import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
 import { llmClient } from "../effect/app-node-platform.js"
 import { Model } from "../model.js"
+import { PluginHooks } from "../plugin/hooks.js"
 import { State } from "../state.js"
 import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
@@ -77,6 +78,7 @@ type Result = {
   readonly providerState?: SessionMessage.ProviderState
   readonly providerContext?: SessionProviderContext.Info
   readonly metadata?: Record<string, unknown>
+  readonly sourceEstimatedTokens?: number
 }
 
 type Failure = {
@@ -191,6 +193,7 @@ export const layer = Layer.effect(
     const models = yield* SessionRunnerModel.Service
     const db = (yield* Database.Service).db
     const requests = yield* SessionModelRequest.Service
+    const hooks = yield* PluginHooks.Service
 
     const state = State.create<Settings, Editor>({
       name: "session-compaction",
@@ -202,14 +205,24 @@ export const layer = Layer.effect(
       }),
     })
 
-    const compact = Effect.fn("SessionCompaction.compact")(function* (trigger: Trigger): Effect.fn.Return<Outcome> {
+    const compact = Effect.fn("SessionCompaction.compact")(function* (
+      trigger: Trigger,
+      settle: () => void,
+    ): Effect.fn.Return<Outcome> {
       const settings = state.get()
       const context = trigger.context
 
       // Only the user compacts when automatic compaction is off, overflow included.
-      if (trigger.reason !== "manual" && !settings.auto) return { status: "skipped" }
-      if (trigger.reason === "auto" && !due(context, calculateCeiling(context.model.limit, settings.buffer)))
+      if (trigger.reason !== "manual" && !settings.auto) {
+        settle()
+        yield* observe(trigger, "skipped")
         return { status: "skipped" }
+      }
+      if (trigger.reason === "auto" && !due(context, calculateCeiling(context.model.limit, settings.buffer))) {
+        settle()
+        yield* observe(trigger, "skipped")
+        return { status: "skipped" }
+      }
       const native = context.model.compaction?.type === "native"
       const agent = native ? undefined : yield* agents.get(Agent.ID.make("compaction"))
       const model =
@@ -233,8 +246,8 @@ export const layer = Layer.effect(
         : summarize(selected, budget, settings.keep)
       return yield* compaction.pipe(
         Effect.matchEffect({
-          onSuccess: (result) => publish(selected, result),
-          onFailure: (failure) => publish(selected, failure),
+          onSuccess: (result) => publish(selected, result, trigger, settle),
+          onFailure: (failure) => publish(selected, failure, trigger, settle),
         }),
       )
     })
@@ -306,7 +319,9 @@ export const layer = Layer.effect(
         })
 
       const overhead = Token.estimate(prompt) + Token.estimate(NUDGE)
-      return yield* deliver(trigger, prepared, split.recent, budget - overhead, send)
+      return yield* deliver(trigger, prepared, split.recent, budget - overhead, send).pipe(
+        Effect.map((result) => ({ ...result, sourceEstimatedTokens: estimateRequest(prepared.request) })),
+      )
     })
 
     /**
@@ -343,7 +358,7 @@ export const layer = Layer.effect(
       }
 
       const toResult = (window: ReadonlyArray<Message>, usage: Usage | undefined) =>
-        spend(context.session.id, usage && SessionUsage.record(usage, context.model.cost)).pipe(
+        spend(context, usage && SessionUsage.record(usage, context.model.cost)).pipe(
           Effect.as<Result>({
             text: "",
             recent: "",
@@ -447,6 +462,8 @@ export const layer = Layer.effect(
           agent: context.agent.id,
           model: context.model.ref,
           hook: prepared.retry,
+          kind: "compaction",
+          observe: prepared.retryDecision,
           retry: SessionRunnerRetry.isRetryable(cause),
         })
         if (!decision.retry) return yield* Effect.fail<Failure>({ error })
@@ -529,7 +546,7 @@ export const layer = Layer.effect(
             }
 
             if (LLMEvent.is.stepFinish(event)) {
-              return spend(sessionID, SessionUsage.record(event.usage, context.model.cost)).pipe(
+              return spend(context, SessionUsage.record(event.usage, context.model.cost)).pipe(
                 Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
               )
             }
@@ -597,7 +614,7 @@ export const layer = Layer.effect(
         tokens: supplied.tokens,
         cost: SessionUsage.calculateCost(context.model.cost, supplied.tokens),
       }
-      return spend(context.session.id, usage).pipe(
+      return spend(context, usage).pipe(
         Effect.as<Result>({
           text: supplied.summary,
           recent,
@@ -612,17 +629,75 @@ export const layer = Layer.effect(
      * compaction's message shows the total across all of its calls. A session never runs two compactions at once.
      */
     const spent = new Map<SessionContext.Loaded["session"]["id"], SessionUsage.Recorded>()
-    const spend = (sessionID: SessionContext.Loaded["session"]["id"], usage: SessionUsage.Recorded | undefined) =>
+    const spend = (context: SessionContext.Loaded, usage: SessionUsage.Recorded | undefined) =>
       Effect.gen(function* () {
         if (!usage) return
+        const sessionID = context.session.id
         const total = spent.get(sessionID)
         spent.set(sessionID, total ? SessionUsage.add(total, usage) : usage)
         yield* bus.publish(SessionEvent.UsageRecorded, { sessionID, source: "compaction", ...usage })
+        yield* hooks.trigger(
+          "session",
+          "usage",
+          Object.freeze({
+            sessionID,
+            agent: context.agent.id,
+            model: context.model.ref,
+            source: "compaction",
+            ...SessionUsage.snapshot(usage),
+            costSource: "host_calculated",
+          }),
+        )
+      })
+
+    const observe = (
+      trigger: Trigger,
+      status: PluginHooks.Domains["session"]["compaction.outcome"]["status"],
+      result?: Result,
+    ) =>
+      Effect.gen(function* () {
+        if (!(yield* hooks.has("session", "compaction.outcome", trigger.context.model.ref.providerID))) return
+        const context = trigger.context
+        const unknown =
+          context.messages.findLastIndex(SessionProviderContext.isCheckpoint) >
+          context.messages.findLastIndex((message) => hasMeasuredPrompt(message, context.model.ref))
+        const after =
+          result && !result.providerContext
+            ? estimateContext({
+                ...context,
+                messages: yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie),
+              })
+            : undefined
+        yield* hooks.trigger(
+          "session",
+          "compaction.outcome",
+          Object.freeze({
+            sessionID: context.session.id,
+            agent: context.agent.id,
+            model: context.model.ref,
+            trigger: trigger.reason,
+            status,
+            ...(!unknown ? { before: estimateContext(context) } : {}),
+            ...(after !== undefined ? { after } : {}),
+            ...(context.model.limit.context > 0 ? { limit: context.model.limit.context } : {}),
+            ...(result && !result.providerContext
+              ? {
+                  summaryEstimatedTokens: Token.estimate(result.text),
+                  retainedEstimatedTokens: Token.estimate(result.recent),
+                  ...(!unknown && result.sourceEstimatedTokens !== undefined
+                    ? { sourceEstimatedTokens: result.sourceEstimatedTokens }
+                    : {}),
+                }
+              : {}),
+          }),
+        )
       })
 
     const publish = Effect.fnUntraced(function* (
       trigger: Trigger,
       outcome: Result | Failure,
+      source = trigger,
+      settle?: () => void,
     ): Effect.fn.Return<Outcome> {
       const context = trigger.context
       const sessionID = context.session.id
@@ -637,6 +712,8 @@ export const layer = Layer.effect(
           error: outcome.error,
           ...usage,
         })
+        settle?.()
+        yield* observe(source, outcome.error.type === "compaction.interrupted" ? "interrupted" : "failed")
         return { status: "failed", error: outcome.error }
       }
 
@@ -654,6 +731,8 @@ export const layer = Layer.effect(
         },
         { metadata: outcome.metadata },
       )
+      settle?.()
+      yield* observe(source, "completed", outcome)
       return { status: "completed" }
     })
 
@@ -662,14 +741,23 @@ export const layer = Layer.effect(
       reload: state.reload,
       // A manual compaction settles through its `/compact` inbox item, which the runner owns.
       compact: (trigger) =>
-        compact(trigger).pipe(
-          Effect.onInterrupt(() =>
-            trigger.reason === "manual"
-              ? Effect.void
-              : publish(trigger, { error: { type: "compaction.interrupted", message: "Compaction was interrupted" } }),
-          ),
-          Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
-        ),
+        Effect.suspend(() => {
+          const state = { settled: false }
+          return compact(trigger, () => {
+            state.settled = true
+          }).pipe(
+            Effect.onInterrupt(() =>
+              state.settled
+                ? Effect.void
+                : trigger.reason === "manual"
+                  ? observe(trigger, "interrupted")
+                  : publish(trigger, {
+                      error: { type: "compaction.interrupted", message: "Compaction was interrupted" },
+                    }),
+            ),
+            Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
+          )
+        }),
     })
   }),
 )
@@ -677,7 +765,16 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Agent.node, Bus.node, Database.node, llmClient, Model.node, SessionModelRequest.node, SessionRunnerModel.node],
+  deps: [
+    Agent.node,
+    Bus.node,
+    Database.node,
+    llmClient,
+    Model.node,
+    PluginHooks.node,
+    SessionModelRequest.node,
+    SessionRunnerModel.node,
+  ],
 })
 
 /** History loads from the latest completed compaction, so a previous one is always the first message. */

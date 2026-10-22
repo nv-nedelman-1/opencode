@@ -2,14 +2,15 @@ import type { SessionApi } from "@opencode/client/effect/api"
 import type { GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
+import type { Money } from "@opencode/schema/money"
 import type { PromptInput } from "@opencode/schema/prompt-input"
 import type { Session } from "@opencode/schema/session"
 import type { SessionInbox } from "@opencode/schema/session-inbox"
 import type { SessionError } from "@opencode/schema/session-error"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { TokenUsage } from "@opencode/schema/token-usage"
-import type { JsonSchema, Types } from "effect"
-import type { ModelHooks } from "./registration.js"
+import type { Effect, JsonSchema, Types } from "effect"
+import type { ModelHooks, ModelMiddleware } from "./registration.js"
 
 export interface SessionPrompt {
   readonly sessionID: Session.ID
@@ -135,6 +136,82 @@ export interface SessionRetry {
   decision: SessionRetryDecision
 }
 
+/** Final host retry choice, after mutable retry hooks and delay normalization. */
+export interface SessionRetryObservation {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly error: SessionError.Error
+  readonly attempt: number
+  readonly retryable: boolean
+  readonly decision: Readonly<SessionRetryDecision>
+  readonly source: "policy" | "retry-after" | "hook"
+  readonly reason: "scheduled" | "rejected" | "timeout-limit" | "exhausted"
+}
+
+/** Host prompt sizing before request hooks. Zero/unknown catalog limits are omitted. */
+export interface SessionContextUsage {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly measured: number
+  readonly estimated: number
+  readonly limit?: number
+}
+
+/** Local token estimates, not provider-billed usage. Encrypted native sizes remain unknown. */
+export interface SessionCompactionOutcome {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly trigger: "auto" | "overflow" | "manual"
+  readonly status: "skipped" | "completed" | "failed" | "interrupted"
+  readonly before?: number
+  readonly after?: number
+  readonly limit?: number
+  readonly summaryEstimatedTokens?: number
+  readonly retainedEstimatedTokens?: number
+  /** Selected summary input before the summary instruction and overflow shrinking. */
+  readonly sourceEstimatedTokens?: number
+}
+
+/** One auxiliary usage charge; compaction's terminal aggregate must not be charged again. */
+export interface SessionUsage {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly source: "title" | "compaction"
+  readonly tokens: TokenUsage.Info
+  readonly cost: Money.USD
+  readonly costSource: "host_calculated"
+}
+
+/** One physical HTTP model request, after `http.request` hooks have run. */
+export interface SessionHttpCall {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  /** Wire protocol of the route that built the request, such as `openai-chat` or `anthropic-messages`. */
+  readonly protocol: string
+  readonly request: Request
+}
+
+export interface SessionMiddlewares {
+  /**
+   * Wraps one physical HTTP model request, including AI SDK routes and the WebSocket fallback.
+   * `next` sends a request and resolves with the provider response; call it at most once. Return a
+   * response without calling `next` to answer the request locally. `http.response` hooks see the
+   * returned response. Experimental.
+   */
+  readonly http: (
+    call: SessionHttpCall,
+    next: (request: Request) => Effect.Effect<Response, Error>,
+  ) => Effect.Effect<Response, Error>
+}
+
 export interface SessionHooks {
   readonly prompt: SessionPrompt
   readonly context: SessionContext
@@ -148,6 +225,10 @@ export interface SessionHooks {
   readonly "experimental.ws.send": SessionWebSocketSend
   readonly "experimental.ws.receive": SessionWebSocketReceive
   readonly retry: SessionRetry
+  readonly "retry.decision": SessionRetryObservation
+  readonly "context.usage": SessionContextUsage
+  readonly "compaction.outcome": SessionCompactionOutcome
+  readonly usage: SessionUsage
 }
 
 export type SessionDomain = Pick<
@@ -169,4 +250,5 @@ export type SessionDomain = Pick<
   | "context"
 > & {
   readonly hook: ModelHooks<SessionHooks>
+  readonly middleware: ModelMiddleware<SessionMiddlewares>
 }

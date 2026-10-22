@@ -137,6 +137,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused tool.reload"),
       list: () => Effect.die("unused tool.list"),
       hook: () => Effect.die("unused tool.hook"),
+      middleware: () => Effect.die("unused tool.middleware"),
     },
     vcs: overrides.vcs ?? {
       base: () => Effect.die("unused vcs.base"),
@@ -165,6 +166,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
     },
     session: {
       hook: overrides.session?.hook ?? (() => Effect.die("unused session.hook")),
+      middleware: overrides.session?.middleware ?? (() => Effect.die("unused session.middleware")),
       create: overrides.session?.create ?? (() => Effect.die("unused session.create")),
       get: overrides.session?.get ?? (() => Effect.die("unused session.get")),
       remove: overrides.session?.remove ?? (() => Effect.die("unused session.remove")),

@@ -3,7 +3,7 @@ import type { Agent } from "@opencode/schema/agent"
 import type { Session } from "@opencode/schema/session"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { Effect, Types } from "effect"
-import type { Hooks, Transform } from "./registration.js"
+import type { Hooks, Middleware, Transform } from "./registration.js"
 
 export interface ToolEditor {
   list(): readonly (Tool.Info & { readonly id: string })[]
@@ -51,10 +51,33 @@ export interface ToolFailures extends Record<keyof ToolHooks, unknown> {
   readonly "execute.after": never
 }
 
+/** One local tool call, after `execute.before` hooks have run. */
+export interface ToolExecution {
+  readonly tool: string
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  readonly messageID: SessionMessage.ID
+  readonly id: Tool.CallID
+  readonly input: unknown
+}
+
+export interface ToolMiddlewares {
+  /**
+   * Wraps every local tool execution, including CodeMode calls, regardless of when the tool was
+   * registered. `next` validates the given input and runs the tool; call it at most once. Failures
+   * other than `Tool.Error`, such as permission declines and interruption, must propagate unchanged.
+   */
+  readonly execute: (
+    call: ToolExecution,
+    next: (input: unknown) => Effect.Effect<Tool.Result, Tool.Error>,
+  ) => Effect.Effect<Tool.Result, Tool.Error>
+}
+
 export interface ToolDomain {
   readonly transform: Transform<ToolEditor>
   readonly reload: () => Effect.Effect<void>
   /** Currently registered tools, after every transform, keyed by effective name. */
   readonly list: () => Effect.Effect<readonly (Tool.Info & { readonly id: string })[]>
   readonly hook: Hooks<ToolHooks, ToolFailures>
+  readonly middleware: Middleware<ToolMiddlewares>
 }

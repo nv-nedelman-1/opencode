@@ -254,9 +254,18 @@ it.live(
   () =>
     Effect.gen(function* () {
       const fixture = yield* setup()
+      const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+      yield* fixture.hooks.register("session", "compaction.outcome", (event) =>
+        Effect.sync(() => {
+          observed.push(event)
+        }),
+      )
       yield* fixture.prompt("First real user request")
       yield* fixture.prompt("Synthetic context, not a user request", true)
       expect(yield* fixture.compact).toEqual({ status: "completed" })
+      expect(observed[0]).toMatchObject({ status: "completed", trigger: "manual" })
+      expect(observed[0]).not.toHaveProperty("after")
+      expect(observed[0]).not.toHaveProperty("summaryEstimatedTokens")
       const first = yield* fixture.checkpoint
       expect(SessionProviderContext.decode(first).map((message) => message.role)).toEqual(["user", "assistant"])
       expect(JSON.stringify(first.messages)).not.toContain("Synthetic context")
@@ -283,6 +292,7 @@ it.live(
       expect(JSON.stringify(fixture.bodies[1])).toContain("Second real user request")
       expect(yield* fixture.compact).toEqual({ status: "completed" })
       const second = yield* fixture.checkpoint
+      expect(observed[1]).not.toHaveProperty("before")
       expect(
         SessionProviderContext.decode(second)
           .filter((message) => message.role === "user")
@@ -302,6 +312,7 @@ it.live(
       const pending = yield* fixture.compact.pipe(Effect.forkScoped)
       yield* Deferred.await(fixture.blocked)
       yield* Fiber.interrupt(pending)
+      expect(observed.at(-1)).toMatchObject({ status: "interrupted", trigger: "manual" })
       expect(fixture.state.calls).toBe(5)
       expect(yield* fixture.checkpoint).toEqual(second)
       // A transient provider failure retries under the shared session policy and its plugin hook.
@@ -351,6 +362,12 @@ it.live("manual and automatic endpoint compaction keep the provider replacement 
 it.live("automatic native failures, interruptions, and overflows retain the checkpoint", () =>
   Effect.gen(function* () {
     const fixture = yield* setup()
+    const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+    yield* fixture.hooks.register("session", "compaction.outcome", (event) =>
+      Effect.sync(() => {
+        observed.push(event)
+      }),
+    )
     yield* fixture.prompt("Original durable request")
     expect(yield* fixture.compact).toEqual({ status: "completed" })
     const installed = yield* fixture.checkpoint
@@ -364,6 +381,8 @@ it.live("automatic native failures, interruptions, and overflows retain the chec
     const pending = yield* fixture.overflow.pipe(Effect.forkScoped)
     yield* Deferred.await(fixture.blocked)
     yield* Fiber.interrupt(pending)
+    expect(observed.filter((event) => event.status === "interrupted")).toHaveLength(1)
+    expect(observed.at(-1)).toMatchObject({ status: "interrupted", trigger: "overflow" })
     expect((yield* fixture.load).messages.at(-1)).toMatchObject({
       type: "compaction",
       status: "failed",

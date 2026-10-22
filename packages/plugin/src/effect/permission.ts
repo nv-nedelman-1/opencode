@@ -15,8 +15,14 @@ export interface PermissionEvaluation {
   message?: string
 }
 
+/** Final evaluation, including configured denials that cannot be overridden by hooks. */
+export interface PermissionDecision extends Readonly<PermissionEvaluation> {
+  readonly origin: "rules" | "hook"
+}
+
 export interface PermissionHooks {
   readonly evaluate: PermissionEvaluation
+  readonly decision: PermissionDecision
 }
 
 export type PermissionDomain = Pick<PermissionApi<unknown>, "list" | "get" | "reply"> & {

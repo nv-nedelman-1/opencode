@@ -1,6 +1,7 @@
 export * as SessionRunnerRetry from "./retry.js"
 
 import { AIError, isRetryable } from "@opencode/ai"
+import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { Agent } from "@opencode/schema/agent"
 import { Model } from "@opencode/schema/model"
 import { SessionError } from "@opencode/schema/session-error"
@@ -18,7 +19,9 @@ interface Input {
   readonly error: SessionError.Error
   readonly agent: Agent.ID
   readonly model: Model.Ref
+  readonly kind?: SessionRequestKind
   readonly hook: (event: PluginHooks.Domains["session"]["retry"]) => Effect.Effect<void>
+  readonly observe?: (event: PluginHooks.Domains["session"]["retry.decision"]) => Effect.Effect<void>
   readonly retry: boolean
 }
 
@@ -70,24 +73,64 @@ export const policy = (sessionID: SessionSchema.ID) =>
       Effect.gen(function* () {
         const now = yield* Clock.currentTimeMillis
         const next = yield* step(now, input).pipe(Pull.catchDone(() => Effect.succeed(undefined)))
-        if (!next) return { retry: false as const }
+        if (!next) {
+          yield* input.observe?.(
+            Object.freeze({
+              sessionID,
+              agent: input.agent,
+              model: input.model,
+              kind: input.kind ?? "primary",
+              error: input.error,
+              attempt: attempt + 1,
+              retryable: isRetryable(input.cause),
+              decision: Object.freeze({ retry: false }),
+              source: "policy",
+              reason: "exhausted",
+            }),
+          ) ?? Effect.void
+          return { retry: false as const }
+        }
         const [, duration] = next
         attempt++
         if (isTimeout(input.cause)) timeouts++
         const delay = Math.ceil(Duration.toMillis(duration))
+        const proposed =
+          input.retry && timeouts <= MAX_TIMEOUT_RETRIES ? { retry: true as const, delay } : { retry: false as const }
         const event: PluginHooks.Domains["session"]["retry"] = {
           sessionID,
           agent: input.agent,
           model: input.model,
           error: input.error,
           attempt,
-          decision: input.retry && timeouts <= MAX_TIMEOUT_RETRIES ? { retry: true, delay } : { retry: false },
+          decision: { ...proposed },
         }
         yield* input.hook(event)
-        if (!event.decision.retry) return event.decision
         const normalized =
-          Number.isFinite(event.decision.delay) && event.decision.delay >= 0 ? Math.ceil(event.decision.delay) : delay
-        return { retry: true as const, attempt, delay: normalized }
+          event.decision.retry && Number.isFinite(event.decision.delay) && event.decision.delay >= 0
+            ? Math.ceil(event.decision.delay)
+            : delay
+        const decision = event.decision.retry ? { retry: true as const, delay: normalized } : { retry: false as const }
+        const changed =
+          proposed.retry !== decision.retry || (proposed.retry && decision.retry && proposed.delay !== decision.delay)
+        yield* input.observe?.(
+          Object.freeze({
+            sessionID,
+            agent: input.agent,
+            model: input.model,
+            kind: input.kind ?? "primary",
+            error: input.error,
+            attempt,
+            retryable: isRetryable(input.cause),
+            decision: Object.freeze(decision),
+            source: changed
+              ? "hook"
+              : decision.retry && Math.ceil(retryAfter(input) ?? -1) === normalized
+                ? "retry-after"
+                : "policy",
+            reason: decision.retry ? "scheduled" : timeouts > MAX_TIMEOUT_RETRIES ? "timeout-limit" : "rejected",
+          }),
+        ) ?? Effect.void
+        return decision.retry ? { ...decision, attempt } : decision
       })
   })
 

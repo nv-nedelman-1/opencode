@@ -1,0 +1,67 @@
+import { Plugin } from "@opencode/plugin/effect"
+import { EventManifest } from "@opencode/schema/event-manifest"
+import type { Session } from "@opencode/schema/session"
+import { Tool } from "@opencode/schema/tool"
+import { Cause, Effect, Stream } from "effect"
+import { RelayHost } from "./host.js"
+import { RelayModel } from "./model.js"
+import { RelayTool } from "./tool.js"
+import { RelayObserve } from "./observe.js"
+
+const observe = (effect: Effect.Effect<void>) =>
+  effect.pipe(
+    Effect.catchCause((cause) =>
+      Cause.hasInterrupts(cause)
+        ? Effect.failCause(cause).pipe(Effect.orDie)
+        : Effect.logWarning("NeMo Relay host observation failed"),
+    ),
+  )
+
+/**
+ * Built-in NeMo Relay integration. It activates when Relay is configured through its user or system
+ * `plugins.toml` (or `OPENCODE_NEMO_RELAY_PLUGINS_TOML`), and runs eligible HTTP model and local-tool calls
+ * through Relay managed execution beneath one Relay scope per session execution.
+ */
+export default Plugin.define({
+  id: "opencode.nemo-relay",
+  effect: (ctx) =>
+    Effect.gen(function* () {
+      const runtime = yield* RelayHost.acquire()
+      if (!runtime) return
+      if (runtime instanceof RelayHost.StartupFailure) {
+        yield* ctx.tool.middleware("execute", () =>
+          Effect.fail(
+            new Tool.Error({
+              message: runtime.error.message,
+              metadata: { "nemo_relay.failure_stage": "startup" },
+            }),
+          ),
+        )
+        yield* ctx.session.middleware("http", () => Effect.fail(runtime.error))
+        yield* ctx.session.hook("experimental.ws.handshake", () => Effect.die(runtime.error))
+        return
+      }
+      const parentID = (sessionID: Session.ID) =>
+        ctx.session.get({ sessionID }).pipe(
+          Effect.map((session) => session.parentID),
+          Effect.orElseSucceed(() => undefined),
+        )
+      yield* ctx.tool.middleware("execute", RelayTool.middleware(runtime, parentID))
+      yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
+      const observed = RelayObserve.make(runtime)
+      yield* ctx.session.hook("context", (event) => observe(observed.context(event)))
+      yield* ctx.session.hook("compaction", (event) => observe(observed.context(event, "compaction")))
+      yield* ctx.session.hook("generate", (event) => observe(observed.context(event, "generate")))
+      yield* ctx.session.hook("title", (event) => observe(observed.context(event, "title")))
+      yield* ctx.session.hook("context.usage", (event) => observe(observed.contextUsage(event)))
+      yield* ctx.session.hook("retry.decision", (event) => observe(observed.retryDecision(event)))
+      yield* ctx.session.hook("compaction.outcome", (event) => observe(observed.compactionOutcome(event)))
+      yield* ctx.session.hook("usage", (event) => observe(observed.usage(event)))
+      yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
+      yield* ctx.event.subscribe().pipe(
+        Stream.filter(EventManifest.isServer),
+        Stream.runForEach((event) => observe(observed.event(event))),
+        Effect.forkScoped({ startImmediately: true }),
+      )
+    }),
+})

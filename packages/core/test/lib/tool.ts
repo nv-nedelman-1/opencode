@@ -75,6 +75,7 @@ export const registerToolPlugin = <R>(
         reload: tools.reload,
         list: tools.list,
         hook: hook ?? (() => Effect.die("registerToolPlugin does not support tool hooks")),
+        middleware: () => Effect.die("registerToolPlugin does not support tool middleware"),
       },
     })
     yield* plugin.effect(context)
