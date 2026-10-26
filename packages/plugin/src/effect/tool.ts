@@ -5,6 +5,26 @@ import type { SessionMessage } from "@opencode/schema/session-message"
 import type { Effect, Types } from "effect"
 import type { Hooks, Middleware, Transform } from "./registration.js"
 
+/** Read-only facts from the captured registration, not the model-facing tool name. */
+export interface ToolProvenance {
+  readonly origin: "builtin" | "plugin" | "mcp" | "unknown"
+  readonly execution: "local" | "mcp"
+  readonly category:
+    | "file_read"
+    | "file_write"
+    | "terminal"
+    | "code_search"
+    | "web"
+    | "planning"
+    | "delegation"
+    | "human_input"
+    | "skill"
+    | "code_execution"
+    | "mcp_resource"
+    | "extension"
+    | "unknown"
+}
+
 export interface ToolEditor {
   list(): readonly (Tool.Info & { readonly id: string })[]
   get(id: string): (Tool.Info & { readonly id: string }) | undefined
@@ -33,6 +53,7 @@ export interface ToolHooks {
     readonly messageID: SessionMessage.ID
     readonly id: Tool.CallID
     readonly input: unknown
+    readonly provenance?: ToolProvenance
   } & (
     | {
         readonly status: "completed"
@@ -59,6 +80,7 @@ export interface ToolExecution {
   readonly messageID: SessionMessage.ID
   readonly id: Tool.CallID
   readonly input: unknown
+  readonly provenance?: ToolProvenance
 }
 
 export interface ToolMiddlewares {

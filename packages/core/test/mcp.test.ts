@@ -30,6 +30,7 @@ import { Mcp } from "@opencode/core/mcp/index"
 import { McpClient } from "@opencode/core/mcp/client"
 import { McpStdio } from "@opencode/core/mcp/stdio"
 import { Permission } from "@opencode/core/permission"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { State } from "@opencode/core/state"
@@ -508,7 +509,7 @@ const permissions = Layer.mock(Permission.Service, {
 })
 const events = Layer.mock(Bus.Service, { subscribe: () => Stream.never })
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
+  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, PluginHooks.node]), [
     Mcp.node.replace(mcp),
     Permission.node.replace(permissions),
     Bus.node.replace(events),
@@ -2346,6 +2347,12 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
     invocations = []
     const registry = yield* Tool.Service
     const registration = yield* McpTool.Service
+    const hooks = yield* PluginHooks.Service
+    const provenance: unknown[] = []
+    yield* hooks.use("tool", "execute", (event, next) => {
+      provenance.push({ tool: event.tool, provenance: event.provenance })
+      return next(event.input)
+    })
     yield* registration.flush
     const toolSet = yield* registry.snapshot()
 
@@ -2386,6 +2393,11 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
       args: {},
       sessionID: codeModeSessionID,
     })
+    expect(provenance).toEqual([
+      { tool: "direct_lookup", provenance: { origin: "mcp", execution: "mcp", category: "extension" } },
+      { tool: "execute", provenance: { origin: "builtin", execution: "local", category: "code_execution" } },
+      { tool: "demo_search", provenance: { origin: "mcp", execution: "mcp", category: "extension" } },
+    ])
   }),
 )
 
