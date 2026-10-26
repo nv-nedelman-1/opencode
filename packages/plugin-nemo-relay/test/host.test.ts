@@ -219,10 +219,12 @@ test("signed auxiliary coverage does not borrow an active execution", async () =
   try {
     const session = id("signed_auxiliary")
     const primary = native.runtime.open(session)
-    await Effect.runPromise(RelayModel.middleware(native.runtime, () => noParent)(
-      { ...modelCall(session, "generate"), protocol: "bedrock-converse" },
-      () => Effect.succeed(Response.json({})),
-    ))
+    await Effect.runPromise(
+      RelayModel.middleware(native.runtime, () => noParent)(
+        { ...modelCall(session, "generate"), protocol: "bedrock-converse" },
+        () => Effect.succeed(Response.json({})),
+      ),
+    )
     await native.relay.flushSubscribers()
     const coverage = native.events.filter((event) => event.name === "opencode.llm.coverage")
     expect(coverage).toHaveLength(1)

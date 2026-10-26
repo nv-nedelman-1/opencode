@@ -61,7 +61,8 @@ export const middleware =
         call.request.headers.get("authorization")?.startsWith("AWS4-HMAC-SHA256")
       ) {
         runtime.mark(call.kind === "primary" ? call.sessionID : undefined, "opencode.llm.coverage", {
-          managed: false, reason: "signed_transport",
+          managed: false,
+          reason: "signed_transport",
         })
         return yield* next(call.request)
       }
