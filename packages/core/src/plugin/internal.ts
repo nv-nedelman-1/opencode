@@ -67,6 +67,7 @@ import { ShellSelect } from "../shell/select.js"
 import { Snapshot } from "../snapshot.js"
 import { Skill } from "../skill.js"
 import { SkillDiscovery } from "../skill/discovery.js"
+import { PluginHooks } from "./hooks.js"
 import { Watcher } from "../filesystem/watcher.js"
 import { PatchTool } from "../tool/plugin/patch.js"
 import { EditTool } from "../tool/plugin/edit.js"
@@ -150,6 +151,7 @@ const services = [
   Snapshot.Service,
   Skill.Service,
   SkillDiscovery.Service,
+  PluginHooks.Service,
   Tool.Service,
   ToolOutput.Service,
   Watcher.Service,
@@ -204,6 +206,7 @@ export const requirements = LayerNode.group([
   Snapshot.node,
   Skill.node,
   SkillDiscovery.node,
+  PluginHooks.node,
   Tool.node,
   ToolOutput.node,
   Watcher.node,

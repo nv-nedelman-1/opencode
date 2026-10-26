@@ -1,7 +1,23 @@
 import type { SkillApi } from "@opencode/client/promise/api"
 import type { Skill } from "@opencode/schema/skill"
-import type { Transform } from "./registration.js"
+import type { Session } from "@opencode/schema/session"
+import type { Hooks, Transform } from "./registration.js"
 import type { DeepMutable } from "./types.js"
+
+export type SkillSourceKind = "directory" | "url" | "embedded" | "unknown"
+
+/** A host load attempt, not evidence that the model followed its instructions. */
+export interface SkillLoad {
+  readonly sessionID: Session.ID
+  readonly channel: "tool" | "user_mention" | "user_activation"
+  readonly status: "completed" | "unavailable" | "failed" | "interrupted"
+  readonly sourceKind: SkillSourceKind
+  readonly skill?: Skill.Info
+}
+
+export interface SkillHooks {
+  readonly load: SkillLoad
+}
 
 export interface SkillEditor {
   list(): readonly DeepMutable<Skill.Info>[]
@@ -12,6 +28,7 @@ export interface SkillEditor {
 }
 
 export interface SkillDomain extends SkillApi {
+  readonly hook: Hooks<SkillHooks>
   readonly transform: Transform<SkillEditor>
   readonly reload: () => Promise<void>
 }

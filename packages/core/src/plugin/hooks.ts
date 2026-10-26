@@ -3,6 +3,7 @@ export * as PluginHooks from "./hooks.js"
 import type { AISDKHooks } from "@opencode/plugin/effect/aisdk"
 import type { SessionHooks, SessionMiddlewares } from "@opencode/plugin/effect/session"
 import type { ShellHooks } from "@opencode/plugin/effect/shell"
+import type { SkillHooks } from "@opencode/plugin/effect/skill"
 import type { ToolFailures, ToolHooks, ToolMiddlewares } from "@opencode/plugin/effect/tool"
 import type { ModelHookOptions } from "@opencode/plugin/effect/registration"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
@@ -15,6 +16,7 @@ export interface Domains {
   readonly session: SessionHooks
   readonly permission: PermissionHooks
   readonly shell: ShellHooks
+  readonly skill: SkillHooks
   readonly tool: ToolHooks
 }
 
@@ -31,6 +33,7 @@ interface Failures extends Record<keyof Domains, unknown> {
   readonly session: NoFailures<SessionHooks>
   readonly permission: NoFailures<PermissionHooks>
   readonly shell: NoFailures<ShellHooks>
+  readonly skill: NoFailures<SkillHooks>
   readonly tool: ToolFailures
 }
 

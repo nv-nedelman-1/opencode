@@ -449,6 +449,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
         }),
     },
     skill: {
+      hook: (name, callback) => hooks.register("skill", name, callback),
       list: () => response(skill.list()),
       reload: skill.reload,
       transform: (callback) =>

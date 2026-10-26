@@ -56,6 +56,7 @@ const startEntries = Effect.fnUntraced(function* (
   const service = yield* Skill.Service
   const pluginHost = host({
     skill: {
+      hook: () => Effect.die("unused skill.hook"),
       list: () => Effect.die("unused skill.list"),
       transform: service.transform,
       reload: service.reload,
@@ -243,6 +244,8 @@ describe("ConfigSkillPlugin.Plugin", () => {
           ])
           expect((yield* skill.list()).find((item) => item.id === "deploy")?.description).toBe("Deploy")
           expect((yield* skill.list()).find((item) => item.id === "review")?.description).toBe("Second")
+          expect((yield* skill.resolve(Skill.ID.make("review")))?.sourceKind).toBe("url")
+          expect((yield* skill.resolve(Skill.ID.make("deploy")))?.sourceKind).toBe("url")
           expect(pulls).toEqual(["https://example.test/skills/"])
         }),
       ),
@@ -296,6 +299,7 @@ describe("ConfigSkillPlugin.Plugin", () => {
 
           const skill = yield* start([tmp.path, url], tmp.path, discovery)
           expect((yield* skill.list()).find((item) => item.id === "review")?.description).toBe("Available")
+          expect((yield* skill.resolve(Skill.ID.make("review")))?.sourceKind).toBe("directory")
         }),
       ),
     ),
