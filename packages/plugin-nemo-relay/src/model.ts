@@ -178,7 +178,6 @@ const stream = (managed: Managed) =>
               throw new Error("Provider returned invalid JSON SSE data")
             }
             attempt.output(chunk)
-            aggregate.push(chunk)
             yield chunk
           }
         } catch (error) {
@@ -217,7 +216,7 @@ const stream = (managed: Managed) =>
                 operationName(managed.call.protocol),
                 managed.request,
                 provide,
-                undefined,
+                (chunk) => aggregate.push(chunk),
                 () => RelayHost.json(aggregate.value()),
                 managed.parent,
                 STREAMING,

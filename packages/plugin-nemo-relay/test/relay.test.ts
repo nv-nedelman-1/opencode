@@ -163,6 +163,59 @@ describe("managed tool execution", () => {
 })
 
 describe("managed model execution", () => {
+  test.each(["provider", "replacement", "transformed"])(
+    "aggregates %s stream output and usage once after execution intercepts",
+    async (mode) => {
+      const state = { dispatches: 0 }
+      if (mode !== "provider")
+        relay.registerLlmStreamExecutionIntercept("test-stream-aggregate", 10, async function* (request, _context, next) {
+          if (mode === "replacement") {
+            yield* chunks
+            return
+          }
+          for await (const chunk of await next(request)) {
+            const item = chunk as (typeof chunks)[number]
+            yield {
+              ...item,
+              choices: item.choices.map((choice) => ({
+                ...choice,
+                delta: { ...choice.delta, content: choice.delta.content.toUpperCase() },
+              })),
+            }
+          }
+        })
+      try {
+        const response = await runModel(
+          {
+            ...call({ stream: true }),
+            model: { providerID: Provider.ID.make(`aggregate_${mode}`), id: Model.ID.make("m") },
+          },
+          () =>
+            Effect.sync(() => {
+              state.dispatches++
+              return sse(chunks)
+            }),
+        )
+        expect(await response.text()).toContain(mode === "transformed" ? '"HEL"' : '"Hel"')
+        expect(state.dispatches).toBe(mode === "replacement" ? 0 : 1)
+        await relay.flushSubscribers()
+        const ends = (await recorded()).filter(
+          (event) =>
+            event.name === "openai.chat_completions" &&
+            event.scope_category === "end" &&
+            event.metadata?.provider_name === `aggregate_${mode}`,
+        )
+        expect(ends).toHaveLength(1)
+        expect(ends[0].data).toMatchObject({
+          choices: [{ message: { content: mode === "transformed" ? "HELLO" : "Hello" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+        })
+      } finally {
+        if (mode !== "provider") relay.deregisterLlmStreamExecutionIntercept("test-stream-aggregate")
+      }
+    },
+  )
+
   test("streams the provider response through Relay without exposing credentials", async () => {
     const seen: Array<Record<string, string>> = []
     relay.registerLlmRequestIntercept("test-observe-headers", 10, false, (args) => {
