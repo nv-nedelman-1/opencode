@@ -40,6 +40,7 @@ type Bridge = (
 const observations = () => ({
   marks: [] as { name: string; data: Record<string, unknown> }[],
   metadata: [] as unknown[],
+  names: [] as string[],
   releases: 0,
 })
 
@@ -65,8 +66,11 @@ const run = (
   const runtime: RelayHost.Runtime = {
     relay: {
       OpenAIChatCodec: relay.OpenAIChatCodec,
+      OpenAIResponsesCodec: relay.OpenAIResponsesCodec,
+      AnthropicMessagesCodec: relay.AnthropicMessagesCodec,
+      GeminiGenerateContentCodec: relay.GeminiGenerateContentCodec,
       llmCallExecuteAsync: (
-        _name: string,
+        name: string,
         input: RequestProjection,
         callback: Parameters<Bridge>[1],
         _parent: unknown,
@@ -74,6 +78,7 @@ const run = (
         _data: unknown,
         metadata: unknown,
       ) => {
+        observed.names.push(name)
         observed.metadata.push(metadata)
         return bridge(input, callback)
       },
@@ -102,7 +107,17 @@ const native = (observed: ReturnType<typeof observations>) => {
   const stack = relay.createScopeStack()
   const parent = relay.withScopeStack(stack, () => relay.pushScope("physical-attempt-test", 0)) as ScopeHandle
   const runtime: RelayHost.Runtime = {
-    relay: relay as unknown as RelayHost.Relay,
+    relay: {
+      ...relay,
+      llmCallExecuteAsync: (...args: Parameters<typeof relay.llmCallExecuteAsync>) => {
+        observed.names.push(args[0])
+        return relay.llmCallExecuteAsync(...args)
+      },
+      llmStreamCallExecute: (...args: Parameters<typeof relay.llmStreamCallExecute>) => {
+        observed.names.push(args[0])
+        return relay.llmStreamCallExecute(...args)
+      },
+    } as unknown as RelayHost.Relay,
     scope: () => Effect.succeed(parent),
     open: () => parent,
     admit: () => true,
@@ -122,6 +137,31 @@ const native = (observed: ReturnType<typeof observations>) => {
 }
 
 describe("Relay model middleware contracts", () => {
+  test.each([
+    ["openai-chat", "openai.chat_completions"],
+    ["openai-compatible-chat", "openai.chat_completions"],
+    ["openai-responses", "openai.responses"],
+    ["open-responses", "openai.responses"],
+    ["openai-compatible-responses", "openai.responses"],
+    ["xai-responses", "openai.responses"],
+    ["anthropic-messages", "anthropic.messages"],
+    ["gemini", "gemini"],
+    ["ai-sdk", "ai-sdk"],
+    ["custom-json", "custom-json"],
+  ])("names managed %s calls by protocol while retaining configured provider attribution", async (protocol, name) => {
+    const observed = observations()
+    const exit = await run(
+      { ...call(), protocol },
+      forward,
+      () => Effect.succeed(new Response("{}")),
+      undefined,
+      observed,
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(observed.names).toEqual([name])
+    expect(observed.metadata[0]).toMatchObject({ provider_name: "test", "opencode.protocol": protocol })
+  })
+
   test("keeps Request options, credentials, and its original abort signal", async () => {
     const abort = new AbortController()
     const request = new Request("https://provider.test/model?key=private-query-key", {
@@ -369,6 +409,7 @@ describe("Relay model middleware contracts", () => {
     async (outcome) => {
       const observed = observations()
       const actual = native(observed)
+      relay.clearLastCallbackError()
       const input = {
         ...call(
           new Request("https://provider.test/chat", {
@@ -416,6 +457,7 @@ describe("Relay model middleware contracts", () => {
           reader.releaseLock()
         }
         if (outcome !== "cancelled") await response.text()
+        expect(observed.names).toEqual(["openai.chat_completions"])
         expect(observed.marks.filter((mark) => mark.name === "opencode.llm.provider_attempt.started")).toHaveLength(1)
         expect(observed.marks.filter((mark) => mark.name === "opencode.llm.provider_attempt.headers")).toHaveLength(1)
         expect(observed.marks.filter((mark) => mark.name === "opencode.llm.first_output")).toEqual([
@@ -428,6 +470,7 @@ describe("Relay model middleware contracts", () => {
             data: expect.objectContaining({ outcome: outcome === "malformed" ? "failed" : outcome }),
           }),
         ])
+        expect(relay.getLastCallbackError()).toBeNull()
       } finally {
         actual.close()
       }

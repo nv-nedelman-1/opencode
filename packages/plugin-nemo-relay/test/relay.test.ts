@@ -378,7 +378,11 @@ describe("managed model execution", () => {
       await cancelled.promise
       await relay.flushSubscribers()
       const ends = (await recorded()).filter(
-        (event) => event.kind === "scope" && event.scope_category === "end" && event.name === `cancel_${method}`,
+        (event) =>
+          event.kind === "scope" &&
+          event.scope_category === "end" &&
+          event.name === "openai.chat_completions" &&
+          event.metadata?.provider_name === `cancel_${method}`,
       )
       expect(ends).toHaveLength(1)
       expect(ends[0].metadata?.["otel.status_code"]).not.toBe("OK")
@@ -404,17 +408,26 @@ describe("recorded telemetry", () => {
     expect(ends.find((event) => event.name === "opencode.session")?.metadata?.["otel.status_code"]).toBe("OK")
     expect(
       records
-        .filter((event) => event.kind === "scope" && ["read", "edit", "test"].includes(event.name))
+        .filter((event) => event.kind === "scope" && ["read", "edit", "openai.chat_completions"].includes(event.name))
         .every((event) => event.parent_uuid === session?.uuid),
     ).toBe(true)
-    expect(ends.some((event) => event.name === "test" && event.metadata?.["opencode.request_kind"] === "primary")).toBe(
-      true,
-    )
+    expect(
+      ends.some(
+        (event) =>
+          event.name === "openai.chat_completions" &&
+          event.metadata?.provider_name === "test" &&
+          event.metadata?.["opencode.request_kind"] === "primary",
+      ),
+    ).toBe(true)
   })
 
   test("records a provider stream that failed midway as a failed LLM call", async () => {
     const end = (await recorded()).find(
-      (event) => event.kind === "scope" && event.scope_category === "end" && event.name === "flaky",
+      (event) =>
+        event.kind === "scope" &&
+        event.scope_category === "end" &&
+        event.name === "openai.chat_completions" &&
+        event.metadata?.provider_name === "flaky",
     )
 
     expect(end?.metadata?.["otel.status_code"]).toBe("ERROR")

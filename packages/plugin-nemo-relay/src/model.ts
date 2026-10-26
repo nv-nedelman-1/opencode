@@ -214,11 +214,11 @@ const stream = (managed: Managed) =>
           .run(() =>
             withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
               relay.llmStreamCallExecute(
-                managed.call.model.providerID,
+                operationName(managed.call.protocol),
                 managed.request,
                 provide,
                 undefined,
-                aggregate.value,
+                () => RelayHost.json(aggregate.value()),
                 managed.parent,
                 STREAMING,
                 null,
@@ -338,7 +338,7 @@ const unary = (managed: Managed) =>
         (captured.pending = managed.operation.run(() =>
           withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
             relay.llmCallExecuteAsync(
-              managed.call.model.providerID,
+              operationName(managed.call.protocol),
               managed.request,
               async (intercepted: LlmRequest) => {
                 if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
@@ -556,6 +556,17 @@ const codecFor = (relay: RelayHost.Relay, protocol: string) =>
         : protocol === "gemini"
           ? new relay.GeminiGenerateContentCodec()
           : undefined
+
+// Execution plugins dispatch on the wire operation, not a configured provider alias.
+// Preserve opaque protocol identities instead of inferring a provider API from model names.
+const operationName = (protocol: string) =>
+  protocol === "openai-chat" || protocol === "openai-compatible-chat"
+    ? "openai.chat_completions"
+    : RelaySSE.RESPONSES.has(protocol)
+      ? "openai.responses"
+      : protocol === "anthropic-messages"
+        ? "anthropic.messages"
+        : protocol
 
 type Codec = NonNullable<ReturnType<typeof codecFor>>
 type CodecArguments = [
