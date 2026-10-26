@@ -146,7 +146,7 @@ test.each(["sequential", "overlapping"])(
   },
 )
 
-test("an auxiliary stream retains its real execution until the native body drains", async () => {
+test("an auxiliary stream cannot borrow a same-session execution without an owner", async () => {
   const native = await fixture()
   try {
     const session = id("aux_execution")
@@ -162,15 +162,17 @@ test("an auxiliary stream retains its real execution until the native body drain
     )
     native.runtime.close(session, "success")
     await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.uuid === parent.uuid && event.scope_category === "end")).toEqual([])
+    expect(native.events.filter((event) => event.uuid === parent.uuid && event.scope_category === "end")).toHaveLength(
+      1,
+    )
     await response.text()
     await native.relay.flushSubscribers()
     expect(
       native.events.filter((event) => event.name === "openai.chat_completions" && event.scope_category === "start"),
-    ).toEqual([expect.objectContaining({ parent_uuid: parent.uuid })])
+    ).toEqual([expect.objectContaining({ parent_uuid: expect.not.stringContaining(parent.uuid) })])
     expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.name)).toEqual([
-      "openai.chat_completions",
       "opencode.session",
+      "openai.chat_completions",
     ])
   } finally {
     await native.dispose()
@@ -243,7 +245,7 @@ test.each(["idle", "active"])("an %s auxiliary keeps physical observations off t
       "opencode.llm.provider_attempt.completed",
     ])
     expect(observations.every((event) => event.parent_uuid !== primary.uuid)).toBe(true)
-    if (original) expect(observations.every((event) => event.parent_uuid === original.uuid)).toBe(true)
+    if (original) expect(observations.every((event) => event.parent_uuid !== original.uuid)).toBe(true)
     native.runtime.close(session, "success")
   } finally {
     response.resolve(Response.json({}))

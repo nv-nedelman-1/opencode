@@ -313,7 +313,8 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
   const lease = (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>, createExecution = true) =>
     Effect.gen(function* () {
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
-      const entry = createExecution ? yield* resolve(sessionID, parentID) : sessions.get(sessionID)
+      // A shared Session ID does not establish which execution owns an auxiliary invocation.
+      const entry = createExecution ? yield* resolve(sessionID, parentID) : undefined
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
       const stack = entry
         ? relay.createScopeStackFromPropagation(
