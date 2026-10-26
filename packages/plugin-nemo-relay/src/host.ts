@@ -1,6 +1,7 @@
 export * as RelayHost from "./host.js"
 
 import { RelayBinding } from "#binding"
+import type { App } from "@opencode/plugin/app"
 import type { Session } from "@opencode/schema/session"
 import { Cause, Effect, Option, Schema, type Scope } from "effect"
 import type { PropagationContext, ScopeHandle, ScopeStack } from "nemo-relay-node"
@@ -9,6 +10,7 @@ import { access } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { RelayMetrics } from "./metrics.js"
+import { RelayClient } from "./client.js"
 
 export type Relay = Awaited<ReturnType<typeof RelayBinding.load>>[0]
 export type Outcome = "success" | "failed" | "cancelled"
@@ -32,6 +34,8 @@ export interface Options {
   /** Explicit user-layer `plugins.toml`. Relay's system layer still applies above it. */
   readonly pluginsToml?: string
   readonly shutdownBudgetMs?: number
+  /** Host-supplied release facts, without application or installation identity. */
+  readonly client?: Pick<App, "version" | "channel">
 }
 
 export interface Runtime {
@@ -188,7 +192,10 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
   }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
   const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
-  runtime.mark(undefined, "opencode.runtime.activation", { count: 1 })
+  runtime.mark(undefined, "opencode.runtime.activation", {
+    count: 1,
+    ...RelayClient.diagnostics(options.client, process),
+  })
   return runtime
 })
 

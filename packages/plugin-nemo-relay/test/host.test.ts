@@ -314,7 +314,11 @@ test("Location owners share process startup and only the last release closes ses
     const runtimes = await Promise.all(
       scopes.map((scope) =>
         Effect.runPromise(
-          RelayHost.acquire({ config: plugin.defaultConfig(), pluginsToml }).pipe(Scope.provide(scope)),
+          RelayHost.acquire({
+            config: plugin.defaultConfig(),
+            pluginsToml,
+            client: { version: "2.0.25-private+private", channel: "preview" },
+          }).pipe(Scope.provide(scope)),
         ),
       ),
     )
@@ -331,6 +335,11 @@ test("Location owners share process startup and only the last release closes ses
     await relay.flushSubscribers()
     expect(events.filter((event) => event.scope_category === "end")).toEqual([])
     expect(events.filter((event) => event.name === "opencode.runtime.activation.metrics")).toHaveLength(1)
+    expect(events.filter((event) => event.name === "opencode.runtime.activation")).toEqual([
+      expect.objectContaining({
+        data: expect.objectContaining({ count: 1, client_version: "2.0.25", release_channel: "preview" }),
+      }),
+    ])
     const operation = await Effect.runPromise(runtimes[1].lease(id("owners"), noParent))
     expect(operation.parent.uuid).toBe(session.uuid)
     operation.release()

@@ -26,7 +26,7 @@ export default Plugin.define({
   id: "opencode.nemo-relay",
   effect: (ctx) =>
     Effect.gen(function* () {
-      const runtime = yield* RelayHost.acquire()
+      const runtime = yield* RelayHost.acquire({ client: ctx.app })
       if (!runtime) return
       if (runtime instanceof RelayHost.StartupFailure) {
         yield* ctx.tool.middleware("execute", () =>
