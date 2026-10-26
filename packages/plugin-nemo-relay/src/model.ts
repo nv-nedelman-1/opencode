@@ -323,7 +323,9 @@ const unary = (managed: Managed) =>
     managed.operation.onCancel(() => abort.abort())
     const captured: {
       pending?: Promise<unknown>
+      task?: Promise<unknown>
       called?: boolean
+      signal?: AbortSignal
       failure?: Cause.Cause<Error>
       response?: {
         readonly status: number
@@ -342,44 +344,52 @@ const unary = (managed: Managed) =>
               async (intercepted: LlmRequest, relaySignal: AbortSignal) => {
                 if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
                 captured.called = true
-                const requestSignal = AbortSignal.any([relaySignal, signal, abort.signal, managed.call.request.signal])
-                if (requestSignal.aborted) {
-                  const exit = await run(Effect.interrupt, { signal: requestSignal })
-                  if (Exit.isFailure(exit)) captured.failure = exit.cause
-                  throw new Error("provider request was aborted")
-                }
-                const attempt = new ProviderAttempt(managed, false)
-                const exit = await run(managed.send(intercepted, requestSignal), { signal: requestSignal })
-                if (Exit.isFailure(exit)) {
-                  attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
-                  captured.failure = exit.cause
-                  throw new Error("provider request failed")
-                }
-                attempt.headers(exit.value.status)
-                const body = await run(
-                  Effect.tryPromise({
-                    try: () => exit.value.text(),
-                    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-                  }),
-                  { signal: requestSignal },
-                )
-                if (Exit.isFailure(body)) {
-                  attempt.finish(Cause.hasInterrupts(body.cause) ? "cancelled" : "failed", "body")
-                  captured.failure = body.cause
-                  throw new Error("provider response body failed")
-                }
-                const text = body.value
-                captured.response = {
-                  status: exit.value.status,
-                  statusText: exit.value.statusText,
-                  headers: exit.value.headers,
-                  text,
-                }
-                const response = RelayHost.parse(text) ?? text
-                if (exit.value.ok) attempt.output(response)
-                attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
-                if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
-                return response
+                captured.signal = relaySignal
+                return (captured.task = (async () => {
+                  const requestSignal = AbortSignal.any([
+                    relaySignal,
+                    signal,
+                    abort.signal,
+                    managed.call.request.signal,
+                  ])
+                  if (requestSignal.aborted) {
+                    const exit = await run(Effect.interrupt, { signal: requestSignal })
+                    if (Exit.isFailure(exit)) captured.failure = exit.cause
+                    throw new Error("provider request was aborted")
+                  }
+                  const attempt = new ProviderAttempt(managed, false)
+                  const exit = await run(managed.send(intercepted, requestSignal), { signal: requestSignal })
+                  if (Exit.isFailure(exit)) {
+                    attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
+                    captured.failure = exit.cause
+                    throw new Error("provider request failed")
+                  }
+                  attempt.headers(exit.value.status)
+                  const body = await run(
+                    Effect.tryPromise({
+                      try: () => exit.value.text(),
+                      catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+                    }),
+                    { signal: requestSignal },
+                  )
+                  if (Exit.isFailure(body)) {
+                    attempt.finish(Cause.hasInterrupts(body.cause) ? "cancelled" : "failed", "body")
+                    captured.failure = body.cause
+                    throw new Error("provider response body failed")
+                  }
+                  const text = body.value
+                  captured.response = {
+                    status: exit.value.status,
+                    statusText: exit.value.statusText,
+                    headers: exit.value.headers,
+                    text,
+                  }
+                  const response = RelayHost.parse(text) ?? text
+                  if (exit.value.ok) attempt.output(response)
+                  attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
+                  if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
+                  return response
+                })())
               },
               managed.parent,
               0,
@@ -393,19 +403,21 @@ const unary = (managed: Managed) =>
       catch: (error) => error,
     }).pipe(
       Effect.onExit((exit) =>
-        Exit.isFailure(exit)
-          ? Effect.promise(async () => {
-              abort.abort()
-              // Interruption stops waiting for tryPromise, not the native managed call or its intercept tail.
-              await captured.pending?.catch(() => undefined)
-            })
-          : Effect.void,
+        Effect.promise(async () => {
+          if (Exit.isFailure(exit)) abort.abort()
+          // Native settlement can revoke a continuation before its host cleanup finishes.
+          await captured.pending?.catch(() => undefined)
+          await captured.task?.catch(() => undefined)
+        }),
       ),
       Effect.exit,
     )
     if (
       captured.failure &&
-      (Exit.isFailure(executed) || Cause.hasDies(captured.failure) || Cause.hasInterrupts(captured.failure))
+      (Exit.isFailure(executed) ||
+        Cause.hasDies(captured.failure) ||
+        (Cause.hasInterrupts(captured.failure) &&
+          (!captured.signal?.aborted || abort.signal.aborted || managed.call.request.signal.aborted)))
     )
       return yield* Effect.failCause(captured.failure)
     const upstream = captured.response

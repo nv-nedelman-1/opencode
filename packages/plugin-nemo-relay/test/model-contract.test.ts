@@ -394,6 +394,88 @@ describe("Relay model middleware contracts", () => {
     expect(observed.releases).toBe(1)
   })
 
+  test.each([false, true])(
+    "drains a revoked provider without confusing replacement with caller cancellation (%s)",
+    async (caller) => {
+      const entered = Promise.withResolvers<void>()
+      const cleanup = Promise.withResolvers<void>()
+      const requestAbort = new AbortController()
+      const observed = observations()
+      const pending = run(
+        call(
+          new Request("https://provider.test/model", {
+            method: "POST",
+            body: '{"prompt":"hi"}',
+            signal: requestAbort.signal,
+          }),
+        ),
+        async (input, next) => {
+          const revoke = new AbortController()
+          void next(input, revoke.signal).catch(() => undefined)
+          await entered.promise
+          if (caller) requestAbort.abort()
+          revoke.abort()
+          return { choices: [{ message: { content: "replacement" } }] }
+        },
+        () =>
+          Effect.sync(() => entered.resolve()).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Effect.promise(() => cleanup.promise)),
+          ),
+        undefined,
+        observed,
+      )
+      await entered.promise
+      expect(observed.releases).toBe(0)
+      cleanup.resolve()
+      const exit = await pending
+      if (caller) expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      if (!caller) {
+        expect(Exit.isSuccess(exit) && (await exit.value.json())).toEqual({
+          choices: [{ message: { content: "replacement" } }],
+        })
+      }
+      expect(observed.releases).toBe(1)
+      expect(observed.marks.filter((mark) => mark.name === "opencode.llm.provider_attempt.completed")).toHaveLength(1)
+    },
+  )
+
+  test("accepts native execution replacements after Relay revokes their unused continuation", async () => {
+    for (let index = 0; index < 3; index++) {
+      const observed = observations()
+      const provider = native(observed)
+      const entered = Promise.withResolvers<void>()
+      let interrupted = false
+      relay.registerLlmExecutionIntercept("model-contract-replacement", 100, async (input, _context, next) => {
+        void Promise.resolve(next(input)).catch(() => undefined)
+        await entered.promise
+        return { choices: [{ message: { content: "replacement" } }] }
+      })
+      try {
+        const exit = await Effect.runPromiseExit(
+          RelayModel.middleware(provider.runtime, () => Effect.succeed(undefined))(call(), () =>
+            Effect.sync(() => entered.resolve()).pipe(
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() =>
+                Effect.sync(() => {
+                  interrupted = true
+                }),
+              ),
+            ),
+          ),
+        )
+        expect(Exit.isSuccess(exit) && (await exit.value.json())).toEqual({
+          choices: [{ message: { content: "replacement" } }],
+        })
+        expect(interrupted).toBe(true)
+        expect(observed.releases).toBe(1)
+      } finally {
+        relay.deregisterLlmExecutionIntercept("model-contract-replacement")
+        provider.close()
+      }
+    }
+  })
+
   test.each(["relay", "request", "effect", "operation"] as const)(
     "combines %s cancellation with the actual unary Request and interrupts dispatch once",
     async (source) => {
