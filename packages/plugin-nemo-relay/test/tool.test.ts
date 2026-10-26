@@ -52,6 +52,7 @@ const run = (
       Effect.succeed({
         parent,
         run: (callback) => callback(),
+        mark: () => {},
         onCancel: () => {},
         release,
       }),

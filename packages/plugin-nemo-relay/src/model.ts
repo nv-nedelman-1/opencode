@@ -18,7 +18,7 @@ interface LlmRequest {
 interface Managed {
   readonly runtime: RelayHost.Runtime
   readonly call: SessionHttpCall
-  readonly parent: ScopeHandle
+  readonly parent: ScopeHandle | null
   readonly operation: RelayHost.Operation
   readonly ownership: { body: boolean }
   readonly request: LlmRequest
@@ -72,7 +72,7 @@ export const middleware =
         ),
         content,
       }
-      const operation = yield* runtime.lease(call.sessionID, parentID(call.sessionID))
+      const operation = yield* runtime.lease(call.sessionID, parentID(call.sessionID), call.kind === "primary")
       const ownership = { body: false }
       const dispatch = { sent: false }
       const managed: Managed = {
@@ -527,7 +527,7 @@ class ProviderAttempt {
     const output_kind = RelaySSE.outputKind(this.managed.call.protocol, chunk)
     if (output_kind === undefined) return
     this.emittedOutput = true
-    this.managed.runtime.mark(this.managed.call.sessionID, "opencode.llm.first_output", {
+    this.managed.operation.mark("opencode.llm.first_output", {
       ...this.attributes,
       count: 1,
       duration_ms: performance.now() - this.started,
@@ -550,7 +550,7 @@ class ProviderAttempt {
   }
 
   private mark(name: string, data: Record<string, unknown>) {
-    this.managed.runtime.mark(this.managed.call.sessionID, `opencode.llm.provider_attempt.${name}`, {
+    this.managed.operation.mark(`opencode.llm.provider_attempt.${name}`, {
       ...this.attributes,
       ...data,
     })

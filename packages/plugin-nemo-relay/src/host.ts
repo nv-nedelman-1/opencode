@@ -52,12 +52,17 @@ export interface Runtime {
     timestamp?: number,
   ) => void
   readonly admit: (eventID: string) => boolean
-  readonly lease: (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>) => Effect.Effect<Operation>
+  readonly lease: (
+    sessionID: Session.ID,
+    parentID: Effect.Effect<Session.ID | undefined>,
+    createExecution?: boolean,
+  ) => Effect.Effect<Operation>
 }
 
 export interface Operation {
-  readonly parent: ScopeHandle
+  readonly parent: ScopeHandle | null
   readonly run: <A>(callback: () => A) => A
+  readonly mark: (name: string, data: unknown, metadata?: unknown, timestamp?: number) => void
   readonly onCancel: (cancel: () => void) => void
   readonly release: () => void
 }
@@ -305,34 +310,48 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
       return open(sessionID, parent)
     })
 
-  const lease = (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>) =>
+  const lease = (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>, createExecution = true) =>
     Effect.gen(function* () {
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
-      const entry = yield* resolve(sessionID, parentID)
+      const entry = createExecution ? yield* resolve(sessionID, parentID) : sessions.get(sessionID)
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
-      const stack = relay.createScopeStackFromPropagation(
-        relay.withScopeStack(entry.stack, () => relay.capturePropagationContext()) as PropagationContext,
-      )
+      const stack = entry
+        ? relay.createScopeStackFromPropagation(
+            relay.withScopeStack(entry.stack, () => relay.capturePropagationContext()) as PropagationContext,
+          )
+        : relay.createScopeStack()
       const completion = Promise.withResolvers<void>()
       const pending = { done: completion.promise, cancel: () => {} }
       operations.add(pending)
-      entry.operations++
+      if (entry) entry.operations++
       return {
-        parent: entry.handle,
+        parent: entry?.handle ?? null,
         run: <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
+        mark: (name: string, data: unknown, metadata?: unknown, timestamp?: number) => {
+          if (operations.has(pending)) publish(entry, entry?.stack ?? neutral, name, data, metadata, timestamp)
+        },
         onCancel: (cancel: () => void) => {
           pending.cancel = cancel
         },
         release: () => {
           if (!operations.delete(pending)) return
-          entry.operations--
-          finish(entry)
+          if (entry) {
+            entry.operations--
+            finish(entry)
+          }
           completion.resolve()
         },
       }
     })
 
-  const mark: Runtime["mark"] = (sessionID, name, data, metadata, timestamp) => {
+  const publish = (
+    entry: Entry | undefined,
+    stack: ScopeStack,
+    name: string,
+    data: unknown,
+    metadata?: unknown,
+    timestamp?: number,
+  ) => {
     if (!state.accepting) return
     const id = isRecord(metadata) ? metadata["opencode.event_id"] : undefined
     if (typeof id === "string") {
@@ -341,13 +360,17 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
       marks.add(key)
       if (marks.size > 1024) marks.delete(marks.values().next().value!)
     }
-    const entry = sessionID === undefined ? undefined : sessions.get(sessionID)
     const measurements = RelayMetrics.measurements(name, data)
-    relay.withScopeStack(entry?.stack ?? neutral, () => {
+    relay.withScopeStack(stack, () => {
       relay.event(name, entry?.handle ?? null, json(data), json(metadata), timestamp)
       if (measurements.length > 0)
         relay.metric(`${name}.metrics`, measurements, entry?.handle ?? null, json(metadata), timestamp)
     })
+  }
+
+  const mark: Runtime["mark"] = (sessionID, name, data, metadata, timestamp) => {
+    const entry = sessionID === undefined ? undefined : sessions.get(sessionID)
+    publish(entry, entry?.stack ?? neutral, name, data, metadata, timestamp)
   }
 
   const finalize = Effect.gen(function* () {

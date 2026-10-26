@@ -93,6 +93,7 @@ const run = (
       Effect.succeed({
         parent,
         run: (callback) => callback(),
+        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
         onCancel: (cancel) => {
           observed.cancel = cancel
         },
@@ -133,6 +134,7 @@ const native = (observed: ReturnType<typeof observations>) => {
       Effect.succeed({
         parent,
         run: <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
+        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
         onCancel: () => {},
         release: () => {
           observed.releases++
