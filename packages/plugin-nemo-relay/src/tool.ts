@@ -116,7 +116,8 @@ const replaced = (value: unknown): Tool.Result => {
   const envelope =
     typeof value === "object" &&
     value !== null &&
-    ["output", "content", "metadata"].some((key) => Object.hasOwn(value, key))
+    Object.keys(value).length > 0 &&
+    Object.keys(value).every((key) => key === "output" || key === "content" || key === "metadata")
   return Option.getOrElse(envelope ? decodeResult(value) : Option.none(), () => ({
     content: typeof value === "string" ? value : JSON.stringify(value),
   }))

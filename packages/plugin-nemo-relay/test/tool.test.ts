@@ -155,6 +155,11 @@ describe("Relay tool middleware boundaries", () => {
     { value: false, content: "false" },
     { value: "cached", content: "cached" },
     { value: { content: 42, answer: "retained" }, content: '{"content":42,"answer":"retained"}' },
+    {
+      value: { metadata: { source: "calculator" }, answer: 42 },
+      content: '{"metadata":{"source":"calculator"},"answer":42}',
+    },
+    { value: { content: "weather", temperature: 70 }, content: '{"content":"weather","temperature":70}' },
   ])("preserves arbitrary JSON replacement $content", async ({ value, content }) => {
     expect(
       await run(
