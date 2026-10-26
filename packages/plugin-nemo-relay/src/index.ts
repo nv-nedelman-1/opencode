@@ -72,6 +72,10 @@ export default Plugin.define({
         Effect.runSync(observed.skillCatalog(event))
         return undefined
       })
+      yield* ctx.mcp.observe("recovery", (event) => {
+        Effect.runSync(observed.mcpRecovery(event))
+        return undefined
+      })
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
       yield* ctx.event.observe((event) => {
         if (EventManifest.isServer(event)) Effect.runSync(observed.event(event))

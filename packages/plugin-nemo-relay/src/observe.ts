@@ -8,6 +8,7 @@ import type {
   SessionRequestKind,
 } from "@opencode/plugin/effect/session"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
+import type { MCPRecovery } from "@opencode/plugin/effect/mcp"
 import type { SkillCatalog, SkillLoad } from "@opencode/plugin/effect/skill"
 import type { ToolExecution, ToolProvenance } from "@opencode/plugin/effect/tool"
 import type { EventManifest } from "@opencode/schema/event-manifest"
@@ -384,6 +385,11 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           const tools = calls.get(event.data.sessionID)
           const tool = tools?.get(key)
           const category = tool?.provenance?.category ?? "unknown"
+          const metadata = event.type === "session.tool.success" ? event.data.metadata : undefined
+          const delegation =
+            category === "delegation" && tool?.provenance?.origin === "builtin"
+              ? Option.getOrUndefined(delegationMetadata(metadata?.delegation))
+              : undefined
           const data = {
             count: 1,
             category,
@@ -406,8 +412,16 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
                     ? "cancelled"
                     : "error"
                   : category === "terminal"
-                    ? terminalFamily(event.data.metadata)
+                    ? terminalFamily(metadata)
                     : "success",
+            ...(typeof metadata?.truncated !== "boolean" ? {} : { output_truncated: metadata.truncated }),
+            ...(delegation === undefined
+              ? {}
+              : {
+                  delegation_kind: delegation.kind,
+                  requested_mode: delegation.requestedMode,
+                  return_mode: delegation.returnMode,
+                }),
             ...(event.type === "session.tool.failed" ? failure(event.data.error) : {}),
           }
           mark(event.data.sessionID, "opencode.tool.completed", data)
@@ -680,13 +694,44 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     })
 
   const skillCatalog = (event: SkillCatalog) =>
-    Effect.sync(() => event.changes.forEach((change) => runtime.mark(undefined, "opencode.skill.catalog.changed", {
-      count: 1,
-      catalog_action: change.action,
-      source_kind: change.sourceKind,
-      ...(change.previousSourceKind === undefined ? {} : { previous_source_kind: change.previousSourceKind }),
-      content_changed: change.contentChanged,
-    }, hostMetadata)))
+    Effect.sync(() =>
+      event.changes.forEach((change) =>
+        runtime.mark(
+          undefined,
+          "opencode.skill.catalog.changed",
+          {
+            count: 1,
+            catalog_action: change.action,
+            source_kind: change.sourceKind,
+            ...(change.previousSourceKind === undefined ? {} : { previous_source_kind: change.previousSourceKind }),
+            content_changed: change.contentChanged,
+          },
+          hostMetadata,
+        ),
+      ),
+    )
+
+  const mcpRecovery = (event: MCPRecovery) =>
+    Effect.sync(() =>
+      runtime.mark(
+        undefined,
+        event.outcome === "started" ? "opencode.mcp.recovery.started" : "opencode.mcp.recovery.completed",
+        {
+          count: 1,
+          mcp_operation: event.operation,
+          recovery_phase: event.phase,
+          recovery_reason: event.reason,
+          ...(event.outcome === "started"
+            ? {}
+            : {
+                outcome:
+                  event.outcome === "succeeded" ? "success" : event.outcome === "interrupted" ? "cancelled" : "failed",
+              }),
+          ...(event.durationMs === undefined ? {} : { duration_ms: event.durationMs }),
+        },
+        hostMetadata,
+      ),
+    )
 
   return {
     event,
@@ -700,6 +745,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     modelOutcome,
     skillLoad,
     skillCatalog,
+    mcpRecovery,
   }
 }
 
@@ -713,6 +759,13 @@ const terminalMetadata = Schema.decodeUnknownOption(
     signal: Schema.optional(Schema.String),
     timeout: Schema.optional(Schema.Boolean),
     status: Schema.optional(Schema.Literals(["completed", "running"])),
+  }),
+)
+const delegationMetadata = Schema.decodeUnknownOption(
+  Schema.Struct({
+    kind: Schema.Literals(["new", "continued"]),
+    requestedMode: Schema.Literals(["foreground", "background"]),
+    returnMode: Schema.Literals(["foreground", "background"]),
   }),
 )
 const terminalFamily = (metadata: unknown) => {

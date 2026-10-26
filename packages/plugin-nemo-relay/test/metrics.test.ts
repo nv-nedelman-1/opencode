@@ -158,14 +158,86 @@ test("source-owned call detail keeps first output optional and provider errors b
 
 test("skill catalog metrics distinguish effective changes from authored lifecycle intent", () => {
   const result = RelayMetrics.measurements("opencode.skill.catalog.changed", {
-    count: 2, catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true,
+    count: 2,
+    catalog_action: "updated",
+    source_kind: "embedded",
+    previous_source_kind: "directory",
+    content_changed: true,
     skill: { id: "SECRET", content: "SECRET", path: "/SECRET" },
   })
   expect(result).toHaveLength(1)
   expect(result[0]?.value).toBe(2)
-  expect(result[0]?.attributes).toMatchObject({ scope: "effective_catalog", catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true })
+  expect(result[0]?.attributes).toMatchObject({
+    scope: "effective_catalog",
+    catalog_action: "updated",
+    source_kind: "embedded",
+    previous_source_kind: "directory",
+    content_changed: true,
+  })
   expect(JSON.stringify(result)).not.toContain("SECRET")
-  expect(RelayMetrics.measurements("opencode.skill.catalog.changed", { count: 1, catalog_action: "installed" })).toEqual([])
+  expect(
+    RelayMetrics.measurements("opencode.skill.catalog.changed", { count: 1, catalog_action: "installed" }),
+  ).toEqual([])
+})
+
+test("tool result metrics count reported truncation, terminal timeouts and real delegation modes", () => {
+  const terminal = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "terminal",
+    outcome: "success",
+    result_family: "timeout",
+    output_truncated: true,
+  })
+  expect(terminal.map((metric) => metric.name)).toEqual([
+    "opencode.tool.completed.count",
+    "opencode.tool.terminal_result.count",
+    "opencode.tool.output_truncation.count",
+    "opencode.tool.timeout.count",
+  ])
+  const delegate = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "delegation",
+    delegation_kind: "continued",
+    requested_mode: "foreground",
+    return_mode: "background",
+    sessionID: "SECRET",
+  })
+  expect(delegate[1]?.name).toBe("opencode.delegation.return.count")
+  expect(delegate[1]?.attributes).toMatchObject({
+    delegation_kind: "continued",
+    requested_mode: "foreground",
+    return_mode: "background",
+  })
+  expect(JSON.stringify(delegate)).not.toContain("SECRET")
+  expect(RelayMetrics.measurements("opencode.tool.completed", { count: 1, output_truncated: "yes" })).toEqual([])
+  expect(
+    RelayMetrics.measurements("opencode.tool.completed", {
+      count: 1,
+      category: "terminal",
+      result_family: "unknown",
+    }).some((metric) => metric.name === "opencode.tool.timeout.count"),
+  ).toBe(false)
+})
+
+test("MCP recovery exports source phase, terminal outcome and elapsed duration, never endpoint identity", () => {
+  const result = RelayMetrics.measurements("opencode.mcp.recovery.completed", {
+    count: 1,
+    mcp_operation: "resource",
+    recovery_phase: "retry",
+    recovery_reason: "session_expired",
+    outcome: "failed",
+    duration_ms: 12,
+    server: "SECRET",
+    url: "SECRET",
+    error: "SECRET",
+  })
+  expect(result.map((metric) => [metric.name, metric.value])).toEqual([
+    ["opencode.mcp.recovery.completed.count", 1],
+    ["opencode.mcp.recovery.duration", 12],
+  ])
+  expect(result[0]?.attributes).toMatchObject({ mcp_operation: "resource", recovery_phase: "retry", outcome: "failed" })
+  expect(JSON.stringify(result)).not.toContain("SECRET")
+  expect(RelayMetrics.measurements("opencode.mcp.recovery.started", { count: 1, mcp_operation: "SECRET" })).toEqual([])
 })
 
 test("context samples are per-request histograms and retry delay is explicitly the remaining delay", () => {

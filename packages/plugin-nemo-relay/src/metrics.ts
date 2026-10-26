@@ -120,6 +120,13 @@ const Attributes = Schema.Struct({
   approval: Schema.optional(
     Schema.Literals(["unknown", "automatic", "asked", "allowed_after_ask", "rejected", "denied"]),
   ),
+  output_truncated: Schema.optional(Schema.Boolean),
+  delegation_kind: Schema.optional(Schema.Literals(["new", "continued"])),
+  requested_mode: Schema.optional(Schema.Literals(["foreground", "background"])),
+  return_mode: Schema.optional(Schema.Literals(["foreground", "background"])),
+  mcp_operation: Schema.optional(Schema.Literals(["tool", "resource", "prompt", "catalog", "background"])),
+  recovery_phase: Schema.optional(Schema.Literals(["reconnect", "retry"])),
+  recovery_reason: Schema.optional(Schema.Literal("session_expired")),
   load_channel: Schema.optional(Schema.Literals(["tool", "user_mention", "user_activation"])),
   load_status: Schema.optional(Schema.Literals(["completed", "unavailable", "failed", "interrupted"])),
   source_kind: Schema.optional(SkillSource),
@@ -406,6 +413,7 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
             "result_family",
             "tool_origin",
             "approval",
+            "output_truncated",
           ]),
         ),
         ...duration(
@@ -415,6 +423,27 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
         ...(payload.category !== "terminal" || payload.result_family === undefined
           ? []
           : [counter("opencode.tool.terminal_result.count", 1, select(payload, ["outcome", "result_family"]))]),
+        ...(payload.output_truncated !== true
+          ? []
+          : [
+              counter(
+                "opencode.tool.output_truncation.count",
+                1,
+                select(payload, ["category", "execution", "tool_origin"]),
+              ),
+            ]),
+        ...(payload.category !== "terminal" || payload.result_family !== "timeout"
+          ? []
+          : [counter("opencode.tool.timeout.count", 1, select(payload, ["outcome", "execution"]))]),
+        ...(payload.category !== "delegation" || payload.delegation_kind === undefined
+          ? []
+          : [
+              counter(
+                "opencode.delegation.return.count",
+                1,
+                select(payload, ["delegation_kind", "requested_mode", "return_mode"]),
+              ),
+            ]),
       ]
     case "opencode.skill.tool.completed":
       return count(select(payload, ["outcome", "provider_executed"]))
@@ -432,9 +461,17 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
         ]),
       )
     case "opencode.skill.catalog.changed":
-      return count({ scope: "effective_catalog", ...select(payload, ["catalog_action", "source_kind", "previous_source_kind", "content_changed"]) })
+      return count({
+        scope: "effective_catalog",
+        ...select(payload, ["catalog_action", "source_kind", "previous_source_kind", "content_changed"]),
+      })
     case "opencode.permission.wait.started":
       return count(select(payload, ["family"]))
+    case "opencode.mcp.recovery.started":
+    case "opencode.mcp.recovery.completed": {
+      const attributes = select(payload, ["mcp_operation", "recovery_phase", "recovery_reason", "outcome"])
+      return [...count(attributes), ...duration("opencode.mcp.recovery.duration", attributes)]
+    }
     case "opencode.permission.evaluated":
       return count(select(payload, ["family", "effect", "origin"]))
     case "opencode.permission.wait.completed": {
@@ -538,6 +575,8 @@ const supported = new Set([
   "opencode.session.child.created",
   "opencode.mcp.status.changed",
   "opencode.mcp.resources.changed",
+  "opencode.mcp.recovery.started",
+  "opencode.mcp.recovery.completed",
   "opencode.prompt.admitted",
   "opencode.instructions.updated",
   "opencode.runtime.activation",

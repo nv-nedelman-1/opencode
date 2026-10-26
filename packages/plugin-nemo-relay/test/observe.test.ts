@@ -1010,15 +1010,168 @@ test.each(["skills", "sessions"])("skill comparison evicts old %s without claimi
 
 test("catalog changes export effective transitions without skill identities or contents", () => {
   const fixture = makeFixture()
-  Effect.runSync(fixture.observer.skillCatalog({ changes: [
-    { action: "added", sourceKind: "directory", contentChanged: false, skill: { id: Skill.ID.make("SECRET"), name: Skill.Name.make("SECRET"), path: AbsolutePath.make("/SECRET"), content: "SECRET" } },
-    { action: "updated", sourceKind: "embedded", previousSourceKind: "directory", contentChanged: true, skill: { id: Skill.ID.make("SECRET"), name: Skill.Name.make("SECRET"), path: AbsolutePath.make("/SECRET"), content: "SECRET" } },
-  ] }))
+  Effect.runSync(
+    fixture.observer.skillCatalog({
+      changes: [
+        {
+          action: "added",
+          sourceKind: "directory",
+          contentChanged: false,
+          skill: {
+            id: Skill.ID.make("SECRET"),
+            name: Skill.Name.make("SECRET"),
+            path: AbsolutePath.make("/SECRET"),
+            content: "SECRET",
+          },
+        },
+        {
+          action: "updated",
+          sourceKind: "embedded",
+          previousSourceKind: "directory",
+          contentChanged: true,
+          skill: {
+            id: Skill.ID.make("SECRET"),
+            name: Skill.Name.make("SECRET"),
+            path: AbsolutePath.make("/SECRET"),
+            content: "SECRET",
+          },
+        },
+      ],
+    }),
+  )
   expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
-    [undefined, "opencode.skill.catalog.changed", { count: 1, catalog_action: "added", source_kind: "directory", content_changed: false }],
-    [undefined, "opencode.skill.catalog.changed", { count: 1, catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true }],
+    [
+      undefined,
+      "opencode.skill.catalog.changed",
+      { count: 1, catalog_action: "added", source_kind: "directory", content_changed: false },
+    ],
+    [
+      undefined,
+      "opencode.skill.catalog.changed",
+      {
+        count: 1,
+        catalog_action: "updated",
+        source_kind: "embedded",
+        previous_source_kind: "directory",
+        content_changed: true,
+      },
+    ],
   ])
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("final tool results expose reported truncation, timeout and builtin delegation without private metadata", () => {
+  const fixture = makeFixture()
+  const cases: {
+    id: string
+    category: ToolProvenance["category"]
+    metadata: Event.Data<typeof SessionEvent.Tool.Success>["metadata"]
+  }[] = [
+    { id: "terminal", category: "terminal" as const, metadata: { timeout: true, truncated: true, SECRET: "SECRET" } },
+    {
+      id: "delegate",
+      category: "delegation" as const,
+      metadata: {
+        delegation: { kind: "continued", requestedMode: "foreground", returnMode: "background" },
+        sessionID: "SECRET",
+      },
+    },
+    {
+      id: "other",
+      category: "extension" as const,
+      metadata: { delegation: { kind: "new", requestedMode: "background", returnMode: "background" } },
+    },
+  ]
+  cases.forEach((item) => {
+    fixture.capture(item.id, { origin: "builtin", execution: "local", category: item.category })
+    Effect.runSync(
+      fixture.observer.event(
+        published(
+          SessionEvent.Tool.Success,
+          {
+            sessionID,
+            assistantMessageID,
+            id: item.id,
+            executed: false,
+            metadata: item.metadata,
+            content: [{ type: "text", text: "SECRET" }],
+          },
+          100,
+        ),
+      ),
+    )
+  })
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
+    { result_family: "timeout", output_truncated: true },
+    { delegation_kind: "continued", requested_mode: "foreground", return_mode: "background" },
+    expect.not.objectContaining({ delegation_kind: "new" }),
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+const unrelatedMetadata: NonNullable<Event.Data<typeof SessionEvent.Tool.Success>["metadata"]>[] = [
+  { exit: 1, truncated: "yes" },
+  { exit: 1, delegation: { kind: "SECRET" } },
+]
+test.each(unrelatedMetadata)("unrelated metadata cannot erase terminal exit facts %#", (metadata) => {
+  const fixture = makeFixture()
+  fixture.capture("terminal", { origin: "builtin", execution: "local", category: "terminal" })
+  Effect.runSync(
+    fixture.observer.event(
+      published(
+        SessionEvent.Tool.Success,
+        {
+          sessionID,
+          assistantMessageID,
+          id: "terminal",
+          executed: false,
+          content: [{ type: "text", text: "done" }],
+          metadata,
+        },
+        100,
+      ),
+    ),
+  )
+  expect(fixture.marks[0]?.[2]).toMatchObject({ result_family: "nonzero_exit" })
+  expect(fixture.marks[0]?.[2]).not.toHaveProperty("output_truncated")
+})
+
+test("MCP recovery keeps reconnect and retry states separate without guessing execution ownership", () => {
+  const fixture = makeFixture()
+  for (const phase of ["reconnect", "retry"] as const) {
+    Effect.runSync(
+      fixture.observer.mcpRecovery({
+        operation: "tool",
+        sessionID,
+        reason: "session_expired",
+        phase,
+        outcome: "started",
+      }),
+    )
+    Effect.runSync(
+      fixture.observer.mcpRecovery({
+        operation: "tool",
+        sessionID,
+        reason: "session_expired",
+        phase,
+        outcome: phase === "reconnect" ? "succeeded" : "interrupted",
+        durationMs: 12,
+      }),
+    )
+  }
+  expect(fixture.marks.map((mark) => mark[1])).toEqual([
+    "opencode.mcp.recovery.started",
+    "opencode.mcp.recovery.completed",
+    "opencode.mcp.recovery.started",
+    "opencode.mcp.recovery.completed",
+  ])
+  expect(fixture.marks.map((mark) => mark[0])).toEqual([undefined, undefined, undefined, undefined])
+  expect(fixture.marks[3]?.[2]).toMatchObject({
+    mcp_operation: "tool",
+    recovery_phase: "retry",
+    outcome: "cancelled",
+    duration_ms: 12,
+  })
 })
 
 test("host provenance survives delayed bus events and nested CodeMode entries without guessing tool names", () => {
