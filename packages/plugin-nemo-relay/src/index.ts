@@ -46,9 +46,12 @@ export default Plugin.define({
           Effect.map((session) => session.parentID),
           Effect.orElseSucceed(() => undefined),
         )
-      yield* ctx.tool.middleware("execute", RelayTool.middleware(runtime, parentID))
-      yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
       const observed = RelayObserve.make(runtime)
+      const tool = RelayTool.middleware(runtime, parentID)
+      yield* ctx.tool.middleware("execute", (call, next) =>
+        observe(observed.toolExecution(call)).pipe(Effect.andThen(tool(call, next))),
+      )
+      yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
       yield* ctx.session.hook("context", (event) => observe(observed.context(event)))
       yield* ctx.session.hook("compaction", (event) => observe(observed.context(event, "compaction")))
       yield* ctx.session.hook("generate", (event) => observe(observed.context(event, "generate")))
@@ -57,6 +60,8 @@ export default Plugin.define({
       yield* ctx.session.hook("retry.decision", (event) => observe(observed.retryDecision(event)))
       yield* ctx.session.hook("compaction.outcome", (event) => observe(observed.compactionOutcome(event)))
       yield* ctx.session.hook("usage", (event) => observe(observed.usage(event)))
+      yield* ctx.session.hook("model.outcome", (event) => observe(observed.modelOutcome(event)))
+      yield* ctx.skill.hook("load", (event) => observe(observed.skillLoad(event)))
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
       yield* ctx.event.subscribe().pipe(
         Stream.filter(EventManifest.isServer),

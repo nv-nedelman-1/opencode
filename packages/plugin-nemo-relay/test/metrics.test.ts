@@ -24,6 +24,10 @@ test("host instruments preserve missing timing boundaries and ignore provider to
   })
   expect(JSON.stringify(completed)).not.toContain("SECRET")
   expect(RelayMetrics.measurements("opencode.agent.run.completed", { count: 1, outcome: "cancelled" })).toHaveLength(1)
+  expect(
+    RelayMetrics.measurements("opencode.agent.run.completed", { count: 1, outcome: "cancelled", reason: "shutdown" })[0]
+      ?.attributes,
+  ).toMatchObject({ outcome: "cancelled", reason: "shutdown" })
   expect(RelayMetrics.measurements("gen_ai.usage", { count: 1, tokens: 123 })).toEqual([])
   expect(RelayMetrics.measurements("opencode.agent.step.streamed", { duration_ms: 5 })).toEqual([])
 })
@@ -54,6 +58,71 @@ test("tool, skill, compaction, and human wait dimensions are finite allowlists",
     { count: 1, duration_ms: Infinity },
     { count: "1" },
   ].forEach((data) => expect(RelayMetrics.measurements("opencode.agent.run.completed", data)).toEqual([]))
+})
+
+test("source-owned model, skill and tool measurements remain bounded and nonadditive", () => {
+  const model = RelayMetrics.measurements("opencode.llm.host_call.completed", {
+    count: 1,
+    call_role: "title",
+    outcome: "success",
+    duration_ms: 20,
+    model_family: "gpt",
+    response_model_family: "nemotron",
+    responseModel: "SECRET",
+    tokens: { input: 123 },
+    cost_usd: 9,
+  })
+  expect(model.map((metric) => metric.name)).toEqual([
+    "opencode.llm.host_call.completed.count",
+    "opencode.llm.host_call.duration",
+  ])
+  expect(model[0]?.attributes).toMatchObject({
+    scope: "host_call",
+    call_role: "title",
+    model_family: "gpt",
+    response_model_family: "nemotron",
+  })
+  const skill = RelayMetrics.measurements("opencode.skill.load.completed", {
+    count: 1,
+    load_channel: "user_mention",
+    load_status: "completed",
+    source_kind: "url",
+    comparison_window: "session_memory",
+    repeat_load: true,
+    content_changed: false,
+    id: "SECRET",
+    content: "SECRET",
+  })
+  expect(skill).toHaveLength(1)
+  expect(skill[0]?.attributes).toMatchObject({
+    load_channel: "user_mention",
+    load_status: "completed",
+    source_kind: "url",
+    repeat_load: true,
+    content_changed: false,
+  })
+  const tool = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "extension",
+    tool_origin: "mcp",
+    execution: "mcp",
+    approval: "allowed_after_ask",
+    name: "SECRET",
+  })
+  expect(tool[0]?.attributes).toMatchObject({
+    category: "extension",
+    tool_origin: "mcp",
+    execution: "mcp",
+    approval: "allowed_after_ask",
+  })
+  expect(JSON.stringify([model, skill, tool])).not.toContain("SECRET")
+  ;[
+    ["opencode.llm.host_call.completed", { response_model_family: "SECRET" }],
+    ["opencode.skill.load.completed", { source_kind: "SECRET" }],
+    ["opencode.tool.completed", { approval: "SECRET" }],
+  ].forEach(([name, data]) =>
+    expect(RelayMetrics.measurements(name as string, { count: 1, ...(data as object) })).toEqual([]),
+  )
 })
 
 test("context samples are per-request histograms and retry delay is explicitly the remaining delay", () => {

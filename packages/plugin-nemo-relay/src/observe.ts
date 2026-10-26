@@ -2,10 +2,13 @@ export * as RelayObserve from "./observe.js"
 
 import type { SessionContext, SessionHooks, SessionRequest, SessionRequestKind } from "@opencode/plugin/effect/session"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
+import type { SkillLoad } from "@opencode/plugin/effect/skill"
+import type { ToolExecution, ToolProvenance } from "@opencode/plugin/effect/tool"
 import type { EventManifest } from "@opencode/schema/event-manifest"
 import { Session } from "@opencode/schema/session"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import { Effect, Option, Schema } from "effect"
+import { createHash } from "node:crypto"
 import type { RelayHost } from "./host.js"
 import { RelayMetrics } from "./metrics.js"
 
@@ -29,6 +32,12 @@ const errors = new Set([
   "provider.timeout",
 ])
 
+interface ToolState {
+  provenance?: ToolProvenance
+  started?: number
+  approval?: "automatic" | "asked" | "allowed_after_ask" | "rejected" | "denied"
+}
+
 interface SessionState {
   started?: number
   compaction?: number
@@ -36,8 +45,8 @@ interface SessionState {
     SessionMessage.ID,
     { readonly started: number; readonly model: SessionContext["model"]; streamed?: number; firstOutput?: true }
   >
-  readonly permissions: Map<string, { readonly started: number; readonly family: string }>
-  readonly tools: Map<string, { readonly category: string; started?: number; blocked?: true }>
+  readonly permissions: Map<string, { readonly started: number; readonly family: string; readonly toolKey?: string }>
+  readonly tools: Map<string, ToolState>
   readonly counts: {
     steps: number
     tools: number
@@ -64,6 +73,8 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
   const parents = new Map<Session.ID, Session.ID>()
   const sessions = new Map<Session.ID, SessionState>()
   const forms = new Map<string, { readonly sessionID?: Session.ID; readonly started: number }>()
+  // Bounded, process-local comparison only; neither skill identities nor content hashes are exported.
+  const skillLoads = new Map<Session.ID, Map<string, string>>()
   const state = (id: Session.ID) => {
     const existing = sessions.get(id)
     if (existing) return existing
@@ -328,14 +339,12 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
             character_count: event.data.text.length,
           })
           return
-        case "session.tool.input.started":
-          state(event.data.sessionID).tools.set(`${event.data.assistantMessageID}:${event.data.id}`, {
-            category: toolCategory(event.data.name),
-          })
-          if (event.data.name === "skill") {
-            mark(event.data.sessionID, "opencode.skill.tool.requested", { count: 1 })
-          }
+        case "session.tool.input.started": {
+          const tools = state(event.data.sessionID).tools
+          const key = `${event.data.assistantMessageID}:${event.data.id}`
+          if (!tools.has(key)) tools.set(key, {})
           return
+        }
         case "session.tool.called": {
           const current = state(event.data.sessionID)
           const tool = current.tools.get(`${event.data.assistantMessageID}:${event.data.id}`)
@@ -360,7 +369,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           const key = `${event.data.assistantMessageID}:${event.data.id}`
           const tools = sessions.get(event.data.sessionID)?.tools
           const tool = tools?.get(key)
-          const category = tool?.category ?? "unknown"
+          const category = tool?.provenance?.category ?? "unknown"
           const data = {
             count: 1,
             category,
@@ -371,10 +380,14 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
                   ? "cancelled"
                   : "failed",
             provider_executed: event.data.executed,
-            execution: event.data.executed ? "provider" : "unknown",
+            tool_origin: tool?.provenance?.origin ?? "unknown",
+            execution: event.data.executed ? "provider" : (tool?.provenance?.execution ?? "unknown"),
+            approval: tool?.approval ?? "unknown",
             ...duration(tool?.started, event.created),
             result_family:
-              tool?.blocked || (event.type === "session.tool.failed" && event.data.error.type === "permission.rejected")
+              tool?.approval === "denied" ||
+              tool?.approval === "rejected" ||
+              (event.type === "session.tool.failed" && event.data.error.type === "permission.rejected")
                 ? "blocked"
                 : event.type === "session.tool.failed"
                   ? event.data.error.type === "aborted"
@@ -394,7 +407,11 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           const family = permissionFamily(event.data.action)
           const current = state(event.data.sessionID)
           if (current.permissions.has(event.data.id)) return
-          current.permissions.set(event.data.id, { started: event.created, family })
+          const toolKey =
+            event.data.source?.type === "tool" ? `${event.data.source.messageID}:${event.data.source.id}` : undefined
+          const tool = toolKey === undefined ? undefined : current.tools.get(toolKey)
+          if (tool && tool.approval !== "denied" && tool.approval !== "rejected") tool.approval = "asked"
+          current.permissions.set(event.data.id, { started: event.created, family, toolKey })
           current.counts.permissions++
           mark(event.data.sessionID, "opencode.permission.wait.started", { count: 1, family })
           return
@@ -402,6 +419,10 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
         case "permission.replied": {
           const pending = sessions.get(event.data.sessionID)?.permissions.get(event.data.requestID)
           if (!pending) return
+          const tool =
+            pending.toolKey === undefined ? undefined : sessions.get(event.data.sessionID)?.tools.get(pending.toolKey)
+          if (tool && tool.approval !== "denied" && tool.approval !== "rejected")
+            tool.approval = event.data.reply === "reject" ? "rejected" : "allowed_after_ask"
           mark(event.data.sessionID, "opencode.permission.wait.completed", {
             count: 1,
             resolution: event.data.reply,
@@ -442,6 +463,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           closeWaits(event.data.sessionID, event.created, event.id, "session_deleted")
           sessions.delete(event.data.sessionID)
           parents.delete(event.data.sessionID)
+          skillLoads.delete(event.data.sessionID)
           runtime.close(event.data.sessionID, "cancelled")
           return
       }
@@ -540,9 +562,15 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     )
   const permissionDecision = (event: PermissionHooks["decision"]) =>
     Effect.sync(() => {
-      if (event.effect === "deny" && event.source?.type === "tool") {
-        const tool = sessions.get(event.sessionID)?.tools.get(`${event.source.messageID}:${event.source.id}`)
-        if (tool) tool.blocked = true
+      const tool =
+        event.source?.type === "tool"
+          ? sessions.get(event.sessionID)?.tools.get(`${event.source.messageID}:${event.source.id}`)
+          : undefined
+      if (tool) {
+        if (event.effect === "deny") tool.approval = "denied"
+        else if (event.effect === "ask" && tool.approval !== "denied" && tool.approval !== "rejected")
+          tool.approval = "asked"
+        else if (event.effect === "allow" && tool.approval === undefined) tool.approval = "automatic"
       }
       runtime.mark(
         event.sessionID,
@@ -572,7 +600,79 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
       ),
     )
 
-  return { event, context, contextUsage, retryDecision, compactionOutcome, permissionDecision, usage }
+  const toolExecution = (call: ToolExecution) =>
+    Effect.sync(() => {
+      const tools = state(call.sessionID).tools
+      const key = `${call.messageID}:${call.id}`
+      const tool = tools.get(key) ?? {}
+      tools.set(key, tool)
+      // CodeMode's nested tools share the outer call IDs; its first middleware entry owns the host summary.
+      if (tool.provenance || !call.provenance) return
+      tool.provenance = call.provenance
+      if (call.provenance.category === "skill")
+        runtime.mark(call.sessionID, "opencode.skill.tool.requested", { count: 1 }, hostMetadata)
+    })
+  const modelOutcome = (event: SessionHooks["model.outcome"]) =>
+    Effect.sync(() =>
+      runtime.mark(
+        event.sessionID,
+        "opencode.llm.host_call.completed",
+        {
+          count: 1,
+          call_role: event.kind,
+          outcome: event.status === "completed" ? "success" : event.status === "interrupted" ? "cancelled" : "failed",
+          duration_ms: event.durationMs,
+          ...RelayMetrics.route(event.model),
+          ...(event.responseModel === undefined
+            ? {}
+            : { response_model_family: RelayMetrics.modelFamily(event.responseModel) }),
+        },
+        hostMetadata,
+      ),
+    )
+  const skillLoad = (event: SkillLoad) =>
+    Effect.sync(() => {
+      const comparison: { repeat_load?: true; content_changed?: boolean } = {}
+      if (event.status === "completed" && event.skill) {
+        const loads = skillLoads.get(event.sessionID) ?? new Map<string, string>()
+        skillLoads.delete(event.sessionID)
+        skillLoads.set(event.sessionID, loads)
+        const fingerprint = createHash("sha256").update(event.skill.content).digest("hex")
+        const previous = loads.get(event.skill.id)
+        if (previous !== undefined)
+          Object.assign(comparison, { repeat_load: true, content_changed: previous !== fingerprint })
+        loads.delete(event.skill.id)
+        loads.set(event.skill.id, fingerprint)
+        if (loads.size > 64) loads.delete(loads.keys().next().value!)
+        if (skillLoads.size > 256) skillLoads.delete(skillLoads.keys().next().value!)
+      }
+      runtime.mark(
+        event.sessionID,
+        "opencode.skill.load.completed",
+        {
+          count: 1,
+          load_channel: event.channel,
+          load_status: event.status,
+          source_kind: event.sourceKind,
+          comparison_window: "session_memory",
+          ...comparison,
+        },
+        hostMetadata,
+      )
+    })
+
+  return {
+    event,
+    context,
+    contextUsage,
+    retryDecision,
+    compactionOutcome,
+    permissionDecision,
+    usage,
+    toolExecution,
+    modelOutcome,
+    skillLoad,
+  }
 }
 
 const hostMetadata = { "opencode.observation.schema_version": "1", "opencode.observation.source": "host" }
@@ -609,19 +709,4 @@ const permissionFamily = (action: string) => {
   if (action === "skill") return "skill"
   if (["task", "subagent"].includes(action)) return "delegation"
   return "other"
-}
-
-const toolCategory = (name: string) => {
-  if (["read", "list", "ls"].includes(name)) return "file_read"
-  if (["write", "edit", "apply_patch", "patch"].includes(name)) return "file_write"
-  if (["bash", "shell"].includes(name)) return "terminal"
-  if (["grep", "glob", "lsp", "code_search"].includes(name)) return "code_search"
-  if (["webfetch", "websearch"].includes(name)) return "web"
-  if (["todo", "todowrite", "plan", "plan_exit"].includes(name)) return "planning"
-  if (["task", "subagent"].includes(name)) return "delegation"
-  if (name === "question") return "human_input"
-  if (name === "skill") return "skill"
-  if (name === "execute") return "code_execution"
-  if (["list_mcp_resources", "read_mcp_resource"].includes(name)) return "mcp_resource"
-  return "extension"
 }

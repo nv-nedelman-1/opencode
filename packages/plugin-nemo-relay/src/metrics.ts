@@ -6,6 +6,7 @@ import type { MetricMeasurement } from "nemo-relay-node"
 
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
 const Duration = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
+const ModelFamily = Schema.Literals(["gpt", "claude", "gemini", "nemotron", "llama", "qwen", "deepseek", "other"])
 const decodeTokens = Schema.decodeUnknownOption(
   Schema.Struct({
     input: Count,
@@ -43,9 +44,8 @@ const Attributes = Schema.Struct({
   provider_family: Schema.optional(
     Schema.Literals(["openai", "anthropic", "google", "nvidia", "amazon", "azure", "other"]),
   ),
-  model_family: Schema.optional(
-    Schema.Literals(["gpt", "claude", "gemini", "nemotron", "llama", "qwen", "deepseek", "other"]),
-  ),
+  model_family: Schema.optional(ModelFamily),
+  response_model_family: Schema.optional(ModelFamily),
   protocol_family: Schema.optional(
     Schema.Literals(["openai-chat", "openai-responses", "anthropic-messages", "gemini", "bedrock", "ai-sdk", "other"]),
   ),
@@ -96,6 +96,16 @@ const Attributes = Schema.Struct({
     ]),
   ),
   execution: Schema.optional(Schema.Literals(["local", "mcp", "provider", "unknown"])),
+  tool_origin: Schema.optional(Schema.Literals(["builtin", "plugin", "mcp", "unknown"])),
+  approval: Schema.optional(
+    Schema.Literals(["unknown", "automatic", "asked", "allowed_after_ask", "rejected", "denied"]),
+  ),
+  load_channel: Schema.optional(Schema.Literals(["tool", "user_mention", "user_activation"])),
+  load_status: Schema.optional(Schema.Literals(["completed", "unavailable", "failed", "interrupted"])),
+  source_kind: Schema.optional(Schema.Literals(["directory", "url", "embedded", "unknown"])),
+  comparison_window: Schema.optional(Schema.Literal("session_memory")),
+  repeat_load: Schema.optional(Schema.Boolean),
+  content_changed: Schema.optional(Schema.Boolean),
   trigger: Schema.optional(Schema.Literals(["manual", "proactive", "overflow"])),
   compaction_status: Schema.optional(Schema.Literals(["completed", "failed", "cancelled", "skipped"])),
   effect: Schema.optional(Schema.Literals(["allow", "deny", "ask"])),
@@ -150,7 +160,7 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
 
   switch (name) {
     case "opencode.agent.run.completed": {
-      const attributes = select(payload, ["outcome"])
+      const attributes = select(payload, ["outcome", "reason"])
       return [
         ...count(attributes),
         ...duration("opencode.agent.run.duration", attributes),
@@ -185,6 +195,13 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
     }
     case "opencode.runtime.activation":
       return count()
+    case "opencode.llm.host_call.completed": {
+      const attributes = {
+        ...select(payload, ["outcome", "call_role", "provider_family", "model_family", "response_model_family"]),
+        scope: "host_call",
+      }
+      return [...count(attributes), ...duration("opencode.llm.host_call.duration", attributes)]
+    }
     case "opencode.llm.logical.completed": {
       const attributes = {
         ...select(payload, ["outcome", "call_role", "duration_boundary", "provider_family", "model_family"]),
@@ -335,8 +352,21 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
     }
     case "opencode.tool.completed":
       return [
-        ...count(select(payload, ["category", "outcome", "provider_executed", "execution", "result_family"])),
-        ...duration("opencode.tool.duration", select(payload, ["category", "outcome", "execution"])),
+        ...count(
+          select(payload, [
+            "category",
+            "outcome",
+            "provider_executed",
+            "execution",
+            "result_family",
+            "tool_origin",
+            "approval",
+          ]),
+        ),
+        ...duration(
+          "opencode.tool.duration",
+          select(payload, ["category", "outcome", "execution", "tool_origin", "approval"]),
+        ),
         ...(payload.category !== "terminal" || payload.result_family === undefined
           ? []
           : [counter("opencode.tool.terminal_result.count", 1, select(payload, ["outcome", "result_family"]))]),
@@ -345,6 +375,17 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
       return count(select(payload, ["outcome", "provider_executed"]))
     case "opencode.skill.activated":
       return count({ activation_source: "user" })
+    case "opencode.skill.load.completed":
+      return count(
+        select(payload, [
+          "load_channel",
+          "load_status",
+          "source_kind",
+          "comparison_window",
+          "repeat_load",
+          "content_changed",
+        ]),
+      )
     case "opencode.permission.wait.started":
       return count(select(payload, ["family"]))
     case "opencode.permission.evaluated":
@@ -439,6 +480,7 @@ const supported = new Set([
   "opencode.skill.tool.requested",
   "opencode.skill.tool.completed",
   "opencode.skill.activated",
+  "opencode.skill.load.completed",
   "opencode.skill.catalog.updated",
   "opencode.permission.wait.started",
   "opencode.permission.wait.completed",
@@ -452,6 +494,7 @@ const supported = new Set([
   "opencode.instructions.updated",
   "opencode.runtime.activation",
   "opencode.llm.logical.completed",
+  "opencode.llm.host_call.completed",
   "opencode.llm.usage.recorded",
   "opencode.llm.provider_attempt.started",
   "opencode.llm.provider_attempt.headers",
@@ -486,11 +529,6 @@ const counter = (
 /** Bounded configured-route labels, not proof of a remote provider's identity. */
 export function route(model: Model.Ref, protocol = "") {
   const provider = model.providerID.toLowerCase()
-  const family = model.id
-    .toLowerCase()
-    .split("/")
-    .at(-1)
-    ?.match(/^(nemotron|claude|gemini|llama|qwen|deepseek|gpt)(?:[-_.0-9]|$)/)?.[1]
   return {
     provider_family:
       provider === "anthropic"
@@ -506,8 +544,7 @@ export function route(model: Model.Ref, protocol = "") {
                 : provider === "openai"
                   ? "openai"
                   : "other",
-    model_family:
-      (family as "nemotron" | "claude" | "gemini" | "llama" | "qwen" | "deepseek" | "gpt" | undefined) ?? "other",
+    model_family: modelFamily(model.id),
     protocol_family:
       protocol === "openai-compatible-chat" || protocol === "openai-chat"
         ? "openai-chat"
@@ -523,6 +560,18 @@ export function route(model: Model.Ref, protocol = "") {
                   ? "ai-sdk"
                   : "other",
   } as const
+}
+/** Family only: reported identifiers must never become arbitrary metric labels. */
+export function modelFamily(id: string): typeof ModelFamily.Type {
+  return (
+    (id
+      .toLowerCase()
+      .split("/")
+      .at(-1)
+      ?.match(/^(nemotron|claude|gemini|llama|qwen|deepseek|gpt)(?:[-_.0-9]|$)/)?.[1] as
+      | Exclude<typeof ModelFamily.Type, "other">
+      | undefined) ?? "other"
+  )
 }
 const histogram = (
   name: string,

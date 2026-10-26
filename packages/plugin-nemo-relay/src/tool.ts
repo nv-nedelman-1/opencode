@@ -61,6 +61,13 @@ export const middleware =
                 "opencode.session_id": execution.sessionID,
                 "opencode.message_id": execution.messageID,
                 "opencode.agent": execution.agent,
+                ...(execution.provenance === undefined
+                  ? {}
+                  : {
+                      "opencode.tool_origin": execution.provenance.origin,
+                      "opencode.tool_execution": execution.provenance.execution,
+                      "opencode.tool_category": execution.provenance.category,
+                    }),
               },
               execution.id,
             ),

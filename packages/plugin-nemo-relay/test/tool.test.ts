@@ -12,6 +12,7 @@ import { RelayTool } from "../src/tool"
 type Bridge = (
   input: unknown,
   next: (input: unknown, signal: AbortSignal) => Promise<{ result: unknown }>,
+  metadata?: unknown,
 ) => Promise<{ result: unknown }>
 
 const call: ToolExecution = {
@@ -28,11 +29,20 @@ const run = (
   next: Parameters<ToolMiddlewares["execute"]>[1],
   signal?: AbortSignal,
   release = () => {},
+  execution: ToolExecution = call,
 ) => {
   const parent = { uuid: "scope_tool_unit" } as ScopeHandle
   const runtime: RelayHost.Runtime = {
     relay: {
-      toolCallExecuteAsync: (_name: string, input: unknown, callback: Parameters<Bridge>[1]) => bridge(input, callback),
+      toolCallExecuteAsync: (
+        _name: string,
+        input: unknown,
+        callback: Parameters<Bridge>[1],
+        _parent: unknown,
+        _codec: unknown,
+        _responseCodec: unknown,
+        metadata: unknown,
+      ) => bridge(input, callback, metadata),
     } as unknown as RelayHost.Relay,
     scope: () => Effect.succeed(parent),
     open: () => parent,
@@ -47,12 +57,37 @@ const run = (
       }),
     close: () => {},
   }
-  return Effect.runPromiseExit(RelayTool.middleware(runtime, () => Effect.succeed(undefined))(call, next), { signal })
+  return Effect.runPromiseExit(RelayTool.middleware(runtime, () => Effect.succeed(undefined))(execution, next), {
+    signal,
+  })
 }
 
 const forward: Bridge = (input, next) => next(input, new AbortController().signal)
 
 describe("Relay tool middleware boundaries", () => {
+  test("native tool spans receive captured provenance rather than classifying their name", async () => {
+    let observed: unknown
+    const exit = await run(
+      (input, next, metadata) => {
+        observed = metadata
+        return forward(input, next)
+      },
+      () => Effect.succeed({ content: "ok" }),
+      undefined,
+      () => {},
+      {
+        ...call,
+        tool: "bash",
+        provenance: { origin: "mcp", execution: "mcp", category: "extension" },
+      },
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(observed).toMatchObject({
+      "opencode.tool_origin": "mcp",
+      "opencode.tool_execution": "mcp",
+      "opencode.tool_category": "extension",
+    })
+  })
   test("keeps result identity and projects stateful results only once", async () => {
     const state = { reads: 0 }
     const result = {
