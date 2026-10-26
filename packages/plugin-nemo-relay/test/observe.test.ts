@@ -979,6 +979,27 @@ test("host provenance survives delayed bus events and nested CodeMode entries wi
   ])
 })
 
+test("an older queued run terminal cannot erase a subsequent run's captured tool provenance", () => {
+  const fixture = makeFixture()
+  Effect.runSync(fixture.observer.event(published(SessionEvent.Execution.Started, { sessionID }, 100)))
+  fixture.capture("next", { origin: "mcp", execution: "mcp", category: "extension" })
+  ;[
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 150),
+    published(SessionEvent.Execution.Started, { sessionID }, 160),
+    published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "next", name: "bash" }, 170),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "next", executed: false, content: [{ type: "text", text: "SECRET" }] },
+      180,
+    ),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  expect(fixture.marks.find((mark) => mark[1] === "opencode.tool.completed")?.[2]).toMatchObject({
+    tool_origin: "mcp",
+    execution: "mcp",
+    category: "extension",
+  })
+})
+
 test("permission facts attach only to the matching call and denial remains sticky", () => {
   const fixture = makeFixture()
   ;["one", "two"].forEach((id) => fixture.capture(id, { origin: "plugin", execution: "local", category: "extension" }))

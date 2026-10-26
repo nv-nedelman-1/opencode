@@ -47,7 +47,6 @@ interface SessionState {
     { readonly started: number; readonly model: SessionContext["model"]; streamed?: number; firstOutput?: true }
   >
   readonly permissions: Map<string, { readonly started: number; readonly family: string; readonly toolKey?: string }>
-  readonly tools: Map<string, ToolState>
   readonly counts: {
     steps: number
     tools: number
@@ -73,6 +72,15 @@ export const make = (runtime: Parameters<typeof create>[0]) => {
 const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close">) => {
   const parents = new Map<Session.ID, Session.ID>()
   const sessions = new Map<Session.ID, SessionState>()
+  // Source callbacks can lead the bus across run boundaries; calls settle by message/call ID, not run end.
+  const calls = new Map<Session.ID, Map<string, ToolState>>()
+  const toolState = (id: Session.ID) => {
+    const existing = calls.get(id)
+    if (existing) return existing
+    const created = new Map<string, ToolState>()
+    calls.set(id, created)
+    return created
+  }
   const forms = new Map<string, { readonly sessionID?: Session.ID; readonly started: number }>()
   // Bounded, process-local comparison only; neither skill identities nor content hashes are exported.
   const skillLoads = new Map<Session.ID, Map<string, string>>()
@@ -82,7 +90,6 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     const created: SessionState = {
       steps: new Map(),
       permissions: new Map(),
-      tools: new Map(),
       counts: { steps: 0, tools: 0, retries: 0, permissions: 0, forms: 0, compactions: 0 },
     }
     sessions.set(id, created)
@@ -341,14 +348,14 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           })
           return
         case "session.tool.input.started": {
-          const tools = state(event.data.sessionID).tools
+          const tools = toolState(event.data.sessionID)
           const key = `${event.data.assistantMessageID}:${event.data.id}`
           if (!tools.has(key)) tools.set(key, {})
           return
         }
         case "session.tool.called": {
           const current = state(event.data.sessionID)
-          const tool = current.tools.get(`${event.data.assistantMessageID}:${event.data.id}`)
+          const tool = calls.get(event.data.sessionID)?.get(`${event.data.assistantMessageID}:${event.data.id}`)
           if (tool?.started !== undefined) return
           if (tool) tool.started = event.created
           current.counts.tools++
@@ -368,7 +375,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
         case "session.tool.success":
         case "session.tool.failed": {
           const key = `${event.data.assistantMessageID}:${event.data.id}`
-          const tools = sessions.get(event.data.sessionID)?.tools
+          const tools = calls.get(event.data.sessionID)
           const tool = tools?.get(key)
           const category = tool?.provenance?.category ?? "unknown"
           const data = {
@@ -400,6 +407,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           mark(event.data.sessionID, "opencode.tool.completed", data)
           if (category === "skill") mark(event.data.sessionID, "opencode.skill.tool.completed", data)
           tools?.delete(key)
+          if (tools?.size === 0) calls.delete(event.data.sessionID)
           return
         }
         case "permission.asked": {
@@ -408,7 +416,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           if (current.permissions.has(event.data.id)) return
           const toolKey =
             event.data.source?.type === "tool" ? `${event.data.source.messageID}:${event.data.source.id}` : undefined
-          const tool = toolKey === undefined ? undefined : current.tools.get(toolKey)
+          const tool = toolKey === undefined ? undefined : calls.get(event.data.sessionID)?.get(toolKey)
           if (tool && tool.approval !== "denied" && tool.approval !== "rejected") tool.approval = "asked"
           current.permissions.set(event.data.id, { started: event.created, family, toolKey })
           current.counts.permissions++
@@ -418,8 +426,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
         case "permission.replied": {
           const pending = sessions.get(event.data.sessionID)?.permissions.get(event.data.requestID)
           if (!pending) return
-          const tool =
-            pending.toolKey === undefined ? undefined : sessions.get(event.data.sessionID)?.tools.get(pending.toolKey)
+          const tool = pending.toolKey === undefined ? undefined : calls.get(event.data.sessionID)?.get(pending.toolKey)
           if (tool && tool.approval !== "denied" && tool.approval !== "rejected")
             tool.approval = event.data.reply === "reject" ? "rejected" : "allowed_after_ask"
           mark(event.data.sessionID, "opencode.permission.wait.completed", {
@@ -463,6 +470,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           sessions.delete(event.data.sessionID)
           parents.delete(event.data.sessionID)
           skillLoads.delete(event.data.sessionID)
+          calls.delete(event.data.sessionID)
           runtime.close(event.data.sessionID, "cancelled")
           return
       }
@@ -563,7 +571,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     Effect.sync(() => {
       const tool =
         event.source?.type === "tool"
-          ? sessions.get(event.sessionID)?.tools.get(`${event.source.messageID}:${event.source.id}`)
+          ? calls.get(event.sessionID)?.get(`${event.source.messageID}:${event.source.id}`)
           : undefined
       if (tool) {
         if (event.effect === "deny") tool.approval = "denied"
@@ -601,7 +609,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
 
   const toolExecution = (call: ToolExecution) =>
     Effect.sync(() => {
-      const tools = state(call.sessionID).tools
+      const tools = toolState(call.sessionID)
       const key = `${call.messageID}:${call.id}`
       const tool = tools.get(key) ?? {}
       tools.set(key, tool)
