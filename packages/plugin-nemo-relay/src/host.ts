@@ -168,6 +168,24 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
     yield* Effect.logWarning(`${failure.error.message}; model and tool execution is blocked`)
     return failure
   }
+  const failed = active.report.dynamic_plugins.filter((entry) => entry.failure != null)
+  if (failed.length > 0) {
+    // Disabled declarations can also have failure reports; validation identifies requested entries.
+    const requested = yield* Effect.try(
+      () =>
+        new Set(
+          plugin
+            .validate(options.config ?? plugin.defaultConfig(), pluginsToml)
+            .dynamic_plugins.map((entry) => entry.plugin_id),
+        ),
+    ).pipe(Effect.option)
+    if (Option.isSome(requested)) {
+      const count = failed.filter((entry) => requested.value.has(entry.plugin_id)).length
+      if (count > 0) yield* Effect.logWarning("NeMo Relay skipped optional dynamic plugins", { count })
+    } else {
+      yield* Effect.logWarning("NeMo Relay dynamic plugin diagnostics could not be classified")
+    }
+  }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
   const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
   runtime.mark(undefined, "opencode.runtime.activation", { count: 1 })

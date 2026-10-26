@@ -2,12 +2,13 @@ import { afterAll, beforeAll, expect, test } from "bun:test"
 import type { Plugin } from "@opencode/plugin/effect"
 import type { SessionHttpCall, SessionMiddlewares } from "@opencode/plugin/effect/session"
 import type { ToolExecution, ToolMiddlewares } from "@opencode/plugin/effect/tool"
-import { Cause, Effect, Exit } from "effect"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { Cause, Effect, Exit, Logger } from "effect"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import NemoRelayPlugin from "../src/index"
 import { RelayBinding } from "../src/binding"
+import { RelayHost } from "../src/host"
 
 let directory: string
 let pluginsToml: string
@@ -20,6 +21,57 @@ beforeAll(async () => {
 
 afterAll(async () => {
   if (directory) await rm(directory, { recursive: true, force: true })
+})
+
+test.each([true, false])("optional missing artifacts warn only when requested (selected=%s)", async (selected) => {
+  const local = path.join(directory, `optional-${selected}`)
+  await mkdir(local)
+  const file = path.join(local, "plugins.toml")
+  await writeFile(
+    path.join(local, "relay-plugin.toml"),
+    `manifest_version = 1
+[plugin]
+id = "synthetic.optional"
+kind = "rust_dynamic"
+[compat]
+relay = ">=0.10,<1.0"
+native_api = "1"
+[defaults]
+enabled = false
+[capabilities]
+items = ["plugin_native"]
+[source]
+artifact = "private-missing-artifact.dylib"
+[integrity]
+sha256 = "sha256:${"0".repeat(64)}"
+[load]
+library = "private-missing-artifact.dylib"
+symbol = "nemo_relay_register_plugin"
+`,
+  )
+  await writeFile(
+    file,
+    `version = 1
+[[plugins.dynamic]]
+manifest = "relay-plugin.toml"
+[plugins.policy.overrides."synthetic.optional"]
+attestation = "integrity_only"
+startup = "optional"
+`,
+  )
+  if (!selected) await writeFile(path.join(local, ".dynamic-plugins.json"), '{"schema_version":1,"records":[]}')
+  const messages: unknown[] = []
+  const runtime = await Effect.runPromise(
+    Effect.scoped(RelayHost.acquire({ pluginsToml: file })).pipe(
+      Effect.provide(Logger.layer([Logger.make((entry) => messages.push(entry.message))])),
+    ),
+  )
+  expect(runtime).not.toBeUndefined()
+  expect(runtime).not.toBeInstanceOf(RelayHost.StartupFailure)
+  const warnings = messages.filter((message) => JSON.stringify(message).includes("skipped optional dynamic plugins"))
+  expect(warnings).toEqual(selected ? [["NeMo Relay skipped optional dynamic plugins", { count: 1 }]] : [])
+  expect(JSON.stringify(messages)).not.toContain("private-missing-artifact")
+  expect(JSON.stringify(messages)).not.toContain("synthetic.optional")
 })
 
 test.each([
