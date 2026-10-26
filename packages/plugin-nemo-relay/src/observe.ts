@@ -488,7 +488,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
   ) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        kind === "primary" ? event.sessionID : undefined,
         "opencode.context.prepared",
         {
           call_role: kind,
@@ -498,14 +498,14 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           system_character_count: event.system.reduce((count, part) => count + part.text.length, 0),
           ...(event.tools === undefined ? {} : { tool_count: Object.keys(event.tools).length }),
         },
-        hostMetadata,
+        kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
 
   const contextUsage = (event: SessionHooks["context.usage"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        event.kind === "primary" ? event.sessionID : undefined,
         "opencode.context.usage",
         {
           call_role: event.kind,
@@ -519,13 +519,13 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
               }),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
   const retryDecision = (event: SessionHooks["retry.decision"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        event.kind === "primary" ? event.sessionID : undefined,
         "opencode.llm.retry.decision",
         {
           count: 1,
@@ -539,13 +539,13 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           ...failure(event.error),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
   const compactionOutcome = (event: SessionHooks["compaction.outcome"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        undefined,
         "opencode.compaction.outcome",
         {
           count: 1,
@@ -570,7 +570,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
             : { retained_ratio: event.after / event.before }),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        auxiliaryMetadata,
       ),
     )
   const permissionDecision = (event: PermissionHooks["decision"]) =>
@@ -600,7 +600,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
   const usage = (event: SessionHooks["usage"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        undefined,
         "opencode.llm.usage.recorded",
         {
           call_role: event.source,
@@ -609,7 +609,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           cost_usd: event.cost,
           tokens: event.tokens,
         },
-        hostMetadata,
+        auxiliaryMetadata,
       ),
     )
 
@@ -628,7 +628,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
   const modelOutcome = (event: SessionModelOutcome) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        event.kind === "primary" ? event.sessionID : undefined,
         "opencode.llm.host_call.completed",
         {
           count: 1,
@@ -640,7 +640,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
             ? {}
             : { response_model_family: RelayMetrics.modelFamily(event.responseModel) }),
         },
-        hostMetadata,
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
   const skillLoad = (event: SkillLoad) =>
@@ -689,6 +689,8 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
 }
 
 const hostMetadata = { "opencode.observation.schema_version": "1", "opencode.observation.source": "host" }
+// Auxiliary summaries have no invocation owner token; a currently open Session execution may be unrelated.
+const auxiliaryMetadata = { ...hostMetadata, "opencode.execution.attribution": "unavailable" }
 
 const terminalMetadata = Schema.decodeUnknownOption(
   Schema.Struct({

@@ -887,7 +887,59 @@ test("source model outcomes cover auxiliary calls without duplicating logical st
     response_model_family: "nemotron",
   })
   expect(fixture.marks[1][2]).not.toHaveProperty("response_model_family")
+  expect(fixture.marks.map((mark) => mark[0])).toEqual([sessionID, undefined, undefined, undefined])
   expect(JSON.stringify(fixture.marks)).not.toMatch(/SECRET|tokens|cost_usd/)
+})
+
+test("auxiliary summaries preserve metrics without borrowing a concurrent execution's parent", () => {
+  const fixture = makeFixture()
+  const identity = { sessionID, agent: Agent.ID.make("build"), model }
+  Effect.runSync(fixture.observer.event(published(SessionEvent.Execution.Started, { sessionID }, 100)))
+  fixture.marks.length = 0
+  Effect.runSync(fixture.observer.context({ ...identity, messages: [], system: [], options: {} }, "generate"))
+  Effect.runSync(fixture.observer.contextUsage({ ...identity, kind: "generate", measured: 60, estimated: 20 }))
+  Effect.runSync(
+    fixture.observer.retryDecision({
+      ...identity,
+      kind: "generate",
+      error: { type: "provider.rate-limit", message: "SECRET" },
+      attempt: 1,
+      retryable: true,
+      decision: { retry: false },
+      source: "policy",
+      reason: "exhausted",
+    }),
+  )
+  Effect.runSync(fixture.observer.compactionOutcome({ ...identity, trigger: "manual", status: "completed" }))
+  Effect.runSync(
+    fixture.observer.usage({
+      ...identity,
+      source: "generate",
+      tokens,
+      cost: Money.USD.make(0.01),
+      costSource: "host_calculated",
+    }),
+  )
+  Effect.runSync(fixture.observer.modelOutcome({ ...identity, kind: "generate", status: "completed", durationMs: 25 }))
+  expect(fixture.marks.map((mark) => mark[1])).toEqual([
+    "opencode.context.prepared",
+    "opencode.context.usage",
+    "opencode.llm.retry.decision",
+    "opencode.compaction.outcome",
+    "opencode.llm.usage.recorded",
+    "opencode.llm.host_call.completed",
+  ])
+  expect(fixture.marks.every((mark) => mark[0] === undefined)).toBe(true)
+  expect(
+    fixture.marks.every(
+      (mark) => (mark[3] as Record<string, unknown>)["opencode.execution.attribution"] === "unavailable",
+    ),
+  ).toBe(true)
+  expect(fixture.marks[4][2]).toMatchObject({ tokens, cost_usd: 0.01, call_role: "generate" })
+  expect(fixture.marks[5][2]).toMatchObject({ count: 1, duration_ms: 25, outcome: "success", call_role: "generate" })
+  Effect.runSync(fixture.observer.modelOutcome({ ...identity, kind: "primary", status: "completed", durationMs: 50 }))
+  expect(fixture.marks.at(-1)?.[0]).toBe(sessionID)
+  expect(fixture.marks.at(-1)?.[3]).not.toHaveProperty("opencode.execution.attribution")
 })
 
 test("skill loads compare only successful, privately retained session snapshots", () => {
