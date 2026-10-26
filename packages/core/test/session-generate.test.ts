@@ -52,6 +52,7 @@ import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Tool } from "@opencode/core/tool"
 import { asc, eq } from "drizzle-orm"
 import { Effect, Layer, Schema, Stream } from "effect"
+import { Money } from "@opencode/schema/money"
 import { testEffect } from "./lib/effect"
 
 const requests: LLMRequest[] = []
@@ -74,7 +75,14 @@ const client = Layer.mock(LLMClient.Service)({
         LLMEvent.stepFinish({
           index: 0,
           reason: { normalized: "stop" },
-          usage: { inputTokens: 100, outputTokens: 10 },
+          usage: {
+            inputTokens: 100,
+            outputTokens: 10,
+            nonCachedInputTokens: 70,
+            cacheReadInputTokens: 20,
+            cacheWriteInputTokens: 10,
+            reasoningTokens: 3,
+          },
         }),
         LLMEvent.finish({ reason: { normalized: "stop" } }),
       ])
@@ -87,7 +95,16 @@ const models = Layer.mock(SessionRunnerModel.Service)({
     Effect.succeed(
       SessionRunnerModel.resolved(model, {
         capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
-        cost: [],
+        cost: [
+          {
+            input: Money.USDPerMillionTokens.make(2),
+            output: Money.USDPerMillionTokens.make(4),
+            cache: {
+              read: Money.USDPerMillionTokens.make(0.5),
+              write: Money.USDPerMillionTokens.make(1.5),
+            },
+          },
+        ],
         limit: { context: 200_000, output: 32_000 },
       }),
     ),
@@ -211,6 +228,7 @@ const setup = Effect.gen(function* () {
   const projects = yield* Project.Service
   const instructionBuiltIns = yield* InstructionBuiltIns.Service
   const context = yield* SessionContext.Service
+  const hooks = yield* PluginHooks.Service
   const store = yield* SessionStore.Service
   yield* agents.transform((editor) =>
     editor.update(Agent.ID.make("build"), (agent) => {
@@ -243,6 +261,7 @@ const setup = Effect.gen(function* () {
         Effect.provide(
           Layer.mergeAll(
             Layer.succeed(SessionContext.Service, context),
+            Layer.succeed(PluginHooks.Service, hooks),
             Layer.mock(Plugin.Service, { awaitActivation: Effect.void }),
           ) as Layer.Layer<Instance.Services>,
         ),
@@ -352,6 +371,89 @@ it.effect(
       expect(requests[0]?.tools).toMatchObject([{ name: "lookup", description: "Lookup" }])
       expect(requests[0]?.toolChoice).toBeUndefined()
       expect(options[0]?.webSocket).toBeUndefined()
+      expect(yield* durableState(db, sessionID)).toEqual(before)
+    }),
+  { timeout: 15_000 },
+)
+
+it.effect(
+  "observes each generation's reported usage once without durable mutation",
+  () =>
+    Effect.gen(function* () {
+      requests.length = 0
+      instruction = "Initial context"
+      const { db, bus, instructions, session, instances } = yield* setup
+      yield* InstructionState.prepare(db, bus, instructions, sessionID)
+      const hooks = yield* PluginHooks.Service
+      const observed: PluginHooks.Domains["session"]["usage"][] = []
+      yield* hooks.register("session", "usage", (event) =>
+        Effect.sync(() => {
+          observed.push(event)
+          expect(Object.isFrozen(event)).toBe(true)
+          expect(Object.isFrozen(event.tokens)).toBe(true)
+          expect(Object.isFrozen(event.tokens.cache)).toBe(true)
+        }),
+      )
+      const before = yield* durableState(db, sessionID)
+
+      expect(
+        yield* SessionGenerate.generate({ session, prompt: "Private generation input" }).pipe(
+          Effect.provideService(Instance.Service, instances),
+        ),
+      ).toBe("Transient answer")
+
+      expect(requests).toHaveLength(1)
+      expect(observed).toEqual([
+        {
+          sessionID,
+          agent: Agent.ID.make("build"),
+          model: { id: ID.make("generate-model"), providerID: Provider.ID.make("test") },
+          source: "generate",
+          tokens: { input: 70, output: 7, reasoning: 3, cache: { read: 20, write: 10 } },
+          cost: Money.USD.make(0.000205),
+          costSource: "host_calculated",
+        },
+      ])
+      expect(yield* durableState(db, sessionID)).toEqual(before)
+    }),
+  { timeout: 15_000 },
+)
+
+it.effect(
+  "does not invent a usage charge when generation reports none",
+  () =>
+    Effect.gen(function* () {
+      instruction = "Initial context"
+      const { db, bus, instructions, session, instances } = yield* setup
+      yield* InstructionState.prepare(db, bus, instructions, sessionID)
+      const hooks = yield* PluginHooks.Service
+      const observed: PluginHooks.Domains["session"]["usage"][] = []
+      yield* hooks.register("session", "usage", (event) =>
+        Effect.sync(() => {
+          observed.push(event)
+        }),
+      )
+      const before = yield* durableState(db, sessionID)
+
+      expect(
+        yield* SessionGenerate.generate({ session, prompt: "Private generation input" }).pipe(
+          Effect.provideService(Instance.Service, instances),
+          Effect.provide(
+            Layer.mock(LLMClient.Service)({
+              generate: () =>
+                Effect.succeed(
+                  new LLMResponse({
+                    message: Message.assistant("Unmetered answer"),
+                    events: [LLMEvent.textDelta({ id: "generate", text: "Unmetered answer" })],
+                    finishReason: { normalized: "stop" },
+                  }),
+                ),
+            }),
+          ),
+        ),
+      ).toBe("Unmetered answer")
+
+      expect(observed).toEqual([])
       expect(yield* durableState(db, sessionID)).toEqual(before)
     }),
   { timeout: 15_000 },

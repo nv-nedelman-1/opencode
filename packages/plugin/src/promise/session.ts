@@ -182,7 +182,7 @@ export interface SessionUsage {
   readonly sessionID: Session.ID
   readonly agent: Agent.ID
   readonly model: Model.Ref
-  readonly source: "title" | "compaction"
+  readonly source: "title" | "compaction" | "generate"
   readonly tokens: TokenUsage.Info
   readonly cost: Money.USD
   readonly costSource: "host_calculated"
