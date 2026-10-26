@@ -18,6 +18,7 @@ import { SessionStep } from "@opencode/core/session/runner/step"
 import { SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { Snapshot } from "@opencode/core/snapshot"
 import { ToolOutput } from "@opencode/core/tool-output"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { Money } from "@opencode/schema/money"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { asc, eq } from "drizzle-orm"
@@ -26,9 +27,10 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   Layer.merge(
-    AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node, ToolOutput.node]), [
-      Bus.node.replace(Bus.configured({ persist: true })),
-    ]),
+    AppNodeBuilder.build(
+      LayerNode.group([Database.node, Bus.node, SessionProjector.node, ToolOutput.node, PluginHooks.node]),
+      [Bus.node.replace(Bus.configured({ persist: true }))],
+    ),
     TestLLM.testLayer(),
   ),
 )
@@ -49,6 +51,13 @@ for (const fixture of [
       const files = [RelativePath.make("changed.ts")]
       let captures = 0
       let executions = 0
+      const hooks = yield* PluginHooks.Service
+      const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+      yield* hooks.register("session", "model.outcome", (event) =>
+        Effect.sync(() => {
+          outcomes.push(event)
+        }),
+      )
       const steps = yield* SessionStep.make.pipe(
         Effect.provide(
           Layer.mock(Snapshot.Service)({
@@ -96,10 +105,13 @@ for (const fixture of [
             },
           },
           LLMEvent.toolCall({ id: "call-test", name: "test", input: {} }),
+        ).map((event) =>
+          LLMEvent.is.finish(event) ? LLMEvent.finish({ ...event, responseModel: "accepted-model" }) : event,
         ),
       )
       const result = yield* steps
         .attempt({
+          observations: hooks,
           isLocationClosed: () => false,
           sessionID,
           assistantMessageID,
@@ -123,6 +135,16 @@ for (const fixture of [
         })
         .pipe(Effect.exit)
       expect(Exit.isSuccess(result)).toBe(fixture.finish === "stop")
+      expect(outcomes).toHaveLength(1)
+      expect(outcomes[0]).toMatchObject({
+        sessionID,
+        agent: Agent.defaultID,
+        model: model.ref,
+        kind: "primary",
+        status: fixture.finish === "stop" ? "completed" : "failed",
+        responseModel: "accepted-model",
+      })
+      expect(outcomes[0]).not.toHaveProperty("tokens")
       expect(executions).toBe(fixture.toolChoice === "none" ? 0 : 1)
       if (Exit.isSuccess(result))
         expect(result.value).toEqual(

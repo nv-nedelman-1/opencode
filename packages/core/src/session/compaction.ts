@@ -32,6 +32,7 @@ import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
 import type { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
+import { SessionModelOutcome } from "./model-outcome.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
@@ -372,14 +373,28 @@ export const layer = Layer.effect(
           return Effect.gen(function* () {
             const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
             const retained = recentUserMessages(history, context.model, keep)
-            const response = yield* llm.compact(request, { ...prepared.options, mechanism: "trigger" })
+            const response = yield* SessionModelOutcome.observe(
+              hooks,
+              { sessionID: context.session.id, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+              (observer) =>
+                llm
+                  .compact(request, { ...prepared.options, mechanism: "trigger" })
+                  .pipe(
+                    Effect.tap((response) => Effect.sync(() => observer.finish(undefined, response.responseModel))),
+                  ),
+            )
             return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
           })
         }
         if (LLMClient.canCompact(request)) {
-          return llm
-            .compact(request, { mechanism: "endpoint", http: prepared.options.http })
-            .pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
+          return SessionModelOutcome.observe(
+            hooks,
+            { sessionID: context.session.id, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+            (observer) =>
+              llm
+                .compact(request, { mechanism: "endpoint", http: prepared.options.http })
+                .pipe(Effect.tap(() => Effect.sync(() => observer.finish()))),
+          ).pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
         }
         return unsupported(`Native compaction is not supported for ${request.model.provider}/${request.model.route.id}`)
       }
@@ -526,59 +541,65 @@ export const layer = Layer.effect(
       const metadataKey = context.model.model.route.providerMetadataKey ?? context.model.model.provider
       const unusable = (error: SessionError.Error) => Effect.fail<Failure>({ error })
 
-      return llm.stream(request, options).pipe(
-        Stream.runFoldEffect(
-          (): Streamed => ({ text: "" }),
-          (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
-            if (LLMEvent.is.providerError(event)) {
-              if (event.classification === undefined)
-                return unusable({ type: "provider.error", message: event.message })
-              return Effect.fail(
-                new AIError({
-                  reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
-                }),
-              )
-            }
-
-            if (LLMEvent.is.textDelta(event)) {
-              return bus
-                .publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text })
-                .pipe(Effect.as({ ...streamed, text: streamed.text + event.text }))
-            }
-
-            if (LLMEvent.is.stepFinish(event)) {
-              return spend(context, SessionUsage.record(event.usage, context.model.cost)).pipe(
-                Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
-              )
-            }
-
-            if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
-            switch (event.reason.normalized) {
-              case "unknown":
-                return Effect.fail(
-                  new AIError({
-                    reason: new InvalidProviderOutputError({
-                      message: "The provider response ended with an unknown finish reason.",
-                      classification: "incomplete-stream",
+      return SessionModelOutcome.observe(
+        hooks,
+        { sessionID, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+        (observer) =>
+          llm.stream(request, options).pipe(
+            Stream.runFoldEffect(
+              (): Streamed => ({ text: "" }),
+              (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
+                observer.event(event)
+                if (LLMEvent.is.providerError(event)) {
+                  if (event.classification === undefined)
+                    return unusable({ type: "provider.error", message: event.message })
+                  return Effect.fail(
+                    new AIError({
+                      reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
                     }),
-                  }),
-                )
-              case "error":
-                return Effect.fail(
-                  new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
-                )
-              case "length":
-                return unusable({
-                  type: "compaction.failed",
-                  message: "Compaction summary reached the output token limit",
-                })
-              case "content-filter":
-                return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
-              default:
-                return Effect.succeed(streamed)
-            }
-          },
-        ),
+                  )
+                }
+
+                if (LLMEvent.is.textDelta(event)) {
+                  return bus
+                    .publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text })
+                    .pipe(Effect.as({ ...streamed, text: streamed.text + event.text }))
+                }
+
+                if (LLMEvent.is.stepFinish(event)) {
+                  return spend(context, SessionUsage.record(event.usage, context.model.cost)).pipe(
+                    Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
+                  )
+                }
+
+                if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
+                switch (event.reason.normalized) {
+                  case "unknown":
+                    return Effect.fail(
+                      new AIError({
+                        reason: new InvalidProviderOutputError({
+                          message: "The provider response ended with an unknown finish reason.",
+                          classification: "incomplete-stream",
+                        }),
+                      }),
+                    )
+                  case "error":
+                    return Effect.fail(
+                      new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
+                    )
+                  case "length":
+                    return unusable({
+                      type: "compaction.failed",
+                      message: "Compaction summary reached the output token limit",
+                    })
+                  case "content-filter":
+                    return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
+                  default:
+                    return Effect.succeed(streamed)
+                }
+              },
+            ),
+          ),
       )
     }
 

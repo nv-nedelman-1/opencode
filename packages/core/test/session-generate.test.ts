@@ -51,7 +51,7 @@ import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Tool } from "@opencode/core/tool"
 import { asc, eq } from "drizzle-orm"
-import { Effect, Layer, Schema, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import { Money } from "@opencode/schema/money"
 import { testEffect } from "./lib/effect"
 
@@ -84,7 +84,7 @@ const client = Layer.mock(LLMClient.Service)({
             reasoningTokens: 3,
           },
         }),
-        LLMEvent.finish({ reason: { normalized: "stop" } }),
+        LLMEvent.finish({ reason: { normalized: "stop" }, responseModel: "generate-accepted" }),
       ])
       if (!response) throw new Error("Incomplete generate response")
       return response
@@ -386,6 +386,12 @@ it.effect(
       yield* InstructionState.prepare(db, bus, instructions, sessionID)
       const hooks = yield* PluginHooks.Service
       const observed: PluginHooks.Domains["session"]["usage"][] = []
+      const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+      yield* hooks.register("session", "model.outcome", (event) =>
+        Effect.sync(() => {
+          outcomes.push(event)
+        }),
+      )
       yield* hooks.register("session", "usage", (event) =>
         Effect.sync(() => {
           observed.push(event)
@@ -403,6 +409,16 @@ it.effect(
       ).toBe("Transient answer")
 
       expect(requests).toHaveLength(1)
+      expect(outcomes).toHaveLength(1)
+      expect(outcomes[0]).toMatchObject({
+        sessionID,
+        agent: Agent.ID.make("build"),
+        kind: "generate",
+        status: "completed",
+        responseModel: "generate-accepted",
+      })
+      expect(outcomes[0]).not.toHaveProperty("assistantMessageID")
+      expect(outcomes[0].durationMs).toBeGreaterThanOrEqual(0)
       expect(observed).toEqual([
         {
           sessionID,
@@ -494,6 +510,46 @@ it.effect(
       expect(requests[0]?.providerOptions).toEqual({ reasoningEffort: "low" })
     }),
   { timeout: 15_000 },
+)
+
+it.effect("observes cancelled generation without usage or durable changes", () =>
+  Effect.gen(function* () {
+    instruction = "Initial context"
+    const { db, bus, instructions, session, instances } = yield* setup
+    yield* InstructionState.prepare(db, bus, instructions, sessionID)
+    const hooks = yield* PluginHooks.Service
+    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    const entered = yield* Deferred.make<void>()
+    let charges = 0
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        outcomes.push(event)
+      }),
+    )
+    yield* hooks.register("session", "usage", () =>
+      Effect.sync(() => {
+        charges++
+      }),
+    )
+    const before = yield* durableState(db, sessionID)
+    const pending = yield* SessionGenerate.generate({ session, prompt: "Cancel private generation" }).pipe(
+      Effect.provideService(Instance.Service, instances),
+      Effect.provide(
+        Layer.mock(LLMClient.Service)({
+          generate: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+        }),
+      ),
+      Effect.forkScoped,
+    )
+    yield* Deferred.await(entered)
+    yield* Fiber.interrupt(pending)
+    expect(Exit.hasInterrupts(yield* Fiber.await(pending))).toBe(true)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).toMatchObject({ kind: "generate", status: "interrupted", sessionID })
+    expect(outcomes[0]).not.toHaveProperty("responseModel")
+    expect(charges).toBe(0)
+    expect(yield* durableState(db, sessionID)).toEqual(before)
+  }),
 )
 
 it.effect(

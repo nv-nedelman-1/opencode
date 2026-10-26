@@ -13,6 +13,7 @@ import type { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionModelRequest } from "./model-request.js"
+import { SessionModelOutcome } from "./model-outcome.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import type { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
@@ -68,10 +69,22 @@ export const generate = Effect.fn("SessionGenerate.generate")(function* (input: 
       providerID: model.ref.providerID,
       modelID: model.ref.id,
     })
-    const response = yield* llm.generate(prepared.request, prepared.options)
+    const hooks = yield* PluginHooks.Service
+    const response = yield* SessionModelOutcome.observe(
+      hooks,
+      { sessionID: selection.session.id, agent: selection.agent.id, model: model.ref, kind: "generate" },
+      (observer) =>
+        llm.generate(prepared.request, prepared.options).pipe(
+          Effect.tap((response) =>
+            Effect.sync(() => {
+              response.events.forEach(observer.event)
+              observer.finish(response.finishReason, response.responseModel)
+            }),
+          ),
+        ),
+    )
     yield* Effect.logInfo("session generation usage diagnostic", { usage: response.usage })
     if (response.usage) {
-      const hooks = yield* PluginHooks.Service
       yield* hooks.trigger(
         "session",
         "usage",

@@ -13,6 +13,7 @@ import { llmClient } from "../effect/app-node-platform.js"
 import { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
+import { SessionModelOutcome } from "./model-outcome.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
@@ -90,16 +91,23 @@ export const layer = Layer.effect(
         messages: [Message.user(input.text)],
       })
       if (prepared.event.result !== undefined) return prepared.event.result
-      yield* llm.stream(prepared.request, prepared.options).pipe(
-        Stream.runForEach((event) => {
-          if (LLMEvent.is.providerError(event)) failed = true
-          if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
-          if (LLMEvent.is.stepFinish(event)) {
-            const step = SessionUsage.record(event.usage, input.model.cost)
-            usage = usage ? SessionUsage.add(usage, step) : step
-          }
-          return Effect.void
-        }),
+      yield* SessionModelOutcome.observe(
+        hooks,
+        { sessionID: input.session.id, agent: input.agent.id, model: input.model.ref, kind: "title" },
+        (observer) =>
+          llm.stream(prepared.request, prepared.options).pipe(
+            Stream.runForEach((event) => {
+              observer.event(event)
+              if (LLMEvent.is.providerError(event)) failed = true
+              if (LLMEvent.is.textDelta(event)) chunks.push(event.text)
+              if (LLMEvent.is.stepFinish(event)) {
+                const step = SessionUsage.record(event.usage, input.model.cost)
+                usage = usage ? SessionUsage.add(usage, step) : step
+              }
+              return Effect.void
+            }),
+          ),
+      ).pipe(
         Effect.catchTag("AI.Error", () =>
           Effect.sync(() => {
             failed = true

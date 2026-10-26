@@ -190,6 +190,20 @@ export interface SessionUsage {
   readonly costSource: "host_calculated"
 }
 
+/** One actual model invocation, not a physical HTTP retry or a tool execution. Does not charge usage. */
+export interface SessionModelOutcome {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  /** Configured selection; never substituted for an unreported response model. */
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly status: "completed" | "failed" | "interrupted"
+  /** Monotonic elapsed time through stream consumption, before observation callbacks. */
+  readonly durationMs: number
+  /** Provider-reported response model, only when the accepted response supplies it. */
+  readonly responseModel?: string
+}
+
 export interface SessionHooks {
   readonly prompt: SessionPrompt
   readonly context: SessionContext
@@ -197,6 +211,7 @@ export interface SessionHooks {
   readonly generate: SessionGenerate
   readonly title: SessionTitle
   readonly "model.request": SessionModelRequest
+  readonly "model.outcome": SessionModelOutcome
   readonly "http.request": SessionHttpRequest
   readonly "http.response": SessionHttpResponse
   readonly "experimental.ws.handshake": SessionWebSocketHandshake

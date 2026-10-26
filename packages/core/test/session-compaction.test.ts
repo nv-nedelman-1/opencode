@@ -68,6 +68,7 @@ const client = Layer.mock(LLMClient.Service)({
       }),
       LLMEvent.finish({
         reason: { normalized: "stop" },
+        responseModel: "summary-accepted",
       }),
     )
   },
@@ -422,6 +423,12 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     let hooked = 0
     const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
     const usage: PluginHooks.Domains["session"]["usage"][] = []
+    const modelOutcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        modelOutcomes.push(event)
+      }),
+    )
     yield* hooks.register("session", "compaction.outcome", (event) =>
       Effect.sync(() => {
         observed.push(event)
@@ -481,6 +488,15 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       retainedEstimatedTokens: 0,
     })
     expect(observed[0]?.before).toBeGreaterThan(0)
+    expect(modelOutcomes).toHaveLength(1)
+    expect(modelOutcomes[0]).toMatchObject({
+      kind: "compaction",
+      status: "completed",
+      responseModel: "summary-accepted",
+      sessionID,
+    })
+    expect(modelOutcomes[0]).not.toHaveProperty("tokens")
+    expect(modelOutcomes[0]).not.toHaveProperty("cost")
     expect(observed[0]?.after).toBeGreaterThan(0)
     expect(observed[0]?.sourceEstimatedTokens).toBeGreaterThan(0)
     expect(requests[0]?.promptCacheKey).toBe(parentID)
@@ -550,6 +566,12 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
       },
     ]
     let contexts = 0
+    const modelOutcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        modelOutcomes.push(event)
+      }),
+    )
     yield* hooks.register("session", "context", () => Effect.sync(() => contexts++))
     yield* hooks.register("session", "compaction", (event) =>
       Effect.sync(() => {
@@ -566,6 +588,7 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
 
     expect(contexts).toBe(0)
     expect(requests).toEqual([])
+    expect(modelOutcomes).toEqual([])
     expect(yield* store.context(sessionID)).toMatchObject([
       { type: "compaction", reason: "manual", summary: "## Objective\n- hooked summary", recent: "" },
     ])

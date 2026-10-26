@@ -34,7 +34,7 @@ import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
-import { Deferred, Effect, Fiber, Layer, Stream } from "effect"
+import { Deferred, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { testEffect } from "./lib/effect"
 
 let requests: LLMRequest[] = []
@@ -77,6 +77,7 @@ const successfulTitle = () =>
     }),
     LLMEvent.finish({
       reason: { normalized: "stop" },
+      responseModel: "title-accepted",
     }),
   )
 let titleStream: () => Stream.Stream<LLMEvent, AIError> = successfulTitle
@@ -202,6 +203,12 @@ it.effect("generates a title from the sole user message and renames the session"
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const usage: PluginHooks.Domains["session"]["usage"][] = []
+    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        outcomes.push(event)
+      }),
+    )
     yield* hooks.register("session", "usage", (event) =>
       Effect.sync(() => {
         usage.push(event)
@@ -217,6 +224,14 @@ it.effect("generates a title from the sole user message and renames the session"
     yield* title.generate(sessionID)
 
     expect(requests).toHaveLength(1)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).toMatchObject({
+      kind: "title",
+      status: "completed",
+      responseModel: "title-accepted",
+      sessionID,
+    })
+    expect(outcomes[0]).not.toHaveProperty("assistantMessageID")
     expect(requests[0]?.http?.headers).toEqual({
       "x-opencode-session-id": sessionID,
       "x-session-affinity": sessionID,
@@ -286,6 +301,12 @@ it.effect("uses a hook-provided title without a model request", () =>
     yield* prompt(sessionID, "Hello")
 
     const hooks = yield* PluginHooks.Service
+    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        outcomes.push(event)
+      }),
+    )
     yield* hooks.register("session", "title", (event) =>
       Effect.sync(() => {
         event.result = "Plugin Title"
@@ -296,6 +317,7 @@ it.effect("uses a hook-provided title without a model request", () =>
     yield* title.generate(sessionID)
 
     expect(requests).toHaveLength(0)
+    expect(outcomes).toEqual([])
     const store = yield* SessionStore.Service
     expect((yield* store.get(sessionID))?.title).toBe("Plugin Title")
   }),
@@ -342,6 +364,12 @@ it.effect("falls back to the primary model when the small model fails", () =>
 
     const attempted: Model.Ref[] = []
     const hooks = yield* PluginHooks.Service
+    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        outcomes.push(event)
+      }),
+    )
     yield* hooks.register("session", "model.request", (event) =>
       Effect.sync(() => {
         attempted.push(event.model)
@@ -353,6 +381,10 @@ it.effect("falls back to the primary model when the small model fails", () =>
 
     expect(requests.map((request) => String(request.model.id))).toEqual(["title-small", "title-model"])
     expect(attempted.map((model) => String(model.variant))).toEqual(["low", "high"])
+    expect(outcomes.map((outcome) => [outcome.model.id, outcome.status, outcome.responseModel])).toEqual([
+      ["title-small", "failed", undefined],
+      ["title-model", "completed", "title-accepted"],
+    ])
     const store = yield* SessionStore.Service
     expect((yield* store.get(sessionID))?.title).toBe("Generated Title")
   }),
@@ -565,6 +597,34 @@ it.effect("does not rename after a failed title stream", () =>
 
     const store = yield* SessionStore.Service
     expect(requests).toHaveLength(1)
+    expect((yield* store.get(sessionID))?.title).toBeUndefined()
+  }),
+)
+
+it.effect("observes a cancelled title once without a fabricated model or title", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_cancelled_outcome")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Cancel title generation")
+    const hooks = yield* PluginHooks.Service
+    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    const entered = yield* Deferred.make<void>()
+    yield* hooks.register("session", "model.outcome", (event) =>
+      Effect.sync(() => {
+        outcomes.push(event)
+      }),
+    )
+    titleStream = () => Stream.unwrap(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
+    const title = yield* SessionTitle.Service
+    const pending = yield* title.generate(sessionID).pipe(Effect.forkScoped)
+    yield* Deferred.await(entered)
+    yield* Fiber.interrupt(pending)
+    expect(Exit.hasInterrupts(yield* Fiber.await(pending))).toBe(true)
+    expect(outcomes).toHaveLength(1)
+    expect(outcomes[0]).toMatchObject({ kind: "title", status: "interrupted", sessionID })
+    expect(outcomes[0]).not.toHaveProperty("responseModel")
+    const store = yield* SessionStore.Service
     expect((yield* store.get(sessionID))?.title).toBeUndefined()
   }),
 )
