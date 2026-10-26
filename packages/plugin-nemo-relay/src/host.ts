@@ -196,10 +196,11 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
     }
   }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
-  const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
+  const client = RelayClient.diagnostics(options.client, process)
+  const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS, client)
   runtime.mark(undefined, "opencode.runtime.activation", {
     count: 1,
-    ...RelayClient.diagnostics(options.client, process),
+    ...client,
   })
   return runtime
 })
@@ -233,7 +234,13 @@ const locations = (explicit: string | undefined) => [
     : "/etc/nemo-relay/plugins.toml",
 ]
 
-export const make = (relay: Relay, activation: PluginHostActivation, budget: number): Active => {
+export const make = (
+  relay: Relay,
+  activation: PluginHostActivation,
+  budget: number,
+  client?: ReturnType<typeof RelayClient.diagnostics>,
+): Active => {
+  const attributes = RelayClient.metricAttributes(client)
   interface Entry {
     readonly handle: ScopeHandle
     readonly stack: ScopeStack
@@ -365,7 +372,16 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
     relay.withScopeStack(stack, () => {
       relay.event(name, entry?.handle ?? null, json(data), json(metadata), timestamp)
       if (measurements.length > 0)
-        relay.metric(`${name}.metrics`, measurements, entry?.handle ?? null, json(metadata), timestamp)
+        relay.metric(
+          `${name}.metrics`,
+          measurements.map((metric) => ({
+            ...metric,
+            attributes: { ...metric.attributes, ...attributes },
+          })),
+          entry?.handle ?? null,
+          json(metadata),
+          timestamp,
+        )
     })
   }
 

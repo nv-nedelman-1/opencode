@@ -2,7 +2,7 @@ export * as RelayClient from "./client.js"
 
 import type { App } from "@opencode/plugin/app"
 
-/** Process activation diagnostics only; neither installation identity nor global OTLP resources. */
+/** Bounded process facts; neither installation identity nor global OTLP resource configuration. */
 export function diagnostics(
   app: Pick<App, "version" | "channel"> | undefined,
   runtime: {
@@ -26,6 +26,19 @@ export function diagnostics(
     arch: runtime.arch === "arm64" || runtime.arch === "x64" ? runtime.arch : "other",
     ...(family === undefined ? {} : { runtime_family: family }),
     ...(runtimeVersion === undefined ? {} : { runtime_version: runtimeVersion }),
+  }
+}
+
+/** Instrument dimensions, not installation identity or changes to process-global exporters. */
+export function metricAttributes(facts: ReturnType<typeof diagnostics> | undefined): Record<string, string> {
+  if (facts === undefined) return {}
+  return {
+    "opencode.client.channel": facts.release_channel,
+    "opencode.host.os": facts.os,
+    "opencode.host.arch": facts.arch,
+    ...(facts.client_version === undefined ? {} : { "opencode.client.version": facts.client_version }),
+    ...(facts.runtime_family === undefined ? {} : { "opencode.runtime.family": facts.runtime_family }),
+    ...(facts.runtime_version === undefined ? {} : { "opencode.runtime.version": facts.runtime_version }),
   }
 }
 

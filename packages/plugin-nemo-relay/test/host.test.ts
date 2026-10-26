@@ -11,6 +11,7 @@ import path from "node:path"
 import { RelayBinding } from "../src/binding"
 import { RelayHost } from "../src/host"
 import { RelayModel } from "../src/model"
+import { RelayClient } from "../src/client"
 
 interface NativeEvent {
   uuid: string
@@ -35,17 +36,22 @@ afterAll(async () => {
   if (directory) await rm(directory, { recursive: true, force: true })
 })
 
-const fixture = async (budget = 500) => {
+const fixture = async (budget = 500, client?: ReturnType<typeof RelayClient.diagnostics>) => {
   const [relay, plugin] = await RelayBinding.load()
   const activation = await plugin.initialize(plugin.defaultConfig(), pluginsToml)
   const events: NativeEvent[] = []
   const state = { flushes: 0, closes: 0 }
+  const measurements: unknown[] = []
   relay.registerSubscriber("host-lifecycle-test", (event: unknown) => {
     events.push(event as NativeEvent)
   })
   const runtime = RelayHost.make(
     {
       ...relay,
+      metric: (...args: Parameters<typeof relay.metric>) => {
+        measurements.push(args[1])
+        return relay.metric(...args)
+      },
       flushSubscribers: () => {
         state.flushes++
         return relay.flushSubscribers()
@@ -59,12 +65,14 @@ const fixture = async (budget = 500) => {
       },
     },
     budget,
+    client,
   )
   return {
     relay,
     runtime,
     events,
     state,
+    measurements,
     dispose: async () => {
       await Effect.runPromise(runtime.shutdown)
       await activation.close()
@@ -397,6 +405,36 @@ test("host marks emit parented metric instruments once per admitted event", asyn
       expect.objectContaining({ parent_uuid: parent.uuid }),
     ])
     native.runtime.close(session, "success")
+  } finally {
+    await native.dispose()
+  }
+})
+
+test("actual native instruments receive bounded process dimensions without changing host event payloads", async () => {
+  const native = await fixture(
+    500,
+    RelayClient.diagnostics(
+      { version: "2.0.25-SECRET", channel: "beta" },
+      { platform: "linux", arch: "x64", versions: { node: "24.15.0" } },
+    ),
+  )
+  try {
+    native.runtime.mark(undefined, "opencode.agent.run.started", { count: 1 })
+    await native.relay.flushSubscribers()
+    expect(native.measurements).toEqual([
+      [
+        expect.objectContaining({
+          attributes: expect.objectContaining({
+            "opencode.client.version": "2.0.25",
+            "opencode.client.channel": "beta",
+            "opencode.host.os": "linux",
+            "opencode.runtime.family": "node",
+          }),
+        }),
+      ],
+    ])
+    expect(JSON.stringify(native.measurements)).not.toContain("SECRET")
+    expect(native.events.filter((event) => event.name === "opencode.agent.run.started.metrics")).toHaveLength(1)
   } finally {
     await native.dispose()
   }

@@ -121,3 +121,20 @@ test("app names, paths, identity, environment and process arguments are not copi
   expect(JSON.stringify(result)).not.toContain("PRIVATE")
   expect(runtime.argv).toEqual(["PRIVATE_ARGUMENT"])
 })
+
+test("aggregate instrument dimensions share sanitized process facts without installing identity", () => {
+  const facts = RelayClient.diagnostics(
+    { version: "2.0.25-PRIVATE+PRIVATE", channel: "beta" },
+    { platform: "darwin", arch: "arm64", versions: { bun: "1.4.2-PRIVATE" } },
+  )
+  expect(RelayClient.metricAttributes(facts)).toEqual({
+    "opencode.client.version": "2.0.25",
+    "opencode.client.channel": "beta",
+    "opencode.host.os": "darwin",
+    "opencode.host.arch": "arm64",
+    "opencode.runtime.family": "bun",
+    "opencode.runtime.version": "1.4",
+  })
+  expect(JSON.stringify(RelayClient.metricAttributes(facts))).not.toContain("PRIVATE")
+  expect(RelayClient.metricAttributes(undefined)).toEqual({})
+})
