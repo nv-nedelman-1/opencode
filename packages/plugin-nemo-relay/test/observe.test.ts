@@ -849,7 +849,7 @@ test("run operation mix counts logical boundaries, not retries as extra steps, a
   )
   run(published(SessionEvent.Execution.Succeeded, { sessionID }, 200))
   expect(fixture.marks.find((mark) => mark[1] === "opencode.tool.completed")?.[2]).toMatchObject({
-    result_family: "blocked",
+    result_family: "cancelled",
     outcome: "cancelled",
   })
   expect(fixture.marks.find((mark) => mark[1] === "opencode.agent.run.completed")?.[2]).toMatchObject({
@@ -1012,7 +1012,7 @@ test("permission facts attach only to the matching call and denial remains stick
     ),
   )
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
-    { approval: "denied", result_family: "blocked", outcome: "cancelled" },
+    { approval: "denied", result_family: "cancelled", outcome: "cancelled" },
     { approval: "unknown", result_family: "cancelled", outcome: "cancelled" },
   ])
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
@@ -1069,6 +1069,50 @@ test("cleanup rejection never claims a user actor or gets erased by a parallel a
       ),
     ),
   )
-  expect(fixture.marks.at(-1)?.[2]).toMatchObject({ approval: "rejected", result_family: "blocked" })
+  expect(fixture.marks.at(-1)?.[2]).toMatchObject({ approval: "rejected", result_family: "cancelled" })
   expect(JSON.stringify(fixture.marks)).not.toMatch(/SECRET|user_rejected/)
+})
+
+test("denied nested gates do not misclassify a recovered success or unrelated terminal failure", () => {
+  const fixture = makeFixture()
+  ;["success", "failure", "blocked"].forEach((id) => {
+    fixture.capture(id, { origin: "builtin", execution: "local", category: "code_execution" })
+    Effect.runSync(
+      fixture.observer.permissionDecision({
+        sessionID,
+        action: "read",
+        resources: ["SECRET"],
+        effect: "deny",
+        origin: "rules",
+        source: { type: "tool", messageID: assistantMessageID, id },
+      }),
+    )
+    Effect.runSync(
+      fixture.observer.event(
+        id === "success"
+          ? published(
+              SessionEvent.Tool.Success,
+              { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
+              100,
+            )
+          : published(
+              SessionEvent.Tool.Failed,
+              {
+                sessionID,
+                assistantMessageID,
+                id,
+                executed: false,
+                error: { type: id === "blocked" ? "permission.rejected" : "tool.execution", message: "SECRET" },
+              },
+              100,
+            ),
+      ),
+    )
+  })
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
+    { approval: "denied", result_family: "success", outcome: "success" },
+    { approval: "denied", result_family: "error", outcome: "failed" },
+    { approval: "denied", result_family: "blocked", outcome: "failed" },
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
 })

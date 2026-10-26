@@ -35,6 +35,7 @@ const errors = new Set([
 interface ToolState {
   provenance?: ToolProvenance
   started?: number
+  /** Gate history, not the cause of a potentially recovered terminal result. */
   approval?: "automatic" | "asked" | "allowed_after_ask" | "rejected" | "denied"
 }
 
@@ -385,9 +386,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
             approval: tool?.approval ?? "unknown",
             ...duration(tool?.started, event.created),
             result_family:
-              tool?.approval === "denied" ||
-              tool?.approval === "rejected" ||
-              (event.type === "session.tool.failed" && event.data.error.type === "permission.rejected")
+              event.type === "session.tool.failed" && event.data.error.type === "permission.rejected"
                 ? "blocked"
                 : event.type === "session.tool.failed"
                   ? event.data.error.type === "aborted"
