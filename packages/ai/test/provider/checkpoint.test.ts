@@ -10,6 +10,23 @@ const checkpoint = { type: "compaction", id: "cmp_1", encrypted_content: "opaque
 const request = LLM.request({ model: OpenAI.configure({ apiKey: "fixture" }).responses("fixture"), prompt: "hello" })
 const trigger = { mechanism: "trigger" } as const
 
+for (const responseModel of ["accepted-checkpoint-model", undefined]) {
+  testEffect(
+    fixedResponse(
+      sseEvents(
+        { type: "response.created", response: { id: "resp_1", model: responseModel } },
+        { type: "response.completed", response: { id: "resp_1", output: [checkpoint] } },
+      ),
+    ),
+  ).effect(`native trigger ${responseModel ? "preserves reported" : "does not invent"} response model`, () =>
+    Effect.gen(function* () {
+      const response = yield* LLMClient.compact(request, trigger)
+      expect(response.responseModel).toBe(responseModel)
+      expect(response.responseModel).not.toBe(request.model.id)
+    }),
+  )
+}
+
 testEffect(
   dynamicResponse(({ request, text, respond }) =>
     Effect.sync(() => {

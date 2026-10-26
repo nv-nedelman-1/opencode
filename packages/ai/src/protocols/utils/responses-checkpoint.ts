@@ -9,6 +9,7 @@ interface State {
   readonly parser: Pick<OpenResponses.ParserState, "id" | "provider" | "outputItems">
   readonly checkpoints: Readonly<Record<string, CompactionCheckpointResponse["checkpoint"]>>
   readonly responseID?: string
+  readonly responseModel?: string
 }
 
 const onOutputItem = Effect.fnUntraced(function* (
@@ -66,7 +67,15 @@ export const make = <Body>(body: RouteBody<Body>): TriggerCompactOperation =>
         step: Effect.fnUntraced(function* (state: State, event: OpenResponses.Event) {
           if (event.response?.id && state.responseID && event.response.id !== state.responseID)
             return yield* ProviderShared.eventError(source.id, "Compaction response ID changed during execution")
-          if (event.type === "response.created") return [{ ...state, responseID: event.response?.id }, []] as const
+          if (event.type === "response.created")
+            return [
+              {
+                ...state,
+                responseID: event.response?.id,
+                responseModel: event.response?.model?.trim() ? event.response.model : state.responseModel,
+              },
+              [],
+            ] as const
           if (event.type === "error" || event.type === "response.failed")
             return yield* OpenResponses.providerFailure(event, "Compaction request failed")
           if (event.type === "response.incomplete")
@@ -93,9 +102,13 @@ export const make = <Body>(body: RouteBody<Body>): TriggerCompactOperation =>
           result = new CompactionCheckpointResponse({
             checkpoint,
             responseID,
+            responseModel: event.response?.model?.trim() ? event.response.model : state.responseModel,
             usage: OpenResponses.mapUsage(event.response?.usage, OpenResponses.metadataKey(request.model)),
           })
-          return [next, [LLMEvent.finish({ reason: { normalized: "stop" } })]] as const
+          return [
+            next,
+            [LLMEvent.finish({ reason: { normalized: "stop" }, responseModel: result.responseModel })],
+          ] as const
         }),
       },
     })

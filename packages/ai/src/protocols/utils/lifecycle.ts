@@ -100,6 +100,7 @@ export const finish = (
   events: LLMEvent[],
   input: {
     readonly reason: FinishReasonDetails
+    readonly responseModel?: string
     readonly usage?: Usage
     readonly providerMetadata?: ProviderMetadata
   },

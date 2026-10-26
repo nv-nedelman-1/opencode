@@ -25,7 +25,7 @@ import {
   type ToolDefinition,
   type ToolResultPart,
 } from "../schema/index.js"
-import { JsonObject, knownString, optionalArray, optionalNull, ProviderShared } from "./shared.js"
+import { JsonObject, knownString, lenient, optionalArray, optionalNull, ProviderShared } from "./shared.js"
 import { classifyProviderFailure } from "../provider-error.js"
 import { effortUpdate, resolveEffortUpdates } from "../effort-updates.js"
 import * as Cache from "./utils/cache.js"
@@ -472,7 +472,10 @@ const AnthropicEvent = Schema.StructWithRest(
     type: Schema.String,
     index: Schema.optional(Schema.Number),
     message: Schema.optional(
-      Schema.StructWithRest(Schema.Struct({ usage: Schema.optional(AnthropicUsage) }), [JsonObject]),
+      Schema.StructWithRest(
+        Schema.Struct({ usage: Schema.optional(AnthropicUsage), model: lenient(Schema.String) }),
+        [JsonObject],
+      ),
     ),
     content_block: Schema.optional(Schema.Unknown),
     delta: Schema.optional(Schema.Unknown),
@@ -499,6 +502,7 @@ interface ParserState {
   readonly tools: ToolStream.State<number>
   readonly reasoningSignatures: Readonly<Record<number, string>>
   readonly usage?: Usage
+  readonly responseModel?: string
   readonly pendingFinish?: {
     readonly reason: FinishReasonDetails
     readonly providerMetadata?: ProviderMetadata
@@ -1219,7 +1223,14 @@ const NO_EVENTS: StepResult["1"] = []
 
 const onMessageStart = (state: ParserState, event: AnthropicEvent): StepResult => {
   const usage = mapUsage(event.message?.usage, state.providerMetadataKey)
-  return [usage ? { ...state, usage: mergeUsage(state.usage, usage, state.providerMetadataKey) } : state, NO_EVENTS]
+  return [
+    {
+      ...state,
+      ...(usage ? { usage: mergeUsage(state.usage, usage, state.providerMetadataKey) } : {}),
+      responseModel: event.message?.model?.trim() ? event.message.model : state.responseModel,
+    },
+    NO_EVENTS,
+  ]
 }
 
 const onContentBlockStart = (
@@ -1477,6 +1488,7 @@ const onMessageStop = Effect.fnUntraced(function* (state: ParserState) {
       raw: undefined,
     },
     usage: state.usage,
+    responseModel: state.responseModel,
     providerMetadata: state.pendingFinish?.providerMetadata,
   })
   return [{ ...state, lifecycle: finished, tools: result.tools }, events] satisfies StepResult

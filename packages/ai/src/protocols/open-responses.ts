@@ -18,7 +18,7 @@ import {
   type ToolResultPart,
 } from "../schema/index.js"
 import type { Media } from "../media.js"
-import { JsonObject, optionalArray, optionalNull, ProviderShared } from "./shared.js"
+import { JsonObject, lenient, optionalArray, optionalNull, ProviderShared } from "./shared.js"
 import { classifyProviderFailure } from "../provider-error.js"
 import { effortUpdate } from "../effort-updates.js"
 import { OpenResponsesOptions } from "./utils/open-responses-options.js"
@@ -366,6 +366,7 @@ export const Event = Schema.StructWithRest(
       Schema.StructWithRest(
         Schema.Struct({
           id: Schema.optional(Schema.String),
+          model: lenient(Schema.String),
           service_tier: optionalNull(Schema.String),
           incomplete_details: optionalNull(Schema.Struct({ reason: Schema.optional(Schema.String) })),
           output: Schema.optional(Schema.Array(StreamItem)),
@@ -428,6 +429,7 @@ export interface ParserState {
   readonly tools: ToolStream.State<string>
   readonly hasFunctionCall: boolean
   readonly lifecycle: Lifecycle.State
+  readonly responseModel?: string
   readonly outputItems: Readonly<Record<number, string>>
   readonly message: { readonly id: string; readonly phase: MessagePhase | null | undefined } | undefined
   readonly reasoningItems: Readonly<Record<string, ReasoningStreamItem>>
@@ -1355,6 +1357,7 @@ const onResponseFinish = Effect.fnUntraced(function* (state: ParserState, event:
       raw: event.response?.incomplete_details?.reason,
     },
     usage: mapUsage(event.response?.usage, current.providerMetadataKey),
+    responseModel: current.responseModel,
     providerMetadata:
       event.response?.id || event.response?.service_tier
         ? providerMetadata(current, {
@@ -1401,7 +1404,10 @@ export const providerFailure = (event: Event, fallback: string, body = ProviderS
 
 // Callers must pass events through `normalize` first. The OpenAPI requires
 // string IDs but imposes no minLength; empty is not missing.
-export const step = (state: ParserState, event: NormalizedEvent) => {
+export const step = (state: ParserState, event: NormalizedEvent) =>
+  stepEvent(event.response?.model?.trim() ? { ...state, responseModel: event.response.model } : state, event)
+
+const stepEvent = (state: ParserState, event: NormalizedEvent) => {
   if (event.type === "response.output_text.delta" || event.type === "response.output_text.done") {
     if (event.item_id === undefined) return ProviderShared.eventError(state.id, `${event.type} is missing item_id`)
     return Effect.succeed(
