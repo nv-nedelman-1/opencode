@@ -253,6 +253,23 @@ export const make = Effect.fn("PluginHost.make")(function* (
       transform: commands.transform,
     },
     event: {
+      observe: (callback) =>
+        Effect.acquireRelease(
+          bus.listen(
+            (event) =>
+              EventManifest.isServer(event) || isRpcEvent(event)
+                ? Effect.gen(function* () {
+                    const result: unknown = yield* Effect.sync(() => callback(event))
+                    if (result === undefined) return
+                    // Untyped plugins can violate the synchronous contract; never await their work.
+                    void Promise.resolve(result).catch(() => {})
+                    yield* Effect.logWarning("Plugin event observer must be synchronous and return undefined")
+                  }).pipe(Effect.catchCause(() => Effect.logWarning("Plugin event observer failed")))
+                : Effect.void,
+            { location: { directory: location.directory, workspaceID: location.workspaceID } },
+          ),
+          (dispose) => dispose,
+        ).pipe(Effect.map((dispose) => ({ dispose }))),
       subscribe: () =>
         bus
           .subscribe()

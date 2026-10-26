@@ -67,6 +67,61 @@ const delta = (bus: Bus.Interface) =>
   })
 
 describe("Bus Session routing", () => {
+  it.effect(
+    "routes inline Location listeners with the same move, deletion, workspace and global snapshots as streams",
+    () =>
+      Effect.gen(function* () {
+        yield* seed()
+        const bus = yield* Bus.Service
+        const refs = [a, b, otherWorkspace]
+        const streams = yield* Effect.forEach(refs, (ref) => watch(bus, ref))
+        const inline = refs.map(() => [] as Event.Payload[])
+        const legacy: Event.Payload[] = []
+        yield* Effect.forEach(refs, (ref, index) =>
+          bus.listen(
+            (event) =>
+              Effect.sync(() => {
+                inline[index].push(event)
+              }),
+            { location: ref },
+          ),
+        )
+        // Legacy listeners remain global even when registered under an ambient Location.
+        yield* bus
+          .listen((event) =>
+            Effect.sync(() => {
+              legacy.push(event)
+            }),
+          )
+          .pipe(Effect.provideService(Location.Service, location(a)))
+        const before = yield* bus.publish(SessionEvent.Renamed, { sessionID: id, title: "before" })
+        expect(inline).toEqual([[before], [], []])
+        const global = yield* bus.publish(Global, { sessionID: id }, { global: true })
+        const workspace = yield* bus.publish(SessionEvent.Moved, {
+          sessionID: id,
+          location: otherWorkspace,
+          projectID: Project.ID.global,
+        })
+        const middle = yield* delta(bus)
+        const moved = yield* bus.publish(
+          SessionEvent.Moved,
+          { sessionID: id, location: b, projectID: Project.ID.global },
+          { location: a },
+        )
+        const after = yield* delta(bus)
+        const deleted = yield* bus.publish(SessionEvent.Deleted, { sessionID: id })
+        const missing = yield* delta(bus)
+        const done = yield* bus.publish(Done, {})
+        expect(inline).toEqual([
+          [before, global, workspace, done],
+          [global, moved, after, deleted, done],
+          [global, workspace, middle, moved, done],
+        ])
+        expect(yield* Effect.forEach(streams, Fiber.join)).toEqual(inline)
+        expect(legacy).toEqual([before, global, workspace, middle, moved, after, deleted, missing, done])
+      }),
+  )
+
   it.effect("delivers workspace-only moves to both owners without duplicating same-location moves", () =>
     Effect.gen(function* () {
       yield* seed()

@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin/effect"
 import { EventManifest } from "@opencode/schema/event-manifest"
 import type { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { Cause, Effect, Stream } from "effect"
+import { Cause, Effect } from "effect"
 import { RelayHost } from "./host.js"
 import { RelayModel } from "./model.js"
 import { RelayTool } from "./tool.js"
@@ -63,10 +63,9 @@ export default Plugin.define({
       yield* ctx.session.hook("model.outcome", (event) => observe(observed.modelOutcome(event)))
       yield* ctx.skill.hook("load", (event) => observe(observed.skillLoad(event)))
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
-      yield* ctx.event.subscribe().pipe(
-        Stream.filter(EventManifest.isServer),
-        Stream.runForEach((event) => observe(observed.event(event))),
-        Effect.forkScoped({ startImmediately: true }),
-      )
+      yield* ctx.event.observe((event) => {
+        if (EventManifest.isServer(event)) Effect.runSync(observed.event(event))
+        return undefined
+      })
     }),
 })
