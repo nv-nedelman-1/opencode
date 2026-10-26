@@ -214,6 +214,25 @@ test("shutdown cancels and drains an entryless auxiliary native call", async () 
   }
 })
 
+test("signed auxiliary coverage does not borrow an active execution", async () => {
+  const native = await fixture()
+  try {
+    const session = id("signed_auxiliary")
+    const primary = native.runtime.open(session)
+    await Effect.runPromise(RelayModel.middleware(native.runtime, () => noParent)(
+      { ...modelCall(session, "generate"), protocol: "bedrock-converse" },
+      () => Effect.succeed(Response.json({})),
+    ))
+    await native.relay.flushSubscribers()
+    const coverage = native.events.filter((event) => event.name === "opencode.llm.coverage")
+    expect(coverage).toHaveLength(1)
+    expect(coverage[0]?.parent_uuid).not.toBe(primary.uuid)
+    native.runtime.close(session, "success")
+  } finally {
+    await native.dispose()
+  }
+})
+
 test.each(["idle", "active"])("an %s auxiliary keeps physical observations off the next execution", async (state) => {
   const native = await fixture()
   const session = id("aux_marks")
