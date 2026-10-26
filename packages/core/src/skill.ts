@@ -149,7 +149,7 @@ export const observeLoad = <A, E, R>(
   return effect.pipe(
     Effect.onExit((exit) =>
       hooks
-        .trigger(
+        .notify(
           "skill",
           "load",
           Object.freeze({

@@ -1,7 +1,7 @@
 import type { SkillApi } from "@opencode/client/promise/api"
 import type { Skill } from "@opencode/schema/skill"
 import type { Session } from "@opencode/schema/session"
-import type { Hooks, Transform } from "./registration.js"
+import type { Observers, Transform } from "./registration.js"
 import type { DeepMutable } from "./types.js"
 
 export type SkillSourceKind = "directory" | "url" | "embedded" | "unknown"
@@ -15,7 +15,7 @@ export interface SkillLoad {
   readonly skill?: Skill.Info
 }
 
-export interface SkillHooks {
+export interface SkillObservations {
   readonly load: SkillLoad
 }
 
@@ -28,7 +28,7 @@ export interface SkillEditor {
 }
 
 export interface SkillDomain extends SkillApi {
-  readonly hook: Hooks<SkillHooks>
+  readonly observe: Observers<SkillObservations>
   readonly transform: Transform<SkillEditor>
   readonly reload: () => Promise<void>
 }

@@ -203,12 +203,11 @@ it.effect("generates a title from the sole user message and renames the session"
   Effect.gen(function* () {
     const hooks = yield* PluginHooks.Service
     const usage: PluginHooks.Domains["session"]["usage"][] = []
-    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-    yield* hooks.register("session", "model.outcome", (event) =>
-      Effect.sync(() => {
-        outcomes.push(event)
-      }),
-    )
+    const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      outcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "usage", (event) =>
       Effect.sync(() => {
         usage.push(event)
@@ -301,12 +300,11 @@ it.effect("uses a hook-provided title without a model request", () =>
     yield* prompt(sessionID, "Hello")
 
     const hooks = yield* PluginHooks.Service
-    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-    yield* hooks.register("session", "model.outcome", (event) =>
-      Effect.sync(() => {
-        outcomes.push(event)
-      }),
-    )
+    const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      outcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "title", (event) =>
       Effect.sync(() => {
         event.result = "Plugin Title"
@@ -364,12 +362,11 @@ it.effect("falls back to the primary model when the small model fails", () =>
 
     const attempted: Model.Ref[] = []
     const hooks = yield* PluginHooks.Service
-    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-    yield* hooks.register("session", "model.outcome", (event) =>
-      Effect.sync(() => {
-        outcomes.push(event)
-      }),
-    )
+    const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      outcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "model.request", (event) =>
       Effect.sync(() => {
         attempted.push(event.model)
@@ -608,13 +605,12 @@ it.effect("observes a cancelled title once without a fabricated model or title",
     yield* insertSession(sessionID)
     yield* prompt(sessionID, "Cancel title generation")
     const hooks = yield* PluginHooks.Service
-    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
     const entered = yield* Deferred.make<void>()
-    yield* hooks.register("session", "model.outcome", (event) =>
-      Effect.sync(() => {
-        outcomes.push(event)
-      }),
-    )
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      outcomes.push(event)
+      return undefined
+    })
     titleStream = () => Stream.unwrap(Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)))
     const title = yield* SessionTitle.Service
     const pending = yield* title.generate(sessionID).pipe(Effect.forkScoped)

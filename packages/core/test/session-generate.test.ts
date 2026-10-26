@@ -386,12 +386,11 @@ it.effect(
       yield* InstructionState.prepare(db, bus, instructions, sessionID)
       const hooks = yield* PluginHooks.Service
       const observed: PluginHooks.Domains["session"]["usage"][] = []
-      const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-      yield* hooks.register("session", "model.outcome", (event) =>
-        Effect.sync(() => {
-          outcomes.push(event)
-        }),
-      )
+      const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+      yield* hooks.observe("session", "model.outcome", (event) => {
+        outcomes.push(event)
+        return undefined
+      })
       yield* hooks.register("session", "usage", (event) =>
         Effect.sync(() => {
           observed.push(event)
@@ -518,14 +517,13 @@ it.effect("observes cancelled generation without usage or durable changes", () =
     const { db, bus, instructions, session, instances } = yield* setup
     yield* InstructionState.prepare(db, bus, instructions, sessionID)
     const hooks = yield* PluginHooks.Service
-    const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
+    const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
     const entered = yield* Deferred.make<void>()
     let charges = 0
-    yield* hooks.register("session", "model.outcome", (event) =>
-      Effect.sync(() => {
-        outcomes.push(event)
-      }),
-    )
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      outcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "usage", () =>
       Effect.sync(() => {
         charges++

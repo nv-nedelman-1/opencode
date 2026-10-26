@@ -56,7 +56,7 @@ const startEntries = Effect.fnUntraced(function* (
   const service = yield* Skill.Service
   const pluginHost = host({
     skill: {
-      hook: () => Effect.die("unused skill.hook"),
+      observe: () => Effect.die("unused skill.observe"),
       list: () => Effect.die("unused skill.list"),
       transform: service.transform,
       reload: service.reload,

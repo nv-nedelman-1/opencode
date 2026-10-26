@@ -60,8 +60,14 @@ export default Plugin.define({
       yield* ctx.session.hook("retry.decision", (event) => observe(observed.retryDecision(event)))
       yield* ctx.session.hook("compaction.outcome", (event) => observe(observed.compactionOutcome(event)))
       yield* ctx.session.hook("usage", (event) => observe(observed.usage(event)))
-      yield* ctx.session.hook("model.outcome", (event) => observe(observed.modelOutcome(event)))
-      yield* ctx.skill.hook("load", (event) => observe(observed.skillLoad(event)))
+      yield* ctx.session.observe("model.outcome", (event) => {
+        Effect.runSync(observed.modelOutcome(event))
+        return undefined
+      })
+      yield* ctx.skill.observe("load", (event) => {
+        Effect.runSync(observed.skillLoad(event))
+        return undefined
+      })
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
       yield* ctx.event.observe((event) => {
         if (EventManifest.isServer(event)) Effect.runSync(observed.event(event))

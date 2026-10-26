@@ -122,7 +122,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused reference.reload"),
     },
     skill: overrides.skill ?? {
-      hook: () => Effect.die("unused skill.hook"),
+      observe: () => Effect.die("unused skill.observe"),
       list: () => Effect.die("unused skill.list"),
       transform: () => Effect.die("unused skill.transform"),
       reload: () => Effect.die("unused skill.reload"),
@@ -169,6 +169,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused websearch.reload"),
     },
     session: {
+      observe: overrides.session?.observe ?? (() => Effect.die("unused session.observe")),
       hook: overrides.session?.hook ?? (() => Effect.die("unused session.hook")),
       middleware: overrides.session?.middleware ?? (() => Effect.die("unused session.middleware")),
       create: overrides.session?.create ?? (() => Effect.die("unused session.create")),

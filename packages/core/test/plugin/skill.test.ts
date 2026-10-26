@@ -26,7 +26,7 @@ describe("SkillPlugin.Plugin", () => {
         host({
           app: { name: "test", version: "1.2.3", channel: "beta" },
           skill: {
-            hook: () => Effect.die("unused skill.hook"),
+            observe: () => Effect.die("unused skill.observe"),
             list: () => Effect.die("unused skill.list"),
             transform: skill.transform,
             reload: skill.reload,
@@ -63,7 +63,7 @@ describe("SkillPlugin.Plugin", () => {
       yield* SkillPlugin.Plugin.effect(
         host({
           skill: {
-            hook: () => Effect.die("unused skill.hook"),
+            observe: () => Effect.die("unused skill.observe"),
             list: () => Effect.die("unused skill.list"),
             transform: skill.transform,
             reload: skill.reload,

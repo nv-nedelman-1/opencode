@@ -58,12 +58,13 @@ describe("Skill", () => {
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
       const observations: SkillLoad[] = []
-      yield* hooks.register("skill", "load", (event) =>
-        Effect.sync(() => {
-          observations.push(event)
-        }),
-      )
-      const observer = yield* hooks.register("skill", "load", () => Effect.die("observer failure"))
+      yield* hooks.observe("skill", "load", (event) => {
+        observations.push(event)
+        return undefined
+      })
+      const observer = yield* hooks.observe("skill", "load", () => {
+        throw new Error("observer failure")
+      })
       const input = {
         sessionID: Session.ID.make("ses_skill_load"),
         channel: "tool" as const,
@@ -89,7 +90,8 @@ describe("Skill", () => {
         ["interrupted", "directory"],
       ])
       yield* observer.dispose
-      yield* hooks.register("skill", "load", () => Effect.interrupt)
+      // @ts-expect-error Returned Effects are not observers and must never be executed.
+      yield* hooks.observe("skill", "load", () => Effect.interrupt)
       expect(yield* Skill.observeLoad(hooks, input, Effect.succeed("still unchanged"))).toBe("still unchanged")
     }),
   )
@@ -102,18 +104,16 @@ describe("Skill", () => {
       yield* skills.transform((editor) => editor.add(original, "directory"))
       const resolved = (yield* skills.resolve(original.id))!
       const seen: SkillLoad[] = []
-      yield* hooks.register("skill", "load", (event) =>
-        Effect.sync(() => {
-          expect(() => Object.assign(event, { status: "failed" })).toThrow()
-          expect(() => Object.assign(event.skill!, { content: "Changed" })).toThrow()
-          expect(() => Object.assign(event.skill!, { path: "/changed" })).toThrow()
-        }),
-      )
-      yield* hooks.register("skill", "load", (event) =>
-        Effect.sync(() => {
-          seen.push(event)
-        }),
-      )
+      yield* hooks.observe("skill", "load", (event) => {
+        expect(() => Object.assign(event, { status: "failed" })).toThrow()
+        expect(() => Object.assign(event.skill!, { content: "Changed" })).toThrow()
+        expect(() => Object.assign(event.skill!, { path: "/changed" })).toThrow()
+        return undefined
+      })
+      yield* hooks.observe("skill", "load", (event) => {
+        seen.push(event)
+        return undefined
+      })
       expect(
         yield* Skill.observeLoad(
           hooks,
@@ -128,6 +128,80 @@ describe("Skill", () => {
       yield* skills.transform((editor) => editor.update(original.id, (skill) => (skill.content = "Updated")))
       expect((yield* skills.get(original.id))?.content).toBe("Updated")
       expect(seen[0].skill).toEqual(original)
+    }),
+  )
+
+  it.effect("invalid async or Effect load observers cannot delay success, failure, or interruption", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      for (const status of ["completed", "failed", "interrupted"] as const) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const pending = Promise.withResolvers<undefined>()
+            const release = yield* Deferred.make<void>()
+            let foreignRan = false
+            let settled = false
+            let first: SkillLoad | undefined
+            const received: SkillLoad[] = []
+            yield* hooks.observe("skill", "load", (event) => {
+              first = event
+              throw new Error("private observer defect")
+            })
+            // @ts-expect-error An untyped pending promise cannot hold load settlement.
+            yield* hooks.observe("skill", "load", () => pending.promise)
+            // @ts-expect-error Async observers are rejected by the source observation contract.
+            yield* hooks.observe("skill", "load", async () => {
+              throw new Error("private async rejection")
+            })
+            const foreign = Effect.sync(() => {
+              foreignRan = true
+            }).pipe(Effect.andThen(Deferred.await(release)))
+            // @ts-expect-error Do not run or await returned Effects in load finalizers.
+            yield* hooks.observe("skill", "load", () => foreign)
+            yield* hooks.observe("skill", "load", (event) => {
+              received.push(event)
+              return undefined
+            })
+            const failure = new Error("original failure")
+            const input = {
+              sessionID: Session.ID.make("ses_load_stall"),
+              channel: "tool" as const,
+              sourceKind: "directory" as const,
+              skill: info("review", "Review"),
+            }
+            const work =
+              status === "completed"
+                ? Effect.succeed("unchanged")
+                : status === "failed"
+                  ? Effect.fail(failure)
+                  : Effect.interrupt
+            const call = yield* Skill.observeLoad(hooks, input, work).pipe(
+              Effect.onExit(() =>
+                Effect.sync(() => {
+                  settled = true
+                }),
+              ),
+              Effect.forkScoped({ startImmediately: true }),
+            )
+            yield* Effect.yieldNow
+            const settledBeforeRelease = settled
+            pending.resolve(undefined)
+            yield* Deferred.succeed(release, undefined)
+            const exit = yield* Fiber.await(call)
+            yield* Effect.promise(() => Promise.resolve())
+            expect(settledBeforeRelease).toBe(true)
+            expect(foreignRan).toBe(false)
+            expect(received).toHaveLength(1)
+            expect(received[0]).toBe(first!)
+            expect(received[0]).toMatchObject({ ...input, status })
+            expect(Object.isFrozen(received[0])).toBe(true)
+            expect(Object.isFrozen(received[0].skill)).toBe(true)
+            if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
+            if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
+            if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
+          }),
+        )
+      }
     }),
   )
 

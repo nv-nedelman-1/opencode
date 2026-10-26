@@ -24,6 +24,13 @@ export type ModelHooks<Spec, Failures extends Record<keyof Spec, unknown> = Reco
   options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
 ) => Effect.Effect<Registration, never, Scope.Scope>
 
+/** Read-only source observations must be synchronous, non-blocking, and return undefined. */
+export type Observers<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  callback: (input: Spec[Name]) => undefined,
+  options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
+) => Effect.Effect<Registration, never, Scope.Scope>
+
 export type Transform<Input> = (callback: (input: Input) => void) => Effect.Effect<Registration, never, Scope.Scope>
 
 /**

@@ -131,11 +131,10 @@ describe("SkillTool", () => {
             const registry = yield* Tool.Service
             const hooks = yield* PluginHooks.Service
             const loads: SkillLoad[] = []
-            yield* hooks.register("skill", "load", (event) =>
-              Effect.sync(() => {
-                loads.push(event)
-              }),
-            )
+            yield* hooks.observe("skill", "load", (event) => {
+              loads.push(event)
+              return undefined
+            })
             expect((yield* toolDefinitions(registry))[0]).toMatchObject({
               name: "skill",
               description: SkillTool.description,

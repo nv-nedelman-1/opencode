@@ -42,7 +42,7 @@ export const observe = <A, E, R>(
       Effect.onExit((exit) =>
         Effect.gen(function* () {
           const durationMs = Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000
-          yield* hooks.trigger(
+          yield* hooks.notify(
             "session",
             "model.outcome",
             Object.freeze({

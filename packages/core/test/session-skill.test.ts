@@ -238,10 +238,9 @@ describe("Session.skill", () => {
 const observeLoads = Effect.fnUntraced(function* (session: Session.Info, loads: SkillLoad[]) {
   const locations = yield* LocationServiceMap.Service
   yield* PluginHooks.Service.use((hooks) =>
-    hooks.register("skill", "load", (event) =>
-      Effect.sync(() => {
-        loads.push(event)
-      }),
-    ),
+    hooks.observe("skill", "load", (event) => {
+      loads.push(event)
+      return undefined
+    }),
   ).pipe(Effect.provide(locations.get(session.location)))
 })

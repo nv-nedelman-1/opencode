@@ -1,6 +1,12 @@
 export * as RelayObserve from "./observe.js"
 
-import type { SessionContext, SessionHooks, SessionRequest, SessionRequestKind } from "@opencode/plugin/effect/session"
+import type {
+  SessionContext,
+  SessionHooks,
+  SessionModelOutcome,
+  SessionRequest,
+  SessionRequestKind,
+} from "@opencode/plugin/effect/session"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
 import type { SkillLoad } from "@opencode/plugin/effect/skill"
 import type { ToolExecution, ToolProvenance } from "@opencode/plugin/effect/tool"
@@ -619,7 +625,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
       if (call.provenance.category === "skill")
         runtime.mark(call.sessionID, "opencode.skill.tool.requested", { count: 1 }, hostMetadata)
     })
-  const modelOutcome = (event: SessionHooks["model.outcome"]) =>
+  const modelOutcome = (event: SessionModelOutcome) =>
     Effect.sync(() =>
       runtime.mark(
         event.sessionID,

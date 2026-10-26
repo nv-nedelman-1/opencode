@@ -10,7 +10,7 @@ import type { SessionError } from "@opencode/schema/session-error"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { TokenUsage } from "@opencode/schema/token-usage"
 import type { Effect, JsonSchema, Types } from "effect"
-import type { ModelHooks, ModelMiddleware } from "./registration.js"
+import type { ModelHooks, ModelMiddleware, Observers } from "./registration.js"
 
 export interface SessionPrompt {
   readonly sessionID: Session.ID
@@ -235,7 +235,6 @@ export interface SessionHooks {
   readonly generate: SessionGenerate
   readonly title: SessionTitle
   readonly "model.request": SessionModelRequest
-  readonly "model.outcome": SessionModelOutcome
   readonly "http.request": SessionHttpRequest
   readonly "http.response": SessionHttpResponse
   readonly "experimental.ws.handshake": SessionWebSocketHandshake
@@ -246,6 +245,10 @@ export interface SessionHooks {
   readonly "context.usage": SessionContextUsage
   readonly "compaction.outcome": SessionCompactionOutcome
   readonly usage: SessionUsage
+}
+
+export interface SessionObservations {
+  readonly "model.outcome": SessionModelOutcome
 }
 
 export type SessionDomain = Pick<
@@ -267,5 +270,6 @@ export type SessionDomain = Pick<
   | "context"
 > & {
   readonly hook: ModelHooks<SessionHooks>
+  readonly observe: Observers<SessionObservations>
   readonly middleware: ModelMiddleware<SessionMiddlewares>
 }

@@ -466,7 +466,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
         }),
     },
     skill: {
-      hook: (name, callback) => hooks.register("skill", name, callback),
+      observe: (name, callback) => hooks.observe("skill", name, callback),
       list: () => response(skill.list()),
       reload: skill.reload,
       transform: (callback) =>
@@ -552,6 +552,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
     },
     session: {
       hook: (name, callback, options) => hooks.register("session", name, callback, options),
+      observe: (name, callback, options) => hooks.observe("session", name, callback, options),
       middleware: (name, middleware, options) => hooks.use("session", name, middleware, options),
       create: (input) =>
         sessions.create({

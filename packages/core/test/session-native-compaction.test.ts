@@ -256,12 +256,11 @@ it.live(
     Effect.gen(function* () {
       const fixture = yield* setup()
       const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
-      const modelOutcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-      yield* fixture.hooks.register("session", "model.outcome", (event) =>
-        Effect.sync(() => {
-          modelOutcomes.push(event)
-        }),
-      )
+      const modelOutcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+      yield* fixture.hooks.observe("session", "model.outcome", (event) => {
+        modelOutcomes.push(event)
+        return undefined
+      })
       yield* fixture.hooks.register("session", "compaction.outcome", (event) =>
         Effect.sync(() => {
           observed.push(event)

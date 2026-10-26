@@ -52,12 +52,11 @@ for (const fixture of [
       let captures = 0
       let executions = 0
       const hooks = yield* PluginHooks.Service
-      const outcomes: PluginHooks.Domains["session"]["model.outcome"][] = []
-      yield* hooks.register("session", "model.outcome", (event) =>
-        Effect.sync(() => {
-          outcomes.push(event)
-        }),
-      )
+      const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+      yield* hooks.observe("session", "model.outcome", (event) => {
+        outcomes.push(event)
+        return undefined
+      })
       const steps = yield* SessionStep.make.pipe(
         Effect.provide(
           Layer.mock(Snapshot.Service)({
