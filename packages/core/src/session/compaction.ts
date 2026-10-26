@@ -18,7 +18,7 @@ import type { StreamOptions } from "@opencode/ai/route"
 import type { SessionCompactionResult } from "@opencode/plugin/effect/session"
 import type { SessionError } from "@opencode/schema/session-error"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Context, Effect, Layer, Result, Stream } from "effect"
+import { Clock, Context, Effect, Layer, Result, Stream } from "effect"
 import { Agent } from "../agent.js"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
@@ -207,6 +207,7 @@ export const layer = Layer.effect(
 
     const compact = Effect.fn("SessionCompaction.compact")(function* (
       trigger: Trigger,
+      started: number,
       settle: () => void,
     ): Effect.fn.Return<Outcome> {
       const settings = state.get()
@@ -215,12 +216,12 @@ export const layer = Layer.effect(
       // Only the user compacts when automatic compaction is off, overflow included.
       if (trigger.reason !== "manual" && !settings.auto) {
         settle()
-        yield* observe(trigger, "skipped")
+        yield* observe(trigger, "skipped", started)
         return { status: "skipped" }
       }
       if (trigger.reason === "auto" && !due(context, calculateCeiling(context.model.limit, settings.buffer))) {
         settle()
-        yield* observe(trigger, "skipped")
+        yield* observe(trigger, "skipped", started)
         return { status: "skipped" }
       }
       const native = context.model.compaction?.type === "native"
@@ -246,8 +247,8 @@ export const layer = Layer.effect(
         : summarize(selected, budget, settings.keep)
       return yield* compaction.pipe(
         Effect.matchEffect({
-          onSuccess: (result) => publish(selected, result, trigger, settle),
-          onFailure: (failure) => publish(selected, failure, trigger, settle),
+          onSuccess: (result) => publish(selected, result, started, trigger, settle),
+          onFailure: (failure) => publish(selected, failure, started, trigger, settle),
         }),
       )
     })
@@ -653,10 +654,12 @@ export const layer = Layer.effect(
     const observe = (
       trigger: Trigger,
       status: PluginHooks.Domains["session"]["compaction.outcome"]["status"],
+      started: number,
       result?: Result,
     ) =>
       Effect.gen(function* () {
         if (!(yield* hooks.has("session", "compaction.outcome", trigger.context.model.ref.providerID))) return
+        const durationMs = Math.max(0, (yield* Clock.currentTimeMillis) - started)
         const context = trigger.context
         const unknown =
           context.messages.findLastIndex(SessionProviderContext.isCheckpoint) >
@@ -677,6 +680,7 @@ export const layer = Layer.effect(
             model: context.model.ref,
             trigger: trigger.reason,
             status,
+            durationMs,
             ...(!unknown ? { before: estimateContext(context) } : {}),
             ...(after !== undefined ? { after } : {}),
             ...(context.model.limit.context > 0 ? { limit: context.model.limit.context } : {}),
@@ -696,6 +700,7 @@ export const layer = Layer.effect(
     const publish = Effect.fnUntraced(function* (
       trigger: Trigger,
       outcome: Result | Failure,
+      started: number,
       source = trigger,
       settle?: () => void,
     ): Effect.fn.Return<Outcome> {
@@ -713,7 +718,7 @@ export const layer = Layer.effect(
           ...usage,
         })
         settle?.()
-        yield* observe(source, outcome.error.type === "compaction.interrupted" ? "interrupted" : "failed")
+        yield* observe(source, outcome.error.type === "compaction.interrupted" ? "interrupted" : "failed", started)
         return { status: "failed", error: outcome.error }
       }
 
@@ -732,7 +737,7 @@ export const layer = Layer.effect(
         { metadata: outcome.metadata },
       )
       settle?.()
-      yield* observe(source, "completed", outcome)
+      yield* observe(source, "completed", started, outcome)
       return { status: "completed" }
     })
 
@@ -741,19 +746,22 @@ export const layer = Layer.effect(
       reload: state.reload,
       // A manual compaction settles through its `/compact` inbox item, which the runner owns.
       compact: (trigger) =>
-        Effect.suspend(() => {
+        Effect.gen(function* () {
+          const started = yield* Clock.currentTimeMillis
           const state = { settled: false }
-          return compact(trigger, () => {
+          return yield* compact(trigger, started, () => {
             state.settled = true
           }).pipe(
             Effect.onInterrupt(() =>
               state.settled
                 ? Effect.void
                 : trigger.reason === "manual"
-                  ? observe(trigger, "interrupted")
-                  : publish(trigger, {
-                      error: { type: "compaction.interrupted", message: "Compaction was interrupted" },
-                    }),
+                  ? observe(trigger, "interrupted", started)
+                  : publish(
+                      trigger,
+                      { error: { type: "compaction.interrupted", message: "Compaction was interrupted" } },
+                      started,
+                    ),
             ),
             Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
           )

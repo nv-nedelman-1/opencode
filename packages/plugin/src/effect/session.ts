@@ -168,6 +168,8 @@ export interface SessionCompactionOutcome {
   readonly model: Model.Ref
   readonly trigger: "auto" | "overflow" | "manual"
   readonly status: "skipped" | "completed" | "failed" | "interrupted"
+  /** Elapsed time from invocation through terminal settlement, before outcome callbacks. */
+  readonly durationMs?: number
   readonly before?: number
   readonly after?: number
   readonly limit?: number

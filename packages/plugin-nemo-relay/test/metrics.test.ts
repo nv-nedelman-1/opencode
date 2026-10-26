@@ -219,12 +219,14 @@ test("utilization, compaction estimates, and per-run operation mix omit unknowns
     count: 1,
     compaction_status: "completed",
     trigger: "proactive",
+    duration_ms: 125,
     before_tokens: 1_000,
     after_tokens: 200,
     retained_ratio: 0.2,
   })
   expect(compaction.map((metric) => [metric.name, metric.value])).toEqual([
     ["opencode.compaction.outcome.count", 1],
+    ["opencode.compaction.attempt.duration", 125],
     ["opencode.compaction.context_tokens", 1_000],
     ["opencode.compaction.context_tokens", 200],
     ["opencode.compaction.retained_ratio", 0.2],

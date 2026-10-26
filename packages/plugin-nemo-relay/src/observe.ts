@@ -516,6 +516,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           count: 1,
           trigger: event.trigger === "auto" ? "proactive" : event.trigger,
           compaction_status: event.status === "interrupted" ? "cancelled" : event.status,
+          ...(event.durationMs === undefined ? {} : { duration_ms: event.durationMs }),
           estimate_source: "host_context",
           ...(event.before === undefined ? {} : { before_tokens: event.before }),
           ...(event.after === undefined ? {} : { after_tokens: event.after }),

@@ -638,6 +638,7 @@ test("source observations preserve missing native estimates and finalized retry/
       ...identity,
       trigger: "overflow",
       status: "completed",
+      durationMs: 125,
       before: 800,
       after: 200,
       sourceEstimatedTokens: 700,
@@ -677,6 +678,7 @@ test("source observations preserve missing native estimates and finalized retry/
   expect(fixture.marks[1][2]).toMatchObject({
     trigger: "overflow",
     compaction_status: "completed",
+    duration_ms: 125,
     before_tokens: 800,
     after_tokens: 200,
     retained_ratio: 0.25,
@@ -687,6 +689,7 @@ test("source observations preserve missing native estimates and finalized retry/
   expect(fixture.marks[2][2]).not.toHaveProperty("before_tokens")
   expect(fixture.marks[2][2]).not.toHaveProperty("after_tokens")
   expect(fixture.marks[2][2]).not.toHaveProperty("retained_ratio")
+  expect(fixture.marks[2][2]).not.toHaveProperty("duration_ms")
   expect(fixture.marks[3][2]).toMatchObject({
     call_role: "compaction",
     will_retry: true,
