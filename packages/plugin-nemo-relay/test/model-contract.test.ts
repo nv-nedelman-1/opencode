@@ -398,6 +398,7 @@ describe("Relay model middleware contracts", () => {
     "drains a revoked provider without confusing replacement with caller cancellation (%s)",
     async (caller) => {
       const entered = Promise.withResolvers<void>()
+      const cleaning = Promise.withResolvers<void>()
       const cleanup = Promise.withResolvers<void>()
       const requestAbort = new AbortController()
       const observed = observations()
@@ -420,14 +421,24 @@ describe("Relay model middleware contracts", () => {
         () =>
           Effect.sync(() => entered.resolve()).pipe(
             Effect.andThen(Effect.never),
-            Effect.onInterrupt(() => Effect.promise(() => cleanup.promise)),
+          Effect.onInterrupt(() => Effect.promise(() => {
+            cleaning.resolve()
+            return cleanup.promise
+          })),
           ),
         undefined,
         observed,
       )
-      await entered.promise
-      expect(observed.releases).toBe(0)
-      cleanup.resolve()
+      let settled = false
+      void pending.then(() => { settled = true })
+      await cleaning.promise
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(settled).toBe(false)
+        expect(observed.releases).toBe(0)
+      } finally {
+        cleanup.resolve()
+      }
       const exit = await pending
       if (caller) expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
       if (!caller) {
@@ -473,6 +484,30 @@ describe("Relay model middleware contracts", () => {
         relay.deregisterLlmExecutionIntercept("model-contract-replacement")
         provider.close()
       }
+    }
+  })
+
+  test.each(["request", "operation"] as const)("%s cancellation wins over a replacement tail, even without a pending provider", async (source) => {
+    for (const dispatched of [false, true]) {
+      const observed = observations()
+      const entered = Promise.withResolvers<void>()
+      const tail = Promise.withResolvers<void>()
+      const abort = new AbortController()
+      const pending = run(call(new Request("https://provider.test/model", {
+        method: "POST", body: '{"prompt":"hi"}', signal: abort.signal,
+      })), async (input, next) => {
+        if (dispatched) await next(input, new AbortController().signal)
+        entered.resolve()
+        await tail.promise
+        return { choices: [{ message: { content: "replacement" } }] }
+      }, () => Effect.succeed(Response.json({ choices: [] })), undefined, observed)
+      await entered.promise
+      if (source === "request") abort.abort()
+      if (source === "operation") observed.cancel?.()
+      tail.resolve()
+      const exit = await pending
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(observed.releases).toBe(1)
     }
   })
 

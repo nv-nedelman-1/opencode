@@ -320,12 +320,12 @@ const unary = (managed: Managed) =>
     const relay = managed.runtime.relay
     const run = Effect.runPromiseExitWith(yield* Effect.context<never>())
     const abort = new AbortController()
-    managed.operation.onCancel(() => abort.abort())
     const captured: {
       pending?: Promise<unknown>
       task?: Promise<unknown>
       called?: boolean
       signal?: AbortSignal
+      cancelled?: true
       failure?: Cause.Cause<Error>
       response?: {
         readonly status: number
@@ -334,6 +334,10 @@ const unary = (managed: Managed) =>
         readonly text: string
       }
     } = {}
+    managed.operation.onCancel(() => {
+      captured.cancelled = true
+      abort.abort()
+    })
     const executed = yield* Effect.tryPromise({
       try: (signal) =>
         (captured.pending = managed.operation.run(() =>
@@ -412,12 +416,12 @@ const unary = (managed: Managed) =>
       ),
       Effect.exit,
     )
+    if (captured.cancelled || managed.call.request.signal.aborted) return yield* Effect.interrupt
     if (
       captured.failure &&
       (Exit.isFailure(executed) ||
         Cause.hasDies(captured.failure) ||
-        (Cause.hasInterrupts(captured.failure) &&
-          (!captured.signal?.aborted || abort.signal.aborted || managed.call.request.signal.aborted)))
+        (Cause.hasInterrupts(captured.failure) && !captured.signal?.aborted))
     )
       return yield* Effect.failCause(captured.failure)
     const upstream = captured.response
