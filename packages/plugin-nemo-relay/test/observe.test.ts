@@ -108,6 +108,45 @@ test("interleaved executions retain independent host timings and outcomes", () =
   })
 })
 
+test("run usage summaries are isolated observed step samples, not another billing counter", () => {
+  const fixture = makeFixture()
+  const first = published(
+    SessionEvent.Step.Ended,
+    { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0), tokens },
+    120,
+  )
+  for (const event of [
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(SessionEvent.Execution.Started, { sessionID: sibling }, 110),
+    first,
+    first,
+    published(
+      SessionEvent.Step.Ended,
+      {
+        sessionID: sibling,
+        assistantMessageID,
+        finish: "stop",
+        cost: Money.USD.make(0),
+        tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+      130,
+    ),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 140),
+    published(SessionEvent.Execution.Succeeded, { sessionID: sibling }, 150),
+    published(SessionEvent.Execution.Started, { sessionID }, 160),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 170),
+  ])
+    Effect.runSync(fixture.observer.event(event))
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2]),
+  ).toMatchObject([
+    { accounting_source: "host_step", usage_sample_count: 1, input_tokens: 7, output_tokens: 4, cache_read_tokens: 2 },
+    { usage_sample_count: 1, input_tokens: 10, output_tokens: 0, cache_read_tokens: 0 },
+    expect.not.objectContaining({ usage_sample_count: expect.anything() }),
+  ])
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.usage.recorded")).toHaveLength(2)
+})
+
 test("step, retry, and compaction observations whitelist host data without duplicating provider accounting", () => {
   const fixture = makeFixture()
   ;[

@@ -32,6 +32,36 @@ test("host instruments preserve missing timing boundaries and ignore provider to
   expect(RelayMetrics.measurements("opencode.agent.step.streamed", { duration_ms: 5 })).toEqual([])
 })
 
+test("run efficiency is an observed usage distribution, with unknown and zero input kept distinct", () => {
+  const data = {
+    count: 1,
+    outcome: "success",
+    usage_sample_count: 2,
+    input_tokens: 20,
+    output_tokens: 8,
+    cache_read_tokens: 5,
+  }
+  const result = RelayMetrics.measurements("opencode.agent.run.completed", data)
+  expect(
+    result
+      .filter((metric) => metric.name === "opencode.agent.run.observed_tokens")
+      .map((metric) => [metric.attributes?.kind, metric.kind, metric.value]),
+  ).toEqual([
+    ["input_total", 3, 20],
+    ["output_total", 3, 8],
+    ["cache_read", 3, 5],
+  ])
+  expect(result.find((metric) => metric.name === "opencode.agent.run.cache_read_ratio")?.value).toBe(0.25)
+  expect(result.every((metric) => !metric.name.startsWith("opencode.llm.tokens"))).toBe(true)
+  for (const payload of [{ count: 1 }, { ...data, input_tokens: 0, cache_read_tokens: 0 }]) {
+    expect(
+      RelayMetrics.measurements("opencode.agent.run.completed", payload).some(
+        (metric) => metric.name === "opencode.agent.run.cache_read_ratio",
+      ),
+    ).toBe(false)
+  }
+})
+
 test("tool, skill, compaction, and human wait dimensions are finite allowlists", () => {
   const cases = [
     ["opencode.tool.completed", { count: 1, category: "terminal", provider_executed: false, outcome: "cancelled" }, 1],

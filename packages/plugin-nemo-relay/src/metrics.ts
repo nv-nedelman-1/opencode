@@ -155,6 +155,10 @@ const Payload = Schema.Struct({
   context_utilization: Schema.optional(Duration),
   tokens: Schema.optional(Schema.Unknown),
   cost_usd: Schema.optional(Duration),
+  usage_sample_count: Schema.optional(Count),
+  input_tokens: Schema.optional(Count),
+  output_tokens: Schema.optional(Count),
+  cache_read_tokens: Schema.optional(Count),
   step_count: Schema.optional(Count),
   logical_llm_count: Schema.optional(Count),
   tool_call_count: Schema.optional(Count),
@@ -203,6 +207,7 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
             "permission_wait_count",
             "form_wait_count",
             "compaction_count",
+            "usage_sample_count",
           ] as const
         ).flatMap((kind) =>
           payload[kind] === undefined
@@ -217,6 +222,36 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
                 ),
               ],
         ),
+        ...(
+          [
+            ["input_total", payload.input_tokens],
+            ["output_total", payload.output_tokens],
+            ["cache_read", payload.cache_read_tokens],
+          ] as const
+        ).flatMap(([kind, value]) =>
+          value === undefined
+            ? []
+            : [
+                histogram(
+                  "opencode.agent.run.observed_tokens",
+                  value,
+                  "{token}",
+                  { ...attributes, accounting_source: "host_step", kind },
+                  SIZE_BUCKETS,
+                ),
+              ],
+        ),
+        ...(payload.input_tokens === undefined || payload.input_tokens === 0 || payload.cache_read_tokens === undefined
+          ? []
+          : [
+              histogram(
+                "opencode.agent.run.cache_read_ratio",
+                payload.cache_read_tokens / payload.input_tokens,
+                "1",
+                { ...attributes, accounting_source: "host_step" },
+                RATIO_BUCKETS,
+              ),
+            ]),
       ]
     }
     case "opencode.agent.step.completed": {

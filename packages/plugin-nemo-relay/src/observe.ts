@@ -49,6 +49,7 @@ interface ToolState {
 interface SessionState {
   started?: number
   compaction?: number
+  readonly usage: { samples: number; input: number; output: number; cacheRead: number }
   readonly steps: Map<
     SessionMessage.ID,
     { readonly started: number; readonly model: SessionContext["model"]; streamed?: number; firstOutput?: true }
@@ -98,6 +99,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
       steps: new Map(),
       permissions: new Map(),
       counts: { steps: 0, tools: 0, retries: 0, permissions: 0, forms: 0, compactions: 0 },
+      usage: { samples: 0, input: 0, output: 0, cacheRead: 0 },
     }
     sessions.set(id, created)
     return created
@@ -229,6 +231,15 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
                   compaction_count: current.counts.compactions,
                 }),
             ...(event.type === "session.execution.interrupted" ? { reason: event.data.reason } : {}),
+            ...(current?.usage.samples
+              ? {
+                  accounting_source: "host_step",
+                  usage_sample_count: current.usage.samples,
+                  input_tokens: current.usage.input,
+                  output_tokens: current.usage.output,
+                  cache_read_tokens: current.usage.cacheRead,
+                }
+              : {}),
             ...(event.type === "session.execution.failed" ? failure(event.data.error) : {}),
           })
           sessions.delete(event.data.sessionID)
@@ -256,6 +267,13 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
         case "session.step.failed": {
           const current = sessions.get(event.data.sessionID)
           const step = current?.steps.get(event.data.assistantMessageID)
+          if (current?.started !== undefined && event.data.tokens !== undefined) {
+            const usage = event.data.tokens
+            current.usage.samples++
+            current.usage.input += usage.input + usage.cache.read + usage.cache.write
+            current.usage.output += usage.output + usage.reasoning
+            current.usage.cacheRead += usage.cache.read
+          }
           const outcome =
             event.type === "session.step.ended"
               ? "success"
