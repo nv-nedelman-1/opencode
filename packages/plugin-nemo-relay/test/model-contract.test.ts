@@ -42,6 +42,7 @@ const observations = () => ({
   metadata: [] as unknown[],
   names: [] as string[],
   releases: 0,
+  cancel: undefined as (() => void) | undefined,
 })
 
 const call = (
@@ -92,7 +93,9 @@ const run = (
       Effect.succeed({
         parent,
         run: (callback) => callback(),
-        onCancel: () => {},
+        onCancel: (cancel) => {
+          observed.cancel = cancel
+        },
         release: () => {
           observed.releases++
         },
@@ -110,12 +113,15 @@ const native = (observed: ReturnType<typeof observations>) => {
     relay: {
       ...relay,
       llmCallExecuteAsync: (...args: Parameters<typeof relay.llmCallExecuteAsync>) => {
+        const result = relay.llmCallExecuteAsync(...args)
         observed.names.push(args[0])
-        return relay.llmCallExecuteAsync(...args)
+        return result
       },
       llmStreamCallExecute: (...args: Parameters<typeof relay.llmStreamCallExecute>) => {
+        // Unsupported codec-instance probes throw before dispatch and are not accepted managed calls.
+        const result = relay.llmStreamCallExecute(...args)
         observed.names.push(args[0])
-        return relay.llmStreamCallExecute(...args)
+        return result
       },
     } as unknown as RelayHost.Relay,
     scope: () => Effect.succeed(parent),
@@ -362,6 +368,135 @@ describe("Relay model middleware contracts", () => {
       "opencode.llm.provider_attempt.completed",
     ])
     expect(observed.marks[1].data).toMatchObject({ outcome: "cancelled", error_category: "cancelled", count: 1 })
+  })
+
+  test("does not dispatch when Relay supplies an already aborted unary signal", async () => {
+    const abort = new AbortController()
+    abort.abort()
+    let calls = 0
+    const observed = observations()
+    const exit = await run(
+      call(),
+      (input, next) => next(input, abort.signal),
+      () =>
+        Effect.sync(() => {
+          calls++
+          return new Response("{}")
+        }),
+      undefined,
+      observed,
+    )
+    expect(calls).toBe(0)
+    expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+    expect(observed.marks).toEqual([])
+    expect(observed.releases).toBe(1)
+  })
+
+  test.each(["relay", "request", "effect", "operation"] as const)(
+    "combines %s cancellation with the actual unary Request and interrupts dispatch once",
+    async (source) => {
+      const observed = observations()
+      const entered = Promise.withResolvers<void>()
+      const relayAbort = new AbortController()
+      const requestAbort = new AbortController()
+      const effectAbort = new AbortController()
+      const input = call(
+        new Request("https://provider.test/model", {
+          method: "POST",
+          body: '{"prompt":"hi"}',
+          signal: requestAbort.signal,
+        }),
+      )
+      const state: { request?: Request; calls: number; interrupted: boolean } = { calls: 0, interrupted: false }
+      const pending = run(
+        input,
+        (input, next) => next(input, relayAbort.signal),
+        (request) =>
+          Effect.sync(() => {
+            state.request = request
+            state.calls++
+            entered.resolve()
+          }).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() =>
+              Effect.sync(() => {
+                state.interrupted = true
+              }),
+            ),
+          ),
+        effectAbort.signal,
+        observed,
+      )
+      await entered.promise
+      if (source === "relay") relayAbort.abort()
+      if (source === "request") requestAbort.abort()
+      if (source === "effect") effectAbort.abort()
+      if (source === "operation") observed.cancel?.()
+      // A bounded cleanup also lets the pre-fix regression fail without leaving a pending provider callback.
+      const propagated = state.request?.signal.aborted
+      if (!propagated) effectAbort.abort()
+      const exit = await pending
+      expect(propagated).toBe(true)
+      expect(state.interrupted).toBe(true)
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+      expect(state.calls).toBe(1)
+      expect(observed.releases).toBe(1)
+      expect(observed.marks.filter((mark) => mark.name === "opencode.llm.provider_attempt.completed")).toHaveLength(1)
+      expect(observed.marks.at(-1)?.data).toMatchObject({ outcome: "cancelled", error_category: "cancelled" })
+      expect(requestAbort.signal.aborted).toBe(source === "request")
+    },
+  )
+
+  test("Relay cancellation interrupts unary body consumption without replaying dispatch", async () => {
+    const observed = observations()
+    const entered = Promise.withResolvers<void>()
+    const parked = Promise.withResolvers<void>()
+    const relayAbort = new AbortController()
+    const effectAbort = new AbortController()
+    const state: { request?: Request; controller?: ReadableStreamDefaultController<Uint8Array>; calls: number } = {
+      calls: 0,
+    }
+    const pending = run(
+      call(),
+      (input, next) => next(input, relayAbort.signal),
+      (request) =>
+        Effect.sync(() => {
+          state.request = request
+          state.calls++
+          const body = new ReadableStream<Uint8Array>(
+            {
+              start(controller) {
+                state.controller = controller
+                request.signal.addEventListener(
+                  "abort",
+                  () => controller.error(new DOMException("Aborted", "AbortError")),
+                  { once: true },
+                )
+              },
+              pull() {
+                entered.resolve()
+                return parked.promise
+              },
+            },
+            { highWaterMark: 0 },
+          )
+          return new Response(body)
+        }),
+      effectAbort.signal,
+      observed,
+    )
+    await entered.promise
+    relayAbort.abort()
+    const propagated = state.request?.signal.aborted
+    if (!propagated) effectAbort.abort()
+    state.controller?.error(new DOMException("Cleanup", "AbortError"))
+    parked.resolve()
+    const exit = await pending
+    expect(propagated).toBe(true)
+    expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+    expect(state.calls).toBe(1)
+    expect(observed.releases).toBe(1)
+    expect(observed.marks.at(-1)?.data).toMatchObject({ outcome: "cancelled", error_category: "cancelled" })
   })
 
   test("interruption retains unary ownership until the managed native promise tail has drained", async () => {

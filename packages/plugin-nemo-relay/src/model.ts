@@ -22,7 +22,7 @@ interface Managed {
   readonly operation: RelayHost.Operation
   readonly ownership: { body: boolean }
   readonly request: LlmRequest
-  readonly send: (request: LlmRequest) => ReturnType<Next>
+  readonly send: (request: LlmRequest, signal?: AbortSignal) => ReturnType<Next>
 }
 
 type Upstream =
@@ -82,11 +82,11 @@ export const middleware =
         operation,
         ownership,
         request,
-        send: (intercepted) =>
+        send: (intercepted, signal) =>
           Effect.suspend(() => {
             if (dispatch.sent) return Effect.fail(new Error("OpenCode HTTP middleware may call next at most once"))
             dispatch.sent = true
-            return next(rebuild(call.request, text, request, intercepted))
+            return next(rebuild(call.request, text, request, intercepted, signal))
           }),
       }
       return yield* (
@@ -339,12 +339,17 @@ const unary = (managed: Managed) =>
             relay.llmCallExecuteAsync(
               operationName(managed.call.protocol),
               managed.request,
-              async (intercepted: LlmRequest) => {
+              async (intercepted: LlmRequest, relaySignal: AbortSignal) => {
                 if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
                 captured.called = true
-                const requestSignal = AbortSignal.any([signal, abort.signal, managed.call.request.signal])
+                const requestSignal = AbortSignal.any([relaySignal, signal, abort.signal, managed.call.request.signal])
+                if (requestSignal.aborted) {
+                  const exit = await run(Effect.interrupt, { signal: requestSignal })
+                  if (Exit.isFailure(exit)) captured.failure = exit.cause
+                  throw new Error("provider request was aborted")
+                }
                 const attempt = new ProviderAttempt(managed, false)
-                const exit = await run(managed.send(intercepted), { signal: requestSignal })
+                const exit = await run(managed.send(intercepted, requestSignal), { signal: requestSignal })
                 if (Exit.isFailure(exit)) {
                   attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
                   captured.failure = exit.cause
@@ -452,7 +457,13 @@ const blocked = (reason: string) =>
   )
 
 /** Applies Relay's rewrites to the original request while keeping the credentials Relay never saw. */
-const rebuild = (original: Request, text: string, request: LlmRequest, intercepted: LlmRequest) => {
+const rebuild = (
+  original: Request,
+  text: string,
+  request: LlmRequest,
+  intercepted: LlmRequest,
+  signal?: AbortSignal,
+) => {
   const headers = new Headers(original.headers)
   Object.keys(request.headers)
     .filter((key) => !(key in intercepted.headers))
@@ -462,6 +473,7 @@ const rebuild = (original: Request, text: string, request: LlmRequest, intercept
     .forEach(([key, value]) => headers.set(key, value))
   headers.delete("content-length")
   return new Request(original, {
+    ...(signal === undefined ? {} : { signal }),
     headers,
     body: RelayHost.sameJson(intercepted.content, request.content) ? text : JSON.stringify(intercepted.content),
   })
