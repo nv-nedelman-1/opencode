@@ -145,6 +145,55 @@ describe("Relay tool middleware boundaries", () => {
     ).toEqual(Exit.succeed({ content: "cached" }))
   })
 
+  test.each([
+    { value: { answer: 42 }, content: '{"answer":42}' },
+    { value: {}, content: "{}" },
+    { value: [1, { answer: 42 }, null], content: '[1,{"answer":42},null]' },
+    { value: null, content: "null" },
+    { value: 42, content: "42" },
+    { value: false, content: "false" },
+    { value: "cached", content: "cached" },
+    { value: { content: 42, answer: "retained" }, content: '{"content":42,"answer":"retained"}' },
+  ])("preserves arbitrary JSON replacement $content", async ({ value, content }) => {
+    expect(
+      await run(
+        async () => ({ result: value }),
+        () => Effect.die("replacement must not dispatch the tool"),
+      ),
+    ).toEqual(Exit.succeed({ content }))
+  })
+
+  test.each([
+    { output: { answer: 42 } },
+    { content: "cached", metadata: { source: "intercept" } },
+    { metadata: { source: "intercept" } },
+    { content: [{ type: "text" as const, text: "cached" }] },
+  ])("retains recognized OpenCode result envelopes %#", async (value) => {
+    expect(
+      await run(
+        async () => ({ result: value }),
+        () => Effect.die("replacement must not dispatch the tool"),
+      ),
+    ).toEqual(Exit.succeed(value))
+  })
+
+  test("preserves arbitrary JSON substituted after the host tool completed without replaying it", async () => {
+    let calls = 0
+    const exit = await run(
+      async (input, next) => {
+        await next(input, new AbortController().signal)
+        return { result: { answer: 42 } }
+      },
+      () =>
+        Effect.sync(() => {
+          calls++
+          return { content: "original" }
+        }),
+    )
+    expect(exit).toEqual(Exit.succeed({ content: '{"answer":42}' }))
+    expect(calls).toBe(1)
+  })
+
   test.each(["serial", "concurrent"])("rejects %s repeated dispatch without replaying side effects", async (order) => {
     const state = { calls: 0, error: "" }
     const result = { content: "first" }

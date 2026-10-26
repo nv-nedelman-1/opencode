@@ -112,5 +112,12 @@ export const middleware =
     })
 
 /** A result an execution intercept substituted for the tool's own. */
-const replaced = (value: unknown): Tool.Result =>
-  Option.getOrElse(decodeResult(value), () => ({ content: typeof value === "string" ? value : JSON.stringify(value) }))
+const replaced = (value: unknown): Tool.Result => {
+  const envelope =
+    typeof value === "object" &&
+    value !== null &&
+    ["output", "content", "metadata"].some((key) => Object.hasOwn(value, key))
+  return Option.getOrElse(envelope ? decodeResult(value) : Option.none(), () => ({
+    content: typeof value === "string" ? value : JSON.stringify(value),
+  }))
+}
