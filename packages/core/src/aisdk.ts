@@ -760,6 +760,7 @@ type StreamState = {
   step: number
   toolNames: Record<string, string>
   open: Partial<Record<Fragment, string>>
+  responseModel?: string
 }
 
 function streamPartEvents(
@@ -768,11 +769,13 @@ function streamPartEvents(
 ): Effect.Effect<ReadonlyArray<LLMEvent>, AIError> {
   switch (event.type) {
     case "stream-start":
-    case "response-metadata":
     case "raw":
     case "file":
     case "source":
     case "tool-approval-request":
+      return Effect.succeed([])
+    case "response-metadata":
+      state.responseModel = event.modelId ?? state.responseModel
       return Effect.succeed([])
     case "text-start":
       return Effect.succeed(openFragment(state, "text", event.id, providerMetadata(event.providerMetadata)))
@@ -867,6 +870,7 @@ function streamPartEvents(
         }),
         LLMEvent.finish({
           reason: { normalized: finishReason(event.finishReason), raw: event.finishReason.raw },
+          ...(state.responseModel === undefined ? {} : { responseModel: state.responseModel }),
           usage: usage(event.usage),
           providerMetadata: providerMetadata(event.providerMetadata),
         }),
