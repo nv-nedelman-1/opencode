@@ -208,7 +208,7 @@ export const layer = Layer.effect(
 
     const compact = Effect.fn("SessionCompaction.compact")(function* (
       trigger: Trigger,
-      started: number,
+      started: bigint,
       settle: () => void,
     ): Effect.fn.Return<Outcome> {
       const settings = state.get()
@@ -675,12 +675,12 @@ export const layer = Layer.effect(
     const observe = (
       trigger: Trigger,
       status: PluginHooks.Domains["session"]["compaction.outcome"]["status"],
-      started: number,
+      started: bigint,
       result?: Result,
     ) =>
       Effect.gen(function* () {
         if (!(yield* hooks.has("session", "compaction.outcome", trigger.context.model.ref.providerID))) return
-        const durationMs = Math.max(0, (yield* Clock.currentTimeMillis) - started)
+        const durationMs = Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000
         const context = trigger.context
         const unknown =
           context.messages.findLastIndex(SessionProviderContext.isCheckpoint) >
@@ -721,7 +721,7 @@ export const layer = Layer.effect(
     const publish = Effect.fnUntraced(function* (
       trigger: Trigger,
       outcome: Result | Failure,
-      started: number,
+      started: bigint,
       source = trigger,
       settle?: () => void,
     ): Effect.fn.Return<Outcome> {
@@ -768,7 +768,7 @@ export const layer = Layer.effect(
       // A manual compaction settles through its `/compact` inbox item, which the runner owns.
       compact: (trigger) =>
         Effect.gen(function* () {
-          const started = yield* Clock.currentTimeMillis
+          const started = yield* Clock.monotonicTimeNanos
           const state = { settled: false }
           return yield* compact(trigger, started, () => {
             state.settled = true

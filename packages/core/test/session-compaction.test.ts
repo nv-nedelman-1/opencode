@@ -28,7 +28,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
 import { Shell } from "@opencode/schema/shell"
-import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Clock, DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
@@ -657,10 +657,17 @@ it.effect("cancelling a slow terminal observer does not change an already comple
   }),
 )
 
-it.effect("compaction outcomes measure each invocation through terminal settlement", () =>
+it.effect("compaction outcomes measure monotonic time through settlement despite wall-clock corrections", () =>
   Effect.gen(function* () {
     const compaction = yield* SessionCompaction.Service
     const hooks = yield* PluginHooks.Service
+    const clock = yield* Clock.Clock
+    let wallTime = clock.currentTimeMillisUnsafe()
+    const shifted = {
+      ...clock,
+      currentTimeMillisUnsafe: () => wallTime,
+      currentTimeMillis: Effect.sync(() => wallTime),
+    }
     const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
     yield* hooks.register("session", "compaction.outcome", (event) =>
       Effect.sync(() => {
@@ -704,9 +711,10 @@ it.effect("compaction outcomes measure each invocation through terminal settleme
                   ? { ...context, model: { ...context.model, compaction: { type: "native" } } }
                   : context,
             })
-      ).pipe(Effect.forkScoped)
+      ).pipe(Effect.provideService(Clock.Clock, shifted), Effect.forkScoped)
       if (item.status !== "skipped") {
         yield* Deferred.await(entered)
+        wallTime += 60_000
         yield* TestClock.adjust("125 millis")
       }
       if (item.status === "interrupted") yield* Fiber.interrupt(pending)
