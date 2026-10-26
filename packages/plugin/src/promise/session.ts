@@ -1,5 +1,5 @@
 import type { SessionApi } from "@opencode/client/promise/api"
-import type { GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
+import type { FinishReason, GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
 import type { Money } from "@opencode/schema/money"
@@ -202,6 +202,27 @@ export interface SessionModelOutcome {
   readonly durationMs: number
   /** Provider-reported response model, only when the accepted response supplies it. */
   readonly responseModel?: string
+  /** Normalized terminal reason; raw provider text is never exposed here. */
+  readonly finishReason?: FinishReason
+  readonly errorKind?:
+    | "authentication"
+    | "rate-limit"
+    | "quota"
+    | "content-filter"
+    | "invalid-request"
+    | "unsupported-operation"
+    | "no-route"
+    | "provider-internal"
+    | "transport"
+    | "timeout"
+    | "invalid-output"
+    | "context-overflow"
+    | "payload-too-large"
+    | "incomplete-stream"
+    | "unknown"
+  /** Monotonic time to meaningful streamed content; omitted for buffered/native responses. */
+  readonly firstOutputMs?: number
+  readonly firstOutputKind?: "text" | "reasoning" | "tool"
 }
 
 export interface SessionHooks {

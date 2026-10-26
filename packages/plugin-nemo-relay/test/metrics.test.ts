@@ -125,6 +125,37 @@ test("source-owned model, skill and tool measurements remain bounded and nonaddi
   )
 })
 
+test("source-owned call detail keeps first output optional and provider errors bounded", () => {
+  const result = RelayMetrics.measurements("opencode.llm.host_call.completed", {
+    count: 1,
+    call_role: "compaction",
+    outcome: "failed",
+    duration_ms: 25,
+    finish: "length",
+    error_kind: "incomplete-stream",
+    first_output_ms: 10,
+    output_kind: "reasoning",
+    message: "SECRET",
+    responseModel: "SECRET",
+    tokens: { input: 99 },
+    cost_usd: 9,
+  })
+  expect(result.map((metric) => [metric.name, metric.value])).toEqual([
+    ["opencode.llm.host_call.completed.count", 1],
+    ["opencode.llm.host_call.duration", 25],
+    ["opencode.llm.host_call.first_output", 10],
+  ])
+  expect(result[2]?.attributes).toMatchObject({
+    scope: "host_call",
+    call_role: "compaction",
+    output_kind: "reasoning",
+    error_kind: "incomplete-stream",
+    finish: "length",
+  })
+  expect(JSON.stringify(result)).not.toMatch(/SECRET|cost_usd|tokens/)
+  expect(RelayMetrics.measurements("opencode.llm.host_call.completed", { count: 1, error_kind: "SECRET" })).toEqual([])
+})
+
 test("context samples are per-request histograms and retry delay is explicitly the remaining delay", () => {
   const context = RelayMetrics.measurements("opencode.context.prepared", {
     call_role: "title",

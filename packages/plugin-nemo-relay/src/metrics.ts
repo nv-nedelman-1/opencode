@@ -54,6 +54,25 @@ const Attributes = Schema.Struct({
   cost_source: Schema.optional(Schema.Literals(["host_calculated", "catalog", "unavailable"])),
   http_status_class: Schema.optional(Schema.Literals(["2xx", "3xx", "4xx", "5xx", "other"])),
   error_category: Schema.optional(Schema.Literals(["http", "transport", "body", "cancelled", "protocol"])),
+  error_kind: Schema.optional(
+    Schema.Literals([
+      "authentication",
+      "rate-limit",
+      "quota",
+      "content-filter",
+      "invalid-request",
+      "unsupported-operation",
+      "no-route",
+      "provider-internal",
+      "transport",
+      "timeout",
+      "invalid-output",
+      "context-overflow",
+      "payload-too-large",
+      "incomplete-stream",
+      "unknown",
+    ]),
+  ),
   output_kind: Schema.optional(Schema.Literals(["text", "reasoning", "tool"])),
   retryable: Schema.optional(Schema.Boolean),
   will_retry: Schema.optional(Schema.Boolean),
@@ -115,6 +134,7 @@ const Payload = Schema.Struct({
   ...Attributes.fields,
   count: Schema.optional(Count),
   duration_ms: Schema.optional(Duration),
+  first_output_ms: Schema.optional(Duration),
   remaining_delay_ms: Schema.optional(Duration),
   message_count: Schema.optional(Count),
   part_count: Schema.optional(Count),
@@ -197,10 +217,32 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
       return count()
     case "opencode.llm.host_call.completed": {
       const attributes = {
-        ...select(payload, ["outcome", "call_role", "provider_family", "model_family", "response_model_family"]),
+        ...select(payload, [
+          "outcome",
+          "call_role",
+          "provider_family",
+          "model_family",
+          "response_model_family",
+          "finish",
+          "error_kind",
+        ]),
         scope: "host_call",
       }
-      return [...count(attributes), ...duration("opencode.llm.host_call.duration", attributes)]
+      return [
+        ...count(attributes),
+        ...duration("opencode.llm.host_call.duration", attributes),
+        ...(payload.first_output_ms === undefined
+          ? []
+          : [
+              histogram(
+                "opencode.llm.host_call.first_output",
+                payload.first_output_ms,
+                "ms",
+                { ...attributes, ...select(payload, ["output_kind"]) },
+                DURATION_BUCKETS,
+              ),
+            ]),
+      ]
     }
     case "opencode.llm.logical.completed": {
       const attributes = {

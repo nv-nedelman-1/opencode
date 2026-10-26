@@ -1,5 +1,13 @@
 import { expect } from "bun:test"
-import { LLMEvent } from "@opencode/ai"
+import {
+  AIError,
+  AuthenticationError,
+  InvalidProviderOutputError,
+  InvalidRequestError,
+  LLMEvent,
+  RateLimitError,
+  TimeoutError,
+} from "@opencode/ai"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { SessionModelOutcome } from "@opencode/core/session/model-outcome"
@@ -47,7 +55,11 @@ it.effect("observes the exact primary invocation and accepted identity without c
       }),
     )
     expect(result).toBe("answer")
-    expect(outcomes).toEqual([{ ...input, status: "completed", durationMs: 25, responseModel: "accepted-snapshot" }])
+    expect(outcomes).toEqual([
+      { ...input, status: "completed", durationMs: 25, responseModel: "accepted-snapshot", finishReason: "stop" },
+    ])
+    expect(outcomes[0]).not.toHaveProperty("firstOutputMs")
+    expect(outcomes[0]).not.toHaveProperty("errorKind")
     expect(Object.isFrozen(outcomes[0])).toBe(true)
     expect(Object.isFrozen(outcomes[0].model)).toBe(true)
     expect(charges).toBe(0)
@@ -66,6 +78,8 @@ for (const reason of ["error", "unknown", "content-filter"] as const) {
         }),
       )
       expect(outcomes[0].status).toBe("failed")
+      expect(outcomes[0].finishReason).toBe(reason)
+      expect(outcomes[0].errorKind).toBe(reason === "content-filter" ? "content-filter" : "unknown")
       expect(outcomes[0]).not.toHaveProperty("responseModel")
     }),
   )
@@ -82,6 +96,7 @@ it.effect("marks an unterminated stream and a swallowed provider error as failur
       }),
     )
     expect(outcomes.map((outcome) => outcome.status)).toEqual(["failed", "failed"])
+    expect(outcomes.map((outcome) => outcome.errorKind)).toEqual(["incomplete-stream", "unknown"])
   }),
 )
 
@@ -115,6 +130,7 @@ it.effect("waits for cancellation cleanup and preserves interruption despite obs
     })
     const fiber = yield* SessionModelOutcome.observe(hooks, input, (observer) =>
       Effect.gen(function* () {
+        observer.event(LLMEvent.textDelta({ id: "partial", text: "partial" }))
         observer.finish({ normalized: "stop" }, "partial-accepted")
         yield* Deferred.succeed(entered, undefined)
         return yield* Effect.never
@@ -124,7 +140,80 @@ it.effect("waits for cancellation cleanup and preserves interruption despite obs
     yield* Fiber.interrupt(fiber)
     const exit = yield* Fiber.await(fiber)
     expect(Exit.hasInterrupts(exit)).toBe(true)
-    expect(outcomes).toEqual([{ ...input, status: "interrupted", durationMs: 17, responseModel: "partial-accepted" }])
+    expect(outcomes).toEqual([
+      {
+        ...input,
+        status: "interrupted",
+        durationMs: 17,
+        responseModel: "partial-accepted",
+        finishReason: "stop",
+        firstOutputMs: 0,
+        firstOutputKind: "text",
+      },
+    ])
+    expect(outcomes[0]).not.toHaveProperty("errorKind")
+  }),
+)
+
+it.effect("measures meaningful streamed output once at its owner, not at terminal delivery", () =>
+  Effect.gen(function* () {
+    const { hooks, outcomes } = yield* collect
+    const cases = [
+      ["primary", "text", LLMEvent.textDelta({ id: "text", text: "answer" })],
+      ["title", "reasoning", LLMEvent.reasoningDelta({ id: "reasoning", text: "thinking" })],
+      ["compaction", "tool", LLMEvent.toolInputDelta({ id: "call", name: "lookup", text: "{" })],
+      ["primary", "tool", LLMEvent.toolCall({ id: "call", name: "lookup", input: {} })],
+    ] as const
+    for (const [kind, outputKind, event] of cases) {
+      yield* SessionModelOutcome.observe(hooks, { ...input, kind }, (observer) =>
+        Effect.gen(function* () {
+          observer.event(LLMEvent.textStart({ id: "text" }))
+          observer.event(LLMEvent.textDelta({ id: "text", text: "" }))
+          observer.event(LLMEvent.reasoningDelta({ id: "reasoning", text: "" }))
+          observer.event(LLMEvent.toolInputStart({ id: "call", name: "lookup" }))
+          observer.event(LLMEvent.toolInputDelta({ id: "call", name: "lookup", text: "" }))
+          yield* TestClock.adjust("25 millis")
+          observer.event(event)
+          yield* TestClock.adjust("75 millis")
+          observer.event(LLMEvent.textDelta({ id: "text", text: "later" }))
+          observer.finish({ normalized: "stop", raw: "private raw finish", explanation: "private explanation" })
+        }),
+      )
+      expect(outcomes.at(-1)).toEqual({
+        ...input,
+        kind,
+        status: "completed",
+        durationMs: 100,
+        finishReason: "stop",
+        firstOutputMs: 25,
+        firstOutputKind: outputKind,
+      })
+    }
+  }),
+)
+
+it.effect("classifies typed model failures without exposing provider payloads", () =>
+  Effect.gen(function* () {
+    const { hooks, outcomes } = yield* collect
+    const cases = [
+      ["authentication", new AuthenticationError({ message: "private secret" })],
+      ["rate-limit", new RateLimitError({ message: "private secret", retryAfterMs: 10 })],
+      ["timeout", new TimeoutError({ message: "private secret", timeoutMs: 100 })],
+      [
+        "context-overflow",
+        new InvalidRequestError({ message: "private secret", classification: "context-overflow" }),
+      ],
+      [
+        "incomplete-stream",
+        new InvalidProviderOutputError({ message: "private secret", classification: "incomplete-stream" }),
+      ],
+    ] as const
+    for (const [errorKind, reason] of cases) {
+      const failure = new AIError({ reason })
+      const exit = yield* SessionModelOutcome.observe(hooks, input, () => Effect.fail(failure)).pipe(Effect.exit)
+      expect(exit).toEqual(Exit.fail(failure))
+      expect(outcomes.at(-1)).toEqual({ ...input, status: "failed", durationMs: 0, errorKind })
+    }
   }),
 )
 

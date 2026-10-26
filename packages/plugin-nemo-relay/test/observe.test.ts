@@ -873,6 +873,8 @@ test("source model outcomes cover auxiliary calls without duplicating logical st
         kind,
         status: "completed",
         durationMs: 25,
+        finishReason: "stop",
+        ...(kind === "compaction" ? { firstOutputMs: 10, firstOutputKind: "reasoning" as const } : {}),
         ...(kind === "title" ? {} : { responseModel: "nvidia/nemotron-SECRET" }),
       }),
     ),
@@ -884,9 +886,12 @@ test("source model outcomes cover auxiliary calls without duplicating logical st
     call_role: "primary",
     outcome: "success",
     duration_ms: 25,
+    finish: "stop",
     response_model_family: "nemotron",
   })
   expect(fixture.marks[1][2]).not.toHaveProperty("response_model_family")
+  expect(fixture.marks[1][2]).not.toHaveProperty("first_output_ms")
+  expect(fixture.marks[2][2]).toMatchObject({ first_output_ms: 10, output_kind: "reasoning" })
   expect(fixture.marks.map((mark) => mark[0])).toEqual([sessionID, undefined, undefined, undefined])
   expect(JSON.stringify(fixture.marks)).not.toMatch(/SECRET|tokens|cost_usd/)
 })

@@ -415,8 +415,10 @@ it.effect(
         kind: "generate",
         status: "completed",
         responseModel: "generate-accepted",
+        finishReason: "stop",
       })
       expect(outcomes[0]).not.toHaveProperty("assistantMessageID")
+      expect(outcomes[0]).not.toHaveProperty("firstOutputMs")
       expect(outcomes[0].durationMs).toBeGreaterThanOrEqual(0)
       expect(observed).toEqual([
         {

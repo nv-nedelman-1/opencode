@@ -635,6 +635,11 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
           call_role: event.kind,
           outcome: event.status === "completed" ? "success" : event.status === "interrupted" ? "cancelled" : "failed",
           duration_ms: event.durationMs,
+          ...(event.finishReason === undefined ? {} : { finish: event.finishReason }),
+          ...(event.errorKind === undefined ? {} : { error_kind: event.errorKind }),
+          ...(event.firstOutputMs === undefined
+            ? {}
+            : { first_output_ms: event.firstOutputMs, output_kind: event.firstOutputKind }),
           ...RelayMetrics.route(event.model),
           ...(event.responseModel === undefined
             ? {}

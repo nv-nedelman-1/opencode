@@ -229,6 +229,8 @@ it.effect("generates a title from the sole user message and renames the session"
       status: "completed",
       responseModel: "title-accepted",
       sessionID,
+      finishReason: "stop",
+      firstOutputKind: "text",
     })
     expect(outcomes[0]).not.toHaveProperty("assistantMessageID")
     expect(requests[0]?.http?.headers).toEqual({

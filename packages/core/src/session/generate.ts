@@ -1,7 +1,7 @@
 export * as SessionGenerate from "./generate.js"
 
 import type { FileSystem } from "../filesystem.js"
-import { LLMClient, Message, type AIError } from "@opencode/ai"
+import { LLMClient, LLMEvent, Message, type AIError } from "@opencode/ai"
 import { Effect } from "effect"
 import { Database } from "../database/database.js"
 import { Instance } from "../instance/service.js"
@@ -77,7 +77,8 @@ export const generate = Effect.fn("SessionGenerate.generate")(function* (input: 
         llm.generate(prepared.request, prepared.options).pipe(
           Effect.tap((response) =>
             Effect.sync(() => {
-              response.events.forEach(observer.event)
+              // These events are buffered: their delivery time is not time to first output.
+              response.events.filter(LLMEvent.is.providerError).forEach(observer.event)
               observer.finish(response.finishReason, response.responseModel)
             }),
           ),
