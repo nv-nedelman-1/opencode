@@ -156,6 +156,18 @@ test("source-owned call detail keeps first output optional and provider errors b
   expect(RelayMetrics.measurements("opencode.llm.host_call.completed", { count: 1, error_kind: "SECRET" })).toEqual([])
 })
 
+test("skill catalog metrics distinguish effective changes from authored lifecycle intent", () => {
+  const result = RelayMetrics.measurements("opencode.skill.catalog.changed", {
+    count: 2, catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true,
+    skill: { id: "SECRET", content: "SECRET", path: "/SECRET" },
+  })
+  expect(result).toHaveLength(1)
+  expect(result[0]?.value).toBe(2)
+  expect(result[0]?.attributes).toMatchObject({ scope: "effective_catalog", catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true })
+  expect(JSON.stringify(result)).not.toContain("SECRET")
+  expect(RelayMetrics.measurements("opencode.skill.catalog.changed", { count: 1, catalog_action: "installed" })).toEqual([])
+})
+
 test("context samples are per-request histograms and retry delay is explicitly the remaining delay", () => {
   const context = RelayMetrics.measurements("opencode.context.prepared", {
     call_role: "title",

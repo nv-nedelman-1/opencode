@@ -17,6 +17,8 @@ import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Location } from "@opencode/core/location"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Skill } from "@opencode/core/skill"
+import type { SkillCatalog } from "@opencode/plugin/effect/skill"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { SkillDiscovery } from "@opencode/core/skill/discovery"
 import { WellKnown } from "@opencode/core/wellknown"
 import { emptyCredentialNode, emptyWellknownNode } from "../fixture/config-nodes"
@@ -28,7 +30,10 @@ import { host } from "../plugin/host"
 const emptyDiscovery = SkillDiscovery.Service.of({ pull: () => Effect.succeed([]) })
 const watcherLayer = Watcher.testLayer
 const it = testEffect(
-  Layer.merge(AppNodeBuilder.build(LayerNode.group([Skill.node, Bus.node, FSUtil.node])), watcherLayer),
+  Layer.merge(
+    AppNodeBuilder.build(LayerNode.group([Skill.node, Bus.node, FSUtil.node, PluginHooks.node])),
+    watcherLayer,
+  ),
 )
 const decode = Schema.decodeUnknownSync(Info)
 
@@ -309,6 +314,12 @@ describe("ConfigSkillPlugin.Plugin", () => {
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
       Effect.flatMap((tmp) =>
         Effect.gen(function* () {
+          const hooks = yield* PluginHooks.Service
+          const seen: SkillCatalog[] = []
+          yield* hooks.observe("skill", "catalog", (event) => {
+            seen.push(event)
+            return undefined
+          })
           yield* Effect.promise(async () => {
             await fs.mkdir(path.join(tmp.path, "deploy"), { recursive: true })
             await write(tmp.path, "deploy", "Initial")
@@ -334,6 +345,14 @@ describe("ConfigSkillPlugin.Plugin", () => {
           yield* Effect.promise(() => fs.rm(path.join(tmp.path, "review"), { recursive: true }))
           yield* emitAndWait({ type: "delete", path: path.join(tmp.path, "review", "SKILL.md") })
           expect((yield* skill.list()).map((item) => item.id)).toEqual([Skill.ID.make("deploy")])
+          yield* emitAndWait({ type: "update", path: deploy })
+          expect(seen.map((event) => event.changes.map((change) => [change.action, change.skill.id]))).toEqual([
+            [["added", Skill.ID.make("deploy")]],
+            [["updated", Skill.ID.make("deploy")]],
+            [["added", Skill.ID.make("review")]],
+            [["removed", Skill.ID.make("review")]],
+          ])
+          expect(seen[1].changes[0]).toMatchObject({ sourceKind: "directory", contentChanged: false })
         }),
       ),
     ),

@@ -8,7 +8,7 @@ import type {
   SessionRequestKind,
 } from "@opencode/plugin/effect/session"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
-import type { SkillLoad } from "@opencode/plugin/effect/skill"
+import type { SkillCatalog, SkillLoad } from "@opencode/plugin/effect/skill"
 import type { ToolExecution, ToolProvenance } from "@opencode/plugin/effect/tool"
 import type { EventManifest } from "@opencode/schema/event-manifest"
 import { Session } from "@opencode/schema/session"
@@ -679,6 +679,15 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
       )
     })
 
+  const skillCatalog = (event: SkillCatalog) =>
+    Effect.sync(() => event.changes.forEach((change) => runtime.mark(undefined, "opencode.skill.catalog.changed", {
+      count: 1,
+      catalog_action: change.action,
+      source_kind: change.sourceKind,
+      ...(change.previousSourceKind === undefined ? {} : { previous_source_kind: change.previousSourceKind }),
+      content_changed: change.contentChanged,
+    }, hostMetadata)))
+
   return {
     event,
     context,
@@ -690,6 +699,7 @@ const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "cl
     toolExecution,
     modelOutcome,
     skillLoad,
+    skillCatalog,
   }
 }
 

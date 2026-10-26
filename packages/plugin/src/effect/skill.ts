@@ -15,8 +15,23 @@ export interface SkillLoad {
   readonly skill?: Skill.Info
 }
 
+/** A change to the effective catalog, not evidence of a user creating, installing, or deleting a skill. */
+export interface SkillCatalogChange {
+  readonly action: "added" | "updated" | "removed"
+  readonly sourceKind: SkillSourceKind
+  readonly previousSourceKind?: SkillSourceKind
+  readonly skill: Skill.Info
+  /** Whether an existing entry's content changed; false for additions and removals. */
+  readonly contentChanged: boolean
+}
+
+export interface SkillCatalog {
+  readonly changes: readonly SkillCatalogChange[]
+}
+
 export interface SkillObservations {
   readonly load: SkillLoad
+  readonly catalog: SkillCatalog
 }
 
 export interface SkillEditor {

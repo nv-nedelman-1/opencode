@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
-import type { SkillLoad } from "@opencode/plugin/effect/skill"
+import type { SkillCatalog, SkillLoad } from "@opencode/plugin/effect/skill"
 import { Agent } from "@opencode/core/agent"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -12,6 +12,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Skill } from "@opencode/core/skill"
 import { SkillInstructions } from "@opencode/core/skill/instructions"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { State } from "@opencode/core/state"
 import { Session } from "@opencode/schema/session"
 import { testEffect } from "./lib/effect"
 import { readInitial } from "./lib/instructions"
@@ -35,6 +36,79 @@ const info = (id: string, description: string) =>
   })
 
 describe("Skill", () => {
+  it.effect("observes effective catalog changes without treating reloads or hidden sources as changes", () =>
+    Effect.gen(function* () {
+      const skills = yield* Skill.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: SkillCatalog[] = []
+      yield* hooks.observe("skill", "catalog", (event) => {
+        seen.push(event)
+        return undefined
+      })
+      let current = info("review", "Original")
+      yield* skills.transform((editor) => editor.add(current, "directory"))
+      yield* skills.reload()
+      expect(seen).toHaveLength(1)
+      const overlay = yield* skills.transform((editor) => editor.add(info("review", "Remote"), "url"))
+      current = { ...current, content: "Changed while hidden" }
+      yield* skills.reload()
+      expect(seen).toHaveLength(2)
+      yield* overlay.dispose
+      const remove = yield* skills.transform((editor) => editor.remove(current.id))
+      yield* remove.dispose
+      expect(
+        seen.map((event) =>
+          event.changes.map((change) => [
+            change.action,
+            change.sourceKind,
+            change.previousSourceKind,
+            change.contentChanged,
+          ]),
+        ),
+      ).toEqual([
+        [["added", "directory", undefined, false]],
+        [["updated", "url", "directory", false]],
+        [["updated", "directory", "url", true]],
+        [["removed", "directory", undefined, false]],
+        [["added", "directory", undefined, false]],
+      ])
+      expect(seen[0].changes[0].skill.content).toBe("# review")
+      expect(() => Object.assign(seen[0].changes[0].skill, { content: "Mutated" })).toThrow()
+      expect(Object.isFrozen(seen[0])).toBe(true)
+      expect(Object.isFrozen(seen[0].changes)).toBe(true)
+      expect(Object.isFrozen(seen[0].changes[0])).toBe(true)
+    }),
+  )
+
+  it.effect("observes only the committed catalog of a registration batch", () =>
+    Effect.gen(function* () {
+      const skills = yield* Skill.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: SkillCatalog[] = []
+      yield* hooks.observe("skill", "catalog", (event) => {
+        seen.push(event)
+        return undefined
+      })
+      yield* State.batch(
+        Effect.gen(function* () {
+          yield* skills.transform((editor) => editor.add(info("review", "Hidden"), "url"))
+          yield* skills.transform((editor) => editor.remove("review"))
+        }),
+      )
+      expect(seen).toEqual([])
+      yield* State.batch(
+        Effect.gen(function* () {
+          yield* skills.transform((editor) => editor.add(info("deploy", "First"), "directory"))
+          yield* skills.transform((editor) => editor.update("deploy", (skill) => (skill.content = "Final")))
+        }),
+      )
+      expect(seen).toHaveLength(1)
+      expect(seen[0].changes).toMatchObject([
+        { action: "added", sourceKind: "directory", skill: { id: "deploy", content: "Final" } },
+      ])
+    }),
+  )
+
   it.effect("keeps source provenance with effective registrations and restores it on disposal", () =>
     Effect.gen(function* () {
       const skills = yield* Skill.Service

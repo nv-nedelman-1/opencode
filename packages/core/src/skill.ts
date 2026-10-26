@@ -2,14 +2,14 @@ export * as Skill from "./skill.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import type { FSUtil } from "@opencode/util/fs-util"
-import type { SkillLoad, SkillSourceKind } from "@opencode/plugin/effect/skill"
+import type { SkillCatalogChange, SkillLoad, SkillSourceKind } from "@opencode/plugin/effect/skill"
 import path from "path"
-import { Cause, Context, Effect, Exit, Layer, Types } from "effect"
+import { Cause, Context, Effect, Exit, Layer, Schema, Types } from "effect"
 import { Skill } from "@opencode/schema/skill"
 import { Bus } from "./bus.js"
 import { Permission } from "./permission.js"
 import { State } from "./state.js"
-import type { PluginHooks } from "./plugin/hooks.js"
+import { PluginHooks } from "./plugin/hooks.js"
 
 export const DirectorySource = Skill.DirectorySource
 export type DirectorySource = Skill.DirectorySource
@@ -31,6 +31,8 @@ export const Name = Skill.Name
 export type Name = Skill.Name
 
 export { Event } from "@opencode/schema/skill"
+
+const equals = Schema.toEquivalence(Info)
 
 export const available = (skills: ReadonlyArray<Info>, permissions: Permission.Ruleset) =>
   skills.filter((skill) => Permission.evaluate("skill", skill.id, permissions).effect !== "deny")
@@ -95,6 +97,8 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const bus = yield* Bus.Service
+    const hooks = yield* PluginHooks.Service
+    let previous = new Map<ID, { readonly skill: Info; readonly sourceKind: SkillSourceKind }>()
 
     const state = State.create<Data, Editor>({
       name: "skill",
@@ -115,7 +119,37 @@ const layer = Layer.effect(
           editor.skills.delete(ID.make(id))
         },
       }),
-      notify: () => bus.publish(Skill.Event.Updated, {}).pipe(Effect.asVoid),
+      notify: (current) =>
+        Effect.gen(function* () {
+          const snapshot = new Map(
+            Array.from(current.skills, ([id, entry]) => [
+              id,
+              { skill: Object.freeze({ ...entry.skill }), sourceKind: entry.sourceKind },
+            ]),
+          )
+          const changes: SkillCatalogChange[] = []
+          for (const [id, entry] of snapshot) {
+            const before = previous.get(id)
+            if (before && before.sourceKind === entry.sourceKind && equals(before.skill, entry.skill)) continue
+            changes.push(
+              Object.freeze({
+                action: before ? "updated" : "added",
+                ...entry,
+                ...(before ? { previousSourceKind: before.sourceKind } : {}),
+                contentChanged: before !== undefined && before.skill.content !== entry.skill.content,
+              }),
+            )
+          }
+          for (const [id, entry] of previous) {
+            if (snapshot.has(id)) continue
+            changes.push(Object.freeze({ action: "removed", ...entry, contentChanged: false }))
+          }
+          previous = snapshot
+          if (changes.length > 0) {
+            yield* hooks.notify("skill", "catalog", Object.freeze({ changes: Object.freeze(changes) }))
+          }
+          yield* bus.publish(Skill.Event.Updated, {})
+        }).pipe(Effect.asVoid),
     })
 
     return Service.of({
@@ -137,7 +171,7 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node],
+  deps: [Bus.node, PluginHooks.node],
 })
 
 export const observeLoad = <A, E, R>(

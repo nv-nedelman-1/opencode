@@ -7,6 +7,7 @@ import type { MetricMeasurement } from "nemo-relay-node"
 const Count = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0), Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER))
 const Duration = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0))
 const ModelFamily = Schema.Literals(["gpt", "claude", "gemini", "nemotron", "llama", "qwen", "deepseek", "other"])
+const SkillSource = Schema.Literals(["directory", "url", "embedded", "unknown"])
 const decodeTokens = Schema.decodeUnknownOption(
   Schema.Struct({
     input: Count,
@@ -121,7 +122,9 @@ const Attributes = Schema.Struct({
   ),
   load_channel: Schema.optional(Schema.Literals(["tool", "user_mention", "user_activation"])),
   load_status: Schema.optional(Schema.Literals(["completed", "unavailable", "failed", "interrupted"])),
-  source_kind: Schema.optional(Schema.Literals(["directory", "url", "embedded", "unknown"])),
+  source_kind: Schema.optional(SkillSource),
+  previous_source_kind: Schema.optional(SkillSource),
+  catalog_action: Schema.optional(Schema.Literals(["added", "updated", "removed"])),
   comparison_window: Schema.optional(Schema.Literal("session_memory")),
   repeat_load: Schema.optional(Schema.Boolean),
   content_changed: Schema.optional(Schema.Boolean),
@@ -428,6 +431,8 @@ export function measurements(name: string, data: unknown): MetricMeasurement[] {
           "content_changed",
         ]),
       )
+    case "opencode.skill.catalog.changed":
+      return count({ scope: "effective_catalog", ...select(payload, ["catalog_action", "source_kind", "previous_source_kind", "content_changed"]) })
     case "opencode.permission.wait.started":
       return count(select(payload, ["family"]))
     case "opencode.permission.evaluated":
@@ -524,6 +529,7 @@ const supported = new Set([
   "opencode.skill.activated",
   "opencode.skill.load.completed",
   "opencode.skill.catalog.updated",
+  "opencode.skill.catalog.changed",
   "opencode.permission.wait.started",
   "opencode.permission.wait.completed",
   "opencode.form.wait.started",

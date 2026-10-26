@@ -68,6 +68,10 @@ export default Plugin.define({
         Effect.runSync(observed.skillLoad(event))
         return undefined
       })
+      yield* ctx.skill.observe("catalog", (event) => {
+        Effect.runSync(observed.skillCatalog(event))
+        return undefined
+      })
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
       yield* ctx.event.observe((event) => {
         if (EventManifest.isServer(event)) Effect.runSync(observed.event(event))

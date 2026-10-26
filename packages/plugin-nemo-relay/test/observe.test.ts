@@ -1008,6 +1008,19 @@ test.each(["skills", "sessions"])("skill comparison evicts old %s without claimi
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
 })
 
+test("catalog changes export effective transitions without skill identities or contents", () => {
+  const fixture = makeFixture()
+  Effect.runSync(fixture.observer.skillCatalog({ changes: [
+    { action: "added", sourceKind: "directory", contentChanged: false, skill: { id: Skill.ID.make("SECRET"), name: Skill.Name.make("SECRET"), path: AbsolutePath.make("/SECRET"), content: "SECRET" } },
+    { action: "updated", sourceKind: "embedded", previousSourceKind: "directory", contentChanged: true, skill: { id: Skill.ID.make("SECRET"), name: Skill.Name.make("SECRET"), path: AbsolutePath.make("/SECRET"), content: "SECRET" } },
+  ] }))
+  expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
+    [undefined, "opencode.skill.catalog.changed", { count: 1, catalog_action: "added", source_kind: "directory", content_changed: false }],
+    [undefined, "opencode.skill.catalog.changed", { count: 1, catalog_action: "updated", source_kind: "embedded", previous_source_kind: "directory", content_changed: true }],
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
 test("host provenance survives delayed bus events and nested CodeMode entries without guessing tool names", () => {
   const fixture = makeFixture()
   fixture.capture("call", { origin: "builtin", execution: "local", category: "code_execution" })
