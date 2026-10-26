@@ -396,6 +396,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
         }),
     },
     mcp: {
+      observe: (name, callback) => hooks.observe("mcp", name, callback),
       list: (input) => {
         const ref = locationRef(input)
         if (ref && !isCurrentLocation(ref))

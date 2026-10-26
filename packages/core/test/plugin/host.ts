@@ -103,6 +103,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       },
     },
     mcp: overrides.mcp ?? {
+      observe: () => Effect.die("unused mcp.observe"),
       list: () => Effect.die("unused mcp.list"),
       transform: () => Effect.die("unused mcp.transform"),
       reload: () => Effect.die("unused mcp.reload"),

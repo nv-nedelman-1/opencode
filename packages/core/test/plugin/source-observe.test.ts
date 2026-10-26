@@ -9,6 +9,7 @@ import { Provider } from "@opencode/schema/provider"
 import { AbsolutePath } from "@opencode/schema/schema"
 import { Session } from "@opencode/schema/session"
 import type { SkillLoad } from "@opencode/plugin/effect/skill"
+import type { MCPRecovery } from "@opencode/plugin/effect/mcp"
 import { fromPromise } from "@opencode/plugin/promise/adapter"
 import { Effect, Fiber } from "effect"
 import { testEffect } from "../lib/effect"
@@ -41,6 +42,7 @@ it.effect(
       const hooks = yield* PluginHooks.Service
       const model: [string, PluginHooks.Observations["session"]["model.outcome"]][] = []
       const skills: [string, SkillLoad][] = []
+      const mcp: [string, MCPRecovery][] = []
       let dispose = Effect.void
       let filtered = 0
       const promise = fromPromise({
@@ -56,6 +58,10 @@ it.effect(
           )
           await ctx.skill.observe("load", (event) => {
             skills.push(["promise", event])
+            return undefined
+          })
+          await ctx.mcp.observe("recovery", (event) => {
+            mcp.push(["promise", event])
             return undefined
           })
         },
@@ -87,6 +93,10 @@ it.effect(
                 skills.push(["effect", event])
                 return undefined
               })
+              yield* ctx.mcp.observe("recovery", (event) => {
+                mcp.push(["effect", event])
+                return undefined
+              })
             }),
         },
         { ...promise, revision: "1" },
@@ -96,6 +106,13 @@ it.effect(
       )
       yield* call
       yield* Skill.observeLoad(hooks, skillInput, Effect.void)
+      const recovery = Object.freeze({
+        operation: "tool" as const,
+        reason: "session_expired" as const,
+        phase: "retry" as const,
+        outcome: "succeeded" as const,
+      })
+      yield* hooks.notify("mcp", "recovery", recovery)
       expect(model.map(([name]) => name)).toEqual(["effect", "promise"])
       expect(filtered).toBe(0)
       expect(model[0][1]).toBe(model[1][1])
@@ -105,6 +122,11 @@ it.effect(
       expect(skills[0][1]).toBe(skills[1][1])
       expect(skills[0][1]).toMatchObject({ ...skillInput, status: "completed" })
       expect(Object.isFrozen(skills[1][1].skill)).toBe(true)
+      expect(mcp).toEqual([
+        ["effect", recovery],
+        ["promise", recovery],
+      ])
+      expect(mcp[0][1]).toBe(mcp[1][1])
       yield* dispose
       yield* dispose
       yield* call
@@ -112,8 +134,10 @@ it.effect(
       yield* plugins.activate([])
       yield* call
       yield* Skill.observeLoad(hooks, skillInput, Effect.void)
+      yield* hooks.notify("mcp", "recovery", recovery)
       expect(model).toHaveLength(3)
       expect(skills).toHaveLength(2)
+      expect(mcp).toHaveLength(2)
     }),
 )
 

@@ -435,6 +435,7 @@ export function fromPromise(plugin: Plugin) {
             },
           },
           mcp: {
+            observe: (name, callback) => register(host.mcp.observe(name, callback)),
             list: adaptApiMethod(McpEndpoints["mcp.list"], host.mcp.list),
             transform: transform(host.mcp),
             reload: () => run(host.mcp.reload()),

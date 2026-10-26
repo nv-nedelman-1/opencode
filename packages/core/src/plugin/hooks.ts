@@ -1,6 +1,7 @@
 export * as PluginHooks from "./hooks.js"
 
 import type { AISDKHooks } from "@opencode/plugin/effect/aisdk"
+import type { MCPObservations } from "@opencode/plugin/effect/mcp"
 import type { SessionHooks, SessionMiddlewares, SessionObservations } from "@opencode/plugin/effect/session"
 import type { ShellHooks } from "@opencode/plugin/effect/shell"
 import type { SkillObservations } from "@opencode/plugin/effect/skill"
@@ -20,6 +21,7 @@ export interface Domains {
 }
 
 export interface Observations {
+  readonly mcp: MCPObservations
   readonly session: SessionObservations
   readonly skill: SkillObservations
 }
