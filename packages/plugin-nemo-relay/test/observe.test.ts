@@ -43,7 +43,7 @@ const makeFixture = (seen = new Set<string>()) => {
   const marks: Parameters<RelayHost.Runtime["mark"]>[] = []
   const opened: Parameters<RelayHost.Runtime["open"]>[] = []
   const closed: Parameters<RelayHost.Runtime["close"]>[] = []
-  const observer = RelayObserve.make({
+  const runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close"> = {
     admit: (id) => {
       if (seen.has(id)) return false
       seen.add(id)
@@ -55,8 +55,8 @@ const makeFixture = (seen = new Set<string>()) => {
     },
     mark: (...args) => marks.push(args),
     close: (...args) => closed.push(args),
-  })
-  return { observer, marks, opened, closed }
+  }
+  return { observer: RelayObserve.make(runtime), runtime, marks, opened, closed }
 }
 
 test("interleaved executions retain independent host timings and outcomes", () => {
@@ -245,6 +245,74 @@ test("shared event admission prevents a second Location observer reopening or cl
   expect(second.opened).toEqual([])
   expect(second.closed).toEqual([])
   expect(second.marks).toEqual([])
+})
+
+test("interleaved Location observers share run accounting and complete pending waits once", () => {
+  const fixture = makeFixture()
+  const second = RelayObserve.make(fixture.runtime)
+  const permission = Permission.ID.create()
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 110 },
+      120,
+    ),
+    published(Permission.Event.Asked, { sessionID, id: permission, action: "bash", resources: ["SECRET"] }, 130),
+  ].forEach((event) => {
+    Effect.runSync(fixture.observer.event(event))
+    Effect.runSync(second.event(event))
+  })
+  ;[
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 150),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 200),
+  ].forEach((event) => {
+    Effect.runSync(second.event(event))
+    Effect.runSync(fixture.observer.event(event))
+  })
+
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2])).toEqual([
+    expect.objectContaining({ duration_ms: 100, step_count: 1, permission_wait_count: 1 }),
+  ])
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.permission.wait.completed").map((mark) => mark[2]),
+  ).toEqual([expect.objectContaining({ resolution: "cancelled", duration_ms: 70 })])
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")).toHaveLength(1)
+  expect(fixture.opened).toHaveLength(1)
+  expect(fixture.closed).toHaveLength(1)
+})
+
+test("Location turnover preserves child parentage and first-output state while the runtime remains active", () => {
+  const fixture = makeFixture()
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 100 },
+      110,
+    ),
+    published(
+      SessionEvent.Forked,
+      { sessionID: sibling, parentID: sessionID, boundary: { type: "through", messageID: assistantMessageID } },
+      120,
+    ),
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+
+  // Only the surviving/new Location receives later events; the process runtime is unchanged.
+  const surviving = RelayObserve.make(fixture.runtime)
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID: sibling }, 130),
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 140),
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 150),
+  ].forEach((event) => Effect.runSync(surviving.event(event)))
+
+  expect(fixture.opened).toEqual([
+    [sessionID, undefined, 100_000],
+    [sibling, sessionID, 130_000],
+  ])
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output").map((mark) => mark[2]),
+  ).toEqual([expect.objectContaining({ duration_ms: 40, output_kind: "text" })])
 })
 
 test("skill requests and successful loads are distinct from user activation and never export skill content", () => {

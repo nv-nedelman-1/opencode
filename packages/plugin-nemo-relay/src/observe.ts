@@ -48,8 +48,19 @@ interface SessionState {
   }
 }
 
+const observers = new WeakMap<Parameters<typeof create>[0], ReturnType<typeof create>>()
+
+/** All Location subscribers share the state belonging to their process runtime. */
+export const make = (runtime: Parameters<typeof create>[0]) => {
+  const existing = observers.get(runtime)
+  if (existing) return existing
+  const observer = create(runtime)
+  observers.set(runtime, observer)
+  return observer
+}
+
 /** Host billing and native provider accounting are separate, non-additive planes. */
-export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close">) => {
+const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close">) => {
   const parents = new Map<Session.ID, Session.ID>()
   const sessions = new Map<Session.ID, SessionState>()
   const forms = new Map<string, { readonly sessionID?: Session.ID; readonly started: number }>()
