@@ -18,10 +18,12 @@ import { Snapshot } from "../../snapshot.js"
 import { Tool } from "../../tool.js"
 import { ToolOutput } from "../../tool-output.js"
 import { QuestionTool } from "../../tool/plugin/question.js"
+import type { PluginHooks } from "../../plugin/hooks.js"
 import { StepFailedError } from "../error.js"
 import { SessionEvent } from "../event.js"
 import { SessionMessage } from "../message.js"
 import { SessionModelRequest } from "../model-request.js"
+import { SessionModelOutcome } from "../model-outcome.js"
 import { SessionSchema } from "../schema.js"
 import { toSessionError } from "../to-session-error.js"
 import { SessionUsage } from "../usage.js"
@@ -42,6 +44,8 @@ export type Outcome = Data.TaggedEnum<{
 export const Outcome = Data.taggedEnum<Outcome>()
 
 interface Input {
+  /** Captured by the Session runner; standalone consumers do not require plugins. */
+  readonly observations?: PluginHooks.Interface
   readonly isLocationClosed: () => boolean
   readonly sessionID: SessionSchema.ID
   readonly assistantMessageID: SessionMessage.ID
@@ -108,37 +112,48 @@ export const make = Effect.gen(function* () {
     // A local execution starts only after its Tool.Called publication completes.
     let overflowFailure: ProviderErrorEvent | undefined
     // Read to the end, not just the finish event, so the next request can reuse this response.
-    const providerStream = llm.stream(input.prepared.request, input.prepared.options).pipe(
-      Stream.runForEach((event) =>
-        Effect.gen(function* () {
-          if (overflowFailure || publisher.hasProviderError()) return
-          // Wait here, where cancellation still works, rather than inside the uninterruptible publish.
-          if (!publisher.hasStarted()) yield* Fiber.join(pendingStartSnapshot)
-          if (
-            LLMEvent.is.providerError(event) &&
-            isContextOverflowFailure(event) &&
-            !publisher.record().outputStarted
-          ) {
-            overflowFailure = event
-            return
-          }
-          yield* publisher.publish(event)
-          if (event.type !== "tool-call" || event.providerExecuted) return
-          toolRuns.push({
-            call: event,
-            fiber: yield* Effect.uninterruptibleMask((restore) =>
-              restore(executeTool(event)).pipe(
-                Effect.flatMap(toolOutput.truncate),
-                Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
-                Effect.catchTag("Tool.Error", (error) =>
-                  publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
-                ),
-              ),
-            ).pipe(Effect.forkScoped),
-          })
-        }),
-      ),
-      Effect.ensuring(publisher.flush()),
+    const providerStream = SessionModelOutcome.observe(
+      input.observations,
+      {
+        sessionID: input.sessionID,
+        agent: input.agent,
+        model: input.model.ref,
+        kind: "primary",
+      },
+      (observer) =>
+        llm.stream(input.prepared.request, input.prepared.options).pipe(
+          Stream.runForEach((event) =>
+            Effect.gen(function* () {
+              observer.event(event)
+              if (overflowFailure || publisher.hasProviderError()) return
+              // Wait here, where cancellation still works, rather than inside the uninterruptible publish.
+              if (!publisher.hasStarted()) yield* Fiber.join(pendingStartSnapshot)
+              if (
+                LLMEvent.is.providerError(event) &&
+                isContextOverflowFailure(event) &&
+                !publisher.record().outputStarted
+              ) {
+                overflowFailure = event
+                return
+              }
+              yield* publisher.publish(event)
+              if (event.type !== "tool-call" || event.providerExecuted) return
+              toolRuns.push({
+                call: event,
+                fiber: yield* Effect.uninterruptibleMask((restore) =>
+                  restore(executeTool(event)).pipe(
+                    Effect.flatMap(toolOutput.truncate),
+                    Effect.flatMap((outcome) => publisher.toolExecution(event.id, event.name, outcome)),
+                    Effect.catchTag("Tool.Error", (error) =>
+                      publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
+                    ),
+                  ),
+                ).pipe(Effect.forkScoped),
+              })
+            }),
+          ),
+          Effect.ensuring(publisher.flush()),
+        ),
     )
 
     // Keep the final tool and Step events uninterruptible, even when the work itself is cancelled.

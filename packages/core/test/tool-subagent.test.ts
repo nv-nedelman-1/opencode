@@ -394,6 +394,7 @@ describe("SubagentTool", () => {
           expect(settled.metadata).toEqual({
             sessionID: outputSessionID(settled.metadata),
             status: "completed",
+            delegation: { kind: "new", requestedMode: "foreground", returnMode: "foreground" },
           })
           expect((yield* sessions.get(outputSessionID(settled.metadata))).parentID).toBe(parent.id)
         }),
@@ -435,7 +436,11 @@ describe("SubagentTool", () => {
           })
           const child = yield* sessions.get(outputSessionID(settled.metadata))
           expect(settled.content).toEqual([{ type: "text", text: completedOutput(child.id) }])
-          expect(settled.metadata).toEqual({ sessionID: child.id, status: "completed" })
+          expect(settled.metadata).toEqual({
+            sessionID: child.id,
+            status: "completed",
+            delegation: { kind: "new", requestedMode: "foreground", returnMode: "foreground" },
+          })
           expect(progress[0]).toEqual({ sessionID: child.id, status: "running" })
           expect(child).toMatchObject({
             parentID: parent.id,
@@ -507,6 +512,11 @@ describe("SubagentTool", () => {
           })
 
           expect(outputSessionID(second.metadata)).toBe(childID)
+          expect(second.metadata?.delegation).toEqual({
+            kind: "continued",
+            requestedMode: "foreground",
+            returnMode: "foreground",
+          })
           expect((yield* sessions.list({ parentID: parent.id })).data).toHaveLength(1)
           expect((yield* sessions.get(childID)).title).toBe("review")
           expect(
@@ -520,58 +530,68 @@ describe("SubagentTool", () => {
     ),
   )
 
-  it.live("steers a running child session in the background", () =>
-    Effect.acquireRelease(
-      Effect.promise(() => tmpdir()),
-      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
-    ).pipe(
-      Effect.flatMap((dir) =>
-        Effect.gen(function* () {
-          const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
-          const sessions = yield* Session.Service
-          const parent = yield* sessions.create({ location, model: parentModel })
-          const child = yield* sessions.create({
-            parentID: parent.id,
-            title: "review",
-            agent: Agent.ID.make("reviewer"),
-            model: childModel,
-          })
-          yield* withSubagent(parent.location)
-          const locations = yield* LocationServiceMap.Service
-          const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
-          const jobs = yield* Job.Service
-          yield* jobs.start({ id: child.id, type: SubagentTool.name, run: Effect.never })
+  for (const background of [true, false])
+    it.live(`steers a running child with background=${background}`, () =>
+      Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      ).pipe(
+        Effect.flatMap((dir) =>
+          Effect.gen(function* () {
+            const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+            const sessions = yield* Session.Service
+            const parent = yield* sessions.create({ location, model: parentModel })
+            const child = yield* sessions.create({
+              parentID: parent.id,
+              title: "review",
+              agent: Agent.ID.make("reviewer"),
+              model: childModel,
+            })
+            yield* withSubagent(parent.location)
+            const locations = yield* LocationServiceMap.Service
+            const registry = yield* Tool.Service.pipe(Effect.provide(locations.get(parent.location)))
+            const jobs = yield* Job.Service
+            yield* jobs.start({ id: child.id, type: SubagentTool.name, run: Effect.never })
+            if (!background) yield* jobs.background(child.id)
 
-          const result = yield* executeTool(registry, {
-            sessionID: parent.id,
-            ...toolIdentity,
-            call: {
-              type: "tool-call",
-              id: "call-running-subagent",
-              name: SubagentTool.name,
-              input: {
-                agent: "reviewer",
-                description: "follow up",
-                prompt: "continue while running",
-                sessionID: child.id,
-                background: true,
+            const result = yield* executeTool(registry, {
+              sessionID: parent.id,
+              ...toolIdentity,
+              call: {
+                type: "tool-call",
+                id: "call-running-subagent",
+                name: SubagentTool.name,
+                input: {
+                  agent: "reviewer",
+                  description: "follow up",
+                  prompt: "continue while running",
+                  sessionID: child.id,
+                  background,
+                },
               },
-            },
-          })
+            })
 
-          expect(result).toMatchObject({
-            status: "completed",
-            metadata: { sessionID: child.id, status: "running" },
-          })
-          expect((yield* sessions.inbox(child.id)).find((message) => message.type === "user")?.payload.text).toBe(
-            "continue while running",
-          )
-          expect((yield* jobs.get(child.id))?.status).toBe("running")
-          yield* jobs.cancel(child.id)
-        }),
+            expect(result).toMatchObject({
+              status: "completed",
+              metadata: {
+                sessionID: child.id,
+                status: "running",
+                delegation: {
+                  kind: "continued",
+                  requestedMode: background ? "background" : "foreground",
+                  returnMode: "background",
+                },
+              },
+            })
+            expect((yield* sessions.inbox(child.id)).find((message) => message.type === "user")?.payload.text).toBe(
+              "continue while running",
+            )
+            expect((yield* jobs.get(child.id))?.status).toBe("running")
+            yield* jobs.cancel(child.id)
+          }),
+        ),
       ),
-    ),
-  )
+    )
 
   it.live("rejects unrelated children and switches agents on continuation", () =>
     Effect.acquireRelease(
@@ -798,7 +818,11 @@ describe("SubagentTool", () => {
           expect(settled.metadata).toMatchObject({
             status: "running",
           })
-          expect(settled.metadata).toEqual({ sessionID: childID, status: "running" })
+          expect(settled.metadata).toEqual({
+            sessionID: childID,
+            status: "running",
+            delegation: { kind: "new", requestedMode: "background", returnMode: "background" },
+          })
           expect(settled.content).toEqual([{ type: "text", text: expect.stringContaining(`sessionID: ${childID}`) }])
 
           const admission = Array.from(yield* Fiber.join(admitted))[0]

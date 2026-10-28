@@ -23,7 +23,7 @@ import {
   type ToolDefinition,
 } from "../schema/index.js"
 import { classifyProviderFailure } from "../provider-error.js"
-import { isRecord, JsonObject, optionalArray, optionalNull, ProviderShared } from "./shared.js"
+import { isRecord, JsonObject, lenient, optionalArray, optionalNull, ProviderShared } from "./shared.js"
 import { OpenAIOptions } from "./utils/openai-options.js"
 import { Lifecycle } from "./utils/lifecycle.js"
 import { ToolStream } from "./utils/tool-stream.js"
@@ -280,6 +280,7 @@ const OpenAIChatError = Schema.StructWithRest(
 
 export const OpenAIChatEvent = Schema.StructWithRest(
   Schema.Struct({
+    model: lenient(Schema.String),
     choices: optionalNull(Schema.Array(OpenAIChatChoice)),
     usage: optionalNull(OpenAIChatUsage),
     error: optionalNull(OpenAIChatError),
@@ -305,6 +306,7 @@ export interface ParserState {
   readonly toolCallEvents: ReadonlyArray<LLMEvent>
   readonly usage?: Usage
   readonly finishReason?: FinishReasonDetails
+  readonly responseModel?: string
   readonly lifecycle: Lifecycle.State
   readonly reasoningField?: string
   /** A scalar reasoning field (`reasoning_content`, ...) has carried text in this stream. */
@@ -1204,6 +1206,7 @@ const step = (state: ParserState, event: OpenAIChatEvent) =>
         toolCallEvents: finished?.events ?? state.toolCallEvents,
         usage,
         finishReason,
+        responseModel: event.model?.trim() ? event.model : state.responseModel,
         lifecycle,
         reasoningField,
         reasoningTextObserved,
@@ -1259,7 +1262,7 @@ export const finishEvents = Effect.fnUntraced(function* (state: ParserState) {
   const ended = Lifecycle.reasoningEnd(started, events, "reasoning-0", metadata)
   const lifecycle = toolCallEvents.length ? Lifecycle.stepStart(ended, events) : ended
   events.push(...toolCallEvents)
-  Lifecycle.finish(lifecycle, events, { reason, usage: state.usage })
+  Lifecycle.finish(lifecycle, events, { reason, usage: state.usage, responseModel: state.responseModel })
   return events
 })
 

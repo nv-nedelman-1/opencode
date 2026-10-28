@@ -23,8 +23,9 @@ const REPORT_DESCRIPTION =
 export const Plugin = define({
   id: "opencode.skill",
   effect: Effect.fn(function* (ctx) {
+    const skills = yield* Skill.Service
     const reportContent = yield* reportContentWithDiagnostics(ctx.app)
-    yield* ctx.skill.transform((editor) => {
+    yield* skills.transform((editor) => {
       editor.add(
         Skill.Info.make({
           id: Skill.ID.make("opencode"),
@@ -33,6 +34,7 @@ export const Plugin = define({
           path: AbsolutePath.make("/builtin/opencode.md"),
           content: OpencodeContent,
         }),
+        "embedded",
       )
       editor.add(
         Skill.Info.make({
@@ -42,6 +44,7 @@ export const Plugin = define({
           path: AbsolutePath.make("/builtin/report.md"),
           content: reportContent,
         }),
+        "embedded",
       )
     })
   }),

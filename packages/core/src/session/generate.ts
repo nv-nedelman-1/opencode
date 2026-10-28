@@ -1,19 +1,22 @@
 export * as SessionGenerate from "./generate.js"
 
 import type { FileSystem } from "../filesystem.js"
-import { LLMClient, Message, type AIError } from "@opencode/ai"
+import { LLMClient, LLMEvent, Message, type AIError } from "@opencode/ai"
 import { Effect } from "effect"
 import { Database } from "../database/database.js"
 import { Instance } from "../instance/service.js"
 import { Plugin } from "../plugin/service.js"
+import { PluginHooks } from "../plugin/hooks.js"
 import type { Instructions } from "../instructions/index.js"
 import { SessionContext } from "./context.js"
 import type { AgentNotFoundError } from "./error.js"
 import { SessionHistory } from "./history.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionModelRequest } from "./model-request.js"
+import { SessionModelOutcome } from "./model-outcome.js"
 import type { SessionRunnerModel } from "./runner/model.js"
 import type { SessionSchema } from "./schema.js"
+import { SessionUsage } from "./usage.js"
 
 export type Error =
   | AgentNotFoundError
@@ -66,8 +69,36 @@ export const generate = Effect.fn("SessionGenerate.generate")(function* (input: 
       providerID: model.ref.providerID,
       modelID: model.ref.id,
     })
-    const response = yield* llm.generate(prepared.request, prepared.options)
+    const hooks = yield* PluginHooks.Service
+    const response = yield* SessionModelOutcome.observe(
+      hooks,
+      { sessionID: selection.session.id, agent: selection.agent.id, model: model.ref, kind: "generate" },
+      (observer) =>
+        llm.generate(prepared.request, prepared.options).pipe(
+          Effect.tap((response) =>
+            Effect.sync(() => {
+              // These events are buffered: their delivery time is not time to first output.
+              response.events.filter(LLMEvent.is.providerError).forEach(observer.event)
+              observer.finish(response.finishReason, response.responseModel)
+            }),
+          ),
+        ),
+    )
     yield* Effect.logInfo("session generation usage diagnostic", { usage: response.usage })
+    if (response.usage) {
+      yield* hooks.trigger(
+        "session",
+        "usage",
+        Object.freeze({
+          sessionID: selection.session.id,
+          agent: selection.agent.id,
+          model: model.ref,
+          source: "generate",
+          ...SessionUsage.snapshot(SessionUsage.record(response.usage, model.cost)),
+          costSource: "host_calculated",
+        }),
+      )
+    }
     return response.text
   }).pipe(instances.provide(input.session))
 })

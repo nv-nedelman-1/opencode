@@ -121,6 +121,7 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
               type: "response.completed",
               response: {
                 id: `resp_${state.calls}`,
+                model: "native-accepted",
                 status: "completed",
                 output,
                 usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 },
@@ -255,6 +256,11 @@ it.live(
     Effect.gen(function* () {
       const fixture = yield* setup()
       const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+      const modelOutcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+      yield* fixture.hooks.observe("session", "model.outcome", (event) => {
+        modelOutcomes.push(event)
+        return undefined
+      })
       yield* fixture.hooks.register("session", "compaction.outcome", (event) =>
         Effect.sync(() => {
           observed.push(event)
@@ -264,6 +270,12 @@ it.live(
       yield* fixture.prompt("Synthetic context, not a user request", true)
       expect(yield* fixture.compact).toEqual({ status: "completed" })
       expect(observed[0]).toMatchObject({ status: "completed", trigger: "manual" })
+      expect(modelOutcomes).toHaveLength(1)
+      expect(modelOutcomes[0]).toMatchObject({
+        kind: "compaction",
+        status: "completed",
+        responseModel: "native-accepted",
+      })
       expect(observed[0]).not.toHaveProperty("after")
       expect(observed[0]).not.toHaveProperty("summaryEstimatedTokens")
       const first = yield* fixture.checkpoint
@@ -306,6 +318,8 @@ it.live(
       fixture.state.failure = true
       expect(yield* fixture.compact).toMatchObject({ status: "failed", error: { type: "provider.rate-limit" } })
       expect(fixture.state.calls).toBe(4)
+      expect(modelOutcomes.at(-1)).toMatchObject({ status: "failed" })
+      expect(modelOutcomes.at(-1)).not.toHaveProperty("responseModel")
       expect(yield* fixture.checkpoint).toEqual(second)
       fixture.state.failure = false
       fixture.state.hang = true
@@ -314,6 +328,7 @@ it.live(
       yield* Fiber.interrupt(pending)
       expect(observed.at(-1)).toMatchObject({ status: "interrupted", trigger: "manual" })
       expect(fixture.state.calls).toBe(5)
+      expect(modelOutcomes.at(-1)).toMatchObject({ status: "interrupted" })
       expect(yield* fixture.checkpoint).toEqual(second)
       // A transient provider failure retries under the shared session policy and its plugin hook.
       fixture.state.hang = false
@@ -327,6 +342,14 @@ it.live(
       fixture.state.flaky = true
       expect(yield* fixture.compact).toEqual({ status: "completed" })
       expect(fixture.state.calls).toBe(7)
+      expect(modelOutcomes.map((outcome) => outcome.status)).toEqual([
+        "completed",
+        "completed",
+        "failed",
+        "interrupted",
+        "failed",
+        "completed",
+      ])
       expect(retries).toMatchObject([
         {
           agent: "build",

@@ -61,6 +61,13 @@ export const middleware =
                 "opencode.session_id": execution.sessionID,
                 "opencode.message_id": execution.messageID,
                 "opencode.agent": execution.agent,
+                ...(execution.provenance === undefined
+                  ? {}
+                  : {
+                      "opencode.tool_origin": execution.provenance.origin,
+                      "opencode.tool_execution": execution.provenance.execution,
+                      "opencode.tool_category": execution.provenance.category,
+                    }),
               },
               execution.id,
             ),
@@ -105,5 +112,13 @@ export const middleware =
     })
 
 /** A result an execution intercept substituted for the tool's own. */
-const replaced = (value: unknown): Tool.Result =>
-  Option.getOrElse(decodeResult(value), () => ({ content: typeof value === "string" ? value : JSON.stringify(value) }))
+const replaced = (value: unknown): Tool.Result => {
+  const envelope =
+    typeof value === "object" &&
+    value !== null &&
+    Object.keys(value).length > 0 &&
+    Object.keys(value).every((key) => key === "output" || key === "content" || key === "metadata")
+  return Option.getOrElse(envelope ? decodeResult(value) : Option.none(), () => ({
+    content: typeof value === "string" ? value : JSON.stringify(value),
+  }))
+}

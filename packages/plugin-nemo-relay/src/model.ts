@@ -18,11 +18,11 @@ interface LlmRequest {
 interface Managed {
   readonly runtime: RelayHost.Runtime
   readonly call: SessionHttpCall
-  readonly parent: ScopeHandle
+  readonly parent: ScopeHandle | null
   readonly operation: RelayHost.Operation
   readonly ownership: { body: boolean }
   readonly request: LlmRequest
-  readonly send: (request: LlmRequest) => ReturnType<Next>
+  readonly send: (request: LlmRequest, signal?: AbortSignal) => ReturnType<Next>
 }
 
 type Upstream =
@@ -60,7 +60,10 @@ export const middleware =
         call.request.headers.has("x-amz-date") ||
         call.request.headers.get("authorization")?.startsWith("AWS4-HMAC-SHA256")
       ) {
-        runtime.mark(call.sessionID, "opencode.llm.coverage", { managed: false, reason: "signed_transport" })
+        runtime.mark(call.kind === "primary" ? call.sessionID : undefined, "opencode.llm.coverage", {
+          managed: false,
+          reason: "signed_transport",
+        })
         return yield* next(call.request)
       }
       const text = yield* Effect.promise(() => call.request.clone().text())
@@ -72,7 +75,7 @@ export const middleware =
         ),
         content,
       }
-      const operation = yield* runtime.lease(call.sessionID, parentID(call.sessionID))
+      const operation = yield* runtime.lease(call.sessionID, parentID(call.sessionID), call.kind === "primary")
       const ownership = { body: false }
       const dispatch = { sent: false }
       const managed: Managed = {
@@ -82,11 +85,11 @@ export const middleware =
         operation,
         ownership,
         request,
-        send: (intercepted) =>
+        send: (intercepted, signal) =>
           Effect.suspend(() => {
             if (dispatch.sent) return Effect.fail(new Error("OpenCode HTTP middleware may call next at most once"))
             dispatch.sent = true
-            return next(rebuild(call.request, text, request, intercepted))
+            return next(rebuild(call.request, text, request, intercepted, signal))
           }),
       }
       return yield* (
@@ -178,7 +181,6 @@ const stream = (managed: Managed) =>
               throw new Error("Provider returned invalid JSON SSE data")
             }
             attempt.output(chunk)
-            aggregate.push(chunk)
             yield chunk
           }
         } catch (error) {
@@ -214,11 +216,11 @@ const stream = (managed: Managed) =>
           .run(() =>
             withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
               relay.llmStreamCallExecute(
-                managed.call.model.providerID,
+                operationName(managed.call.protocol),
                 managed.request,
                 provide,
-                undefined,
-                aggregate.value,
+                (chunk) => aggregate.push(chunk),
+                () => RelayHost.json(aggregate.value()),
                 managed.parent,
                 STREAMING,
                 null,
@@ -321,10 +323,12 @@ const unary = (managed: Managed) =>
     const relay = managed.runtime.relay
     const run = Effect.runPromiseExitWith(yield* Effect.context<never>())
     const abort = new AbortController()
-    managed.operation.onCancel(() => abort.abort())
     const captured: {
       pending?: Promise<unknown>
+      task?: Promise<unknown>
       called?: boolean
+      signal?: AbortSignal
+      cancelled?: true
       failure?: Cause.Cause<Error>
       response?: {
         readonly status: number
@@ -333,49 +337,66 @@ const unary = (managed: Managed) =>
         readonly text: string
       }
     } = {}
+    managed.operation.onCancel(() => {
+      captured.cancelled = true
+      abort.abort()
+    })
     const executed = yield* Effect.tryPromise({
       try: (signal) =>
         (captured.pending = managed.operation.run(() =>
           withCodec(codecFor(relay, managed.call.protocol), (codecs) =>
             relay.llmCallExecuteAsync(
-              managed.call.model.providerID,
+              operationName(managed.call.protocol),
               managed.request,
-              async (intercepted: LlmRequest) => {
+              async (intercepted: LlmRequest, relaySignal: AbortSignal) => {
                 if (captured.called) throw new Error("OpenCode HTTP middleware may call next at most once")
                 captured.called = true
-                const requestSignal = AbortSignal.any([signal, abort.signal, managed.call.request.signal])
-                const attempt = new ProviderAttempt(managed, false)
-                const exit = await run(managed.send(intercepted), { signal: requestSignal })
-                if (Exit.isFailure(exit)) {
-                  attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
-                  captured.failure = exit.cause
-                  throw new Error("provider request failed")
-                }
-                attempt.headers(exit.value.status)
-                const body = await run(
-                  Effect.tryPromise({
-                    try: () => exit.value.text(),
-                    catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-                  }),
-                  { signal: requestSignal },
-                )
-                if (Exit.isFailure(body)) {
-                  attempt.finish(Cause.hasInterrupts(body.cause) ? "cancelled" : "failed", "body")
-                  captured.failure = body.cause
-                  throw new Error("provider response body failed")
-                }
-                const text = body.value
-                captured.response = {
-                  status: exit.value.status,
-                  statusText: exit.value.statusText,
-                  headers: exit.value.headers,
-                  text,
-                }
-                const response = RelayHost.parse(text) ?? text
-                if (exit.value.ok) attempt.output(response)
-                attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
-                if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
-                return response
+                captured.signal = relaySignal
+                return (captured.task = (async () => {
+                  const requestSignal = AbortSignal.any([
+                    relaySignal,
+                    signal,
+                    abort.signal,
+                    managed.call.request.signal,
+                  ])
+                  if (requestSignal.aborted) {
+                    const exit = await run(Effect.interrupt, { signal: requestSignal })
+                    if (Exit.isFailure(exit)) captured.failure = exit.cause
+                    throw new Error("provider request was aborted")
+                  }
+                  const attempt = new ProviderAttempt(managed, false)
+                  const exit = await run(managed.send(intercepted, requestSignal), { signal: requestSignal })
+                  if (Exit.isFailure(exit)) {
+                    attempt.finish(Cause.hasInterrupts(exit.cause) ? "cancelled" : "failed", "transport")
+                    captured.failure = exit.cause
+                    throw new Error("provider request failed")
+                  }
+                  attempt.headers(exit.value.status)
+                  const body = await run(
+                    Effect.tryPromise({
+                      try: () => exit.value.text(),
+                      catch: (error) => (error instanceof Error ? error : new Error(String(error))),
+                    }),
+                    { signal: requestSignal },
+                  )
+                  if (Exit.isFailure(body)) {
+                    attempt.finish(Cause.hasInterrupts(body.cause) ? "cancelled" : "failed", "body")
+                    captured.failure = body.cause
+                    throw new Error("provider response body failed")
+                  }
+                  const text = body.value
+                  captured.response = {
+                    status: exit.value.status,
+                    statusText: exit.value.statusText,
+                    headers: exit.value.headers,
+                    text,
+                  }
+                  const response = RelayHost.parse(text) ?? text
+                  if (exit.value.ok) attempt.output(response)
+                  attempt.finish(exit.value.ok ? "success" : "failed", exit.value.ok ? undefined : "http")
+                  if (!exit.value.ok) throw new Error(`provider returned HTTP ${exit.value.status}`)
+                  return response
+                })())
               },
               managed.parent,
               0,
@@ -389,19 +410,21 @@ const unary = (managed: Managed) =>
       catch: (error) => error,
     }).pipe(
       Effect.onExit((exit) =>
-        Exit.isFailure(exit)
-          ? Effect.promise(async () => {
-              abort.abort()
-              // Interruption stops waiting for tryPromise, not the native managed call or its intercept tail.
-              await captured.pending?.catch(() => undefined)
-            })
-          : Effect.void,
+        Effect.promise(async () => {
+          if (Exit.isFailure(exit)) abort.abort()
+          // Native settlement can revoke a continuation before its host cleanup finishes.
+          await captured.pending?.catch(() => undefined)
+          await captured.task?.catch(() => undefined)
+        }),
       ),
       Effect.exit,
     )
+    if (captured.cancelled || managed.call.request.signal.aborted) return yield* Effect.interrupt
     if (
       captured.failure &&
-      (Exit.isFailure(executed) || Cause.hasDies(captured.failure) || Cause.hasInterrupts(captured.failure))
+      (Exit.isFailure(executed) ||
+        Cause.hasDies(captured.failure) ||
+        (Cause.hasInterrupts(captured.failure) && !captured.signal?.aborted))
     )
       return yield* Effect.failCause(captured.failure)
     const upstream = captured.response
@@ -453,7 +476,13 @@ const blocked = (reason: string) =>
   )
 
 /** Applies Relay's rewrites to the original request while keeping the credentials Relay never saw. */
-const rebuild = (original: Request, text: string, request: LlmRequest, intercepted: LlmRequest) => {
+const rebuild = (
+  original: Request,
+  text: string,
+  request: LlmRequest,
+  intercepted: LlmRequest,
+  signal?: AbortSignal,
+) => {
   const headers = new Headers(original.headers)
   Object.keys(request.headers)
     .filter((key) => !(key in intercepted.headers))
@@ -463,6 +492,7 @@ const rebuild = (original: Request, text: string, request: LlmRequest, intercept
     .forEach(([key, value]) => headers.set(key, value))
   headers.delete("content-length")
   return new Request(original, {
+    ...(signal === undefined ? {} : { signal }),
     headers,
     body: RelayHost.sameJson(intercepted.content, request.content) ? text : JSON.stringify(intercepted.content),
   })
@@ -516,7 +546,7 @@ class ProviderAttempt {
     const output_kind = RelaySSE.outputKind(this.managed.call.protocol, chunk)
     if (output_kind === undefined) return
     this.emittedOutput = true
-    this.managed.runtime.mark(this.managed.call.sessionID, "opencode.llm.first_output", {
+    this.managed.operation.mark("opencode.llm.first_output", {
       ...this.attributes,
       count: 1,
       duration_ms: performance.now() - this.started,
@@ -539,7 +569,7 @@ class ProviderAttempt {
   }
 
   private mark(name: string, data: Record<string, unknown>) {
-    this.managed.runtime.mark(this.managed.call.sessionID, `opencode.llm.provider_attempt.${name}`, {
+    this.managed.operation.mark(`opencode.llm.provider_attempt.${name}`, {
       ...this.attributes,
       ...data,
     })
@@ -556,6 +586,17 @@ const codecFor = (relay: RelayHost.Relay, protocol: string) =>
         : protocol === "gemini"
           ? new relay.GeminiGenerateContentCodec()
           : undefined
+
+// Execution plugins dispatch on the wire operation, not a configured provider alias.
+// Preserve opaque protocol identities instead of inferring a provider API from model names.
+const operationName = (protocol: string) =>
+  protocol === "openai-chat" || protocol === "openai-compatible-chat"
+    ? "openai.chat_completions"
+    : RelaySSE.RESPONSES.has(protocol)
+      ? "openai.responses"
+      : protocol === "anthropic-messages"
+        ? "anthropic.messages"
+        : protocol
 
 type Codec = NonNullable<ReturnType<typeof codecFor>>
 type CodecArguments = [

@@ -11,8 +11,9 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { WebSearch } from "@opencode/core/websearch"
 import { Effect, Stream } from "effect"
 
-type Overrides = Partial<Omit<Plugin.Context, "options" | "session">> & {
+type Overrides = Partial<Omit<Plugin.Context, "options" | "session" | "event">> & {
   readonly session?: Partial<Plugin.Context["session"]>
+  readonly event?: Partial<Plugin.Context["event"]>
 }
 export function host(overrides: Overrides = {}): Plugin.Context {
   return {
@@ -62,8 +63,10 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       transform: () => Effect.die("unused command.transform"),
       reload: () => Effect.die("unused command.reload"),
     },
-    event: overrides.event ?? {
+    event: {
       subscribe: () => Stream.empty,
+      observe: () => Effect.die("unused event.observe"),
+      ...overrides.event,
     },
     experimental: overrides.experimental ?? {
       terminal: {
@@ -100,6 +103,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       },
     },
     mcp: overrides.mcp ?? {
+      observe: () => Effect.die("unused mcp.observe"),
       list: () => Effect.die("unused mcp.list"),
       transform: () => Effect.die("unused mcp.transform"),
       reload: () => Effect.die("unused mcp.reload"),
@@ -119,6 +123,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused reference.reload"),
     },
     skill: overrides.skill ?? {
+      observe: () => Effect.die("unused skill.observe"),
       list: () => Effect.die("unused skill.list"),
       transform: () => Effect.die("unused skill.transform"),
       reload: () => Effect.die("unused skill.reload"),
@@ -165,6 +170,7 @@ export function host(overrides: Overrides = {}): Plugin.Context {
       reload: () => Effect.die("unused websearch.reload"),
     },
     session: {
+      observe: overrides.session?.observe ?? (() => Effect.die("unused session.observe")),
       hook: overrides.session?.hook ?? (() => Effect.die("unused session.hook")),
       middleware: overrides.session?.middleware ?? (() => Effect.die("unused session.middleware")),
       create: overrides.session?.create ?? (() => Effect.die("unused session.create")),

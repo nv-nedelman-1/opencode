@@ -7,6 +7,9 @@ import type { Session } from "@opencode/schema/session"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { Types } from "effect"
 import type { Hooks, Transform } from "./registration.js"
+import type { ToolProvenance } from "../effect/tool.js"
+
+export type { ToolProvenance } from "../effect/tool.js"
 
 export interface ToolContext extends Omit<Tool.Context, "progress"> {
   readonly signal: AbortSignal
@@ -51,6 +54,7 @@ interface ToolHooks {
     readonly messageID: SessionMessage.ID
     readonly id: Tool.CallID
     readonly input: unknown
+    readonly provenance?: ToolProvenance
   } & (
     | {
         readonly status: "completed"

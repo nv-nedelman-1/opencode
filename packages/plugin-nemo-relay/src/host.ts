@@ -1,6 +1,7 @@
 export * as RelayHost from "./host.js"
 
 import { RelayBinding } from "#binding"
+import type { App } from "@opencode/plugin/app"
 import type { Session } from "@opencode/schema/session"
 import { Cause, Effect, Option, Schema, type Scope } from "effect"
 import type { PropagationContext, ScopeHandle, ScopeStack } from "nemo-relay-node"
@@ -9,6 +10,7 @@ import { access } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { RelayMetrics } from "./metrics.js"
+import { RelayClient } from "./client.js"
 
 export type Relay = Awaited<ReturnType<typeof RelayBinding.load>>[0]
 export type Outcome = "success" | "failed" | "cancelled"
@@ -32,6 +34,8 @@ export interface Options {
   /** Explicit user-layer `plugins.toml`. Relay's system layer still applies above it. */
   readonly pluginsToml?: string
   readonly shutdownBudgetMs?: number
+  /** Host-supplied release facts, without application or installation identity. */
+  readonly client?: Pick<App, "version" | "channel">
 }
 
 export interface Runtime {
@@ -48,12 +52,17 @@ export interface Runtime {
     timestamp?: number,
   ) => void
   readonly admit: (eventID: string) => boolean
-  readonly lease: (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>) => Effect.Effect<Operation>
+  readonly lease: (
+    sessionID: Session.ID,
+    parentID: Effect.Effect<Session.ID | undefined>,
+    createExecution?: boolean,
+  ) => Effect.Effect<Operation>
 }
 
 export interface Operation {
-  readonly parent: ScopeHandle
+  readonly parent: ScopeHandle | null
   readonly run: <A>(callback: () => A) => A
+  readonly mark: (name: string, data: unknown, metadata?: unknown, timestamp?: number) => void
   readonly onCancel: (cancel: () => void) => void
   readonly release: () => void
 }
@@ -168,9 +177,31 @@ const start = Effect.fn("RelayHost.start")(function* (options: Options) {
     yield* Effect.logWarning(`${failure.error.message}; model and tool execution is blocked`)
     return failure
   }
+  const failed = active.report.dynamic_plugins.filter((entry) => entry.failure != null)
+  if (failed.length > 0) {
+    // Disabled declarations can also have failure reports; validation identifies requested entries.
+    const requested = yield* Effect.try(
+      () =>
+        new Set(
+          plugin
+            .validate(options.config ?? plugin.defaultConfig(), pluginsToml)
+            .dynamic_plugins.map((entry) => entry.plugin_id),
+        ),
+    ).pipe(Effect.option)
+    if (Option.isSome(requested)) {
+      const count = failed.filter((entry) => requested.value.has(entry.plugin_id)).length
+      if (count > 0) yield* Effect.logWarning("NeMo Relay skipped optional dynamic plugins", { count })
+    } else {
+      yield* Effect.logWarning("NeMo Relay dynamic plugin diagnostics could not be classified")
+    }
+  }
   yield* Effect.logInfo("NeMo Relay plugin host is active")
-  const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS)
-  runtime.mark(undefined, "opencode.runtime.activation", { count: 1 })
+  const client = RelayClient.diagnostics(options.client, process)
+  const runtime = make(relay, active, options.shutdownBudgetMs ?? SHUTDOWN_BUDGET_MS, client)
+  runtime.mark(undefined, "opencode.runtime.activation", {
+    count: 1,
+    ...client,
+  })
   return runtime
 })
 
@@ -203,7 +234,13 @@ const locations = (explicit: string | undefined) => [
     : "/etc/nemo-relay/plugins.toml",
 ]
 
-export const make = (relay: Relay, activation: PluginHostActivation, budget: number): Active => {
+export const make = (
+  relay: Relay,
+  activation: PluginHostActivation,
+  budget: number,
+  client?: ReturnType<typeof RelayClient.diagnostics>,
+): Active => {
+  const attributes = RelayClient.metricAttributes(client)
   interface Entry {
     readonly handle: ScopeHandle
     readonly stack: ScopeStack
@@ -280,34 +317,49 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
       return open(sessionID, parent)
     })
 
-  const lease = (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>) =>
+  const lease = (sessionID: Session.ID, parentID: Effect.Effect<Session.ID | undefined>, createExecution = true) =>
     Effect.gen(function* () {
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
-      const entry = yield* resolve(sessionID, parentID)
+      // A shared Session ID does not establish which execution owns an auxiliary invocation.
+      const entry = createExecution ? yield* resolve(sessionID, parentID) : undefined
       if (!state.accepting) return yield* Effect.die(new Error("NeMo Relay runtime is stopping"))
-      const stack = relay.createScopeStackFromPropagation(
-        relay.withScopeStack(entry.stack, () => relay.capturePropagationContext()) as PropagationContext,
-      )
+      const stack = entry
+        ? relay.createScopeStackFromPropagation(
+            relay.withScopeStack(entry.stack, () => relay.capturePropagationContext()) as PropagationContext,
+          )
+        : relay.createScopeStack()
       const completion = Promise.withResolvers<void>()
       const pending = { done: completion.promise, cancel: () => {} }
       operations.add(pending)
-      entry.operations++
+      if (entry) entry.operations++
       return {
-        parent: entry.handle,
+        parent: entry?.handle ?? null,
         run: <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
+        mark: (name: string, data: unknown, metadata?: unknown, timestamp?: number) => {
+          if (operations.has(pending)) publish(entry, entry?.stack ?? neutral, name, data, metadata, timestamp)
+        },
         onCancel: (cancel: () => void) => {
           pending.cancel = cancel
         },
         release: () => {
           if (!operations.delete(pending)) return
-          entry.operations--
-          finish(entry)
+          if (entry) {
+            entry.operations--
+            finish(entry)
+          }
           completion.resolve()
         },
       }
     })
 
-  const mark: Runtime["mark"] = (sessionID, name, data, metadata, timestamp) => {
+  const publish = (
+    entry: Entry | undefined,
+    stack: ScopeStack,
+    name: string,
+    data: unknown,
+    metadata?: unknown,
+    timestamp?: number,
+  ) => {
     if (!state.accepting) return
     const id = isRecord(metadata) ? metadata["opencode.event_id"] : undefined
     if (typeof id === "string") {
@@ -316,13 +368,26 @@ export const make = (relay: Relay, activation: PluginHostActivation, budget: num
       marks.add(key)
       if (marks.size > 1024) marks.delete(marks.values().next().value!)
     }
-    const entry = sessionID === undefined ? undefined : sessions.get(sessionID)
     const measurements = RelayMetrics.measurements(name, data)
-    relay.withScopeStack(entry?.stack ?? neutral, () => {
+    relay.withScopeStack(stack, () => {
       relay.event(name, entry?.handle ?? null, json(data), json(metadata), timestamp)
       if (measurements.length > 0)
-        relay.metric(`${name}.metrics`, measurements, entry?.handle ?? null, json(metadata), timestamp)
+        relay.metric(
+          `${name}.metrics`,
+          measurements.map((metric) => ({
+            ...metric,
+            attributes: { ...metric.attributes, ...attributes },
+          })),
+          entry?.handle ?? null,
+          json(metadata),
+          timestamp,
+        )
     })
+  }
+
+  const mark: Runtime["mark"] = (sessionID, name, data, metadata, timestamp) => {
+    const entry = sessionID === undefined ? undefined : sessions.get(sessionID)
+    publish(entry, entry?.stack ?? neutral, name, data, metadata, timestamp)
   }
 
   const finalize = Effect.gen(function* () {

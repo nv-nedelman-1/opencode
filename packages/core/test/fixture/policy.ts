@@ -27,11 +27,13 @@ export const registerIntegrationPolicy = Effect.fn(function* (input: {
         reload: () => Effect.void,
       },
       mcp: {
+        observe: () => Effect.die("unused mcp.observe"),
         list: () => Effect.die("unused mcp.list"),
         transform: (callback) => input.mcp?.transform(callback) ?? Effect.succeed({ dispose: Effect.void }),
         reload: () => input.mcp?.reload() ?? Effect.void,
       },
       skill: {
+        observe: () => Effect.die("unused skill.observe"),
         list: () => Effect.die("unused skill.list"),
         transform: (callback) => input.skill?.transform(callback) ?? Effect.succeed({ dispose: Effect.void }),
         reload: () => input.skill?.reload() ?? Effect.void,

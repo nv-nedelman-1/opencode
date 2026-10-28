@@ -1,8 +1,10 @@
 export * as PluginHooks from "./hooks.js"
 
 import type { AISDKHooks } from "@opencode/plugin/effect/aisdk"
-import type { SessionHooks, SessionMiddlewares } from "@opencode/plugin/effect/session"
+import type { MCPObservations } from "@opencode/plugin/effect/mcp"
+import type { SessionHooks, SessionMiddlewares, SessionObservations } from "@opencode/plugin/effect/session"
 import type { ShellHooks } from "@opencode/plugin/effect/shell"
+import type { SkillObservations } from "@opencode/plugin/effect/skill"
 import type { ToolFailures, ToolHooks, ToolMiddlewares } from "@opencode/plugin/effect/tool"
 import type { ModelHookOptions } from "@opencode/plugin/effect/registration"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
@@ -16,6 +18,12 @@ export interface Domains {
   readonly permission: PermissionHooks
   readonly shell: ShellHooks
   readonly tool: ToolHooks
+}
+
+export interface Observations {
+  readonly mcp: MCPObservations
+  readonly session: SessionObservations
+  readonly skill: SkillObservations
 }
 
 export interface Middlewares {
@@ -45,6 +53,17 @@ const eventProviderID = (event: unknown) => {
 }
 
 export interface Interface {
+  readonly observe: <Domain extends keyof Observations, Name extends keyof Observations[Domain]>(
+    domain: Domain,
+    name: Name,
+    callback: (event: Observations[Domain][Name]) => undefined,
+    options?: ModelHookOptions,
+  ) => Effect.Effect<State.Registration, never, Scope.Scope>
+  readonly notify: <Domain extends keyof Observations, Name extends keyof Observations[Domain]>(
+    domain: Domain,
+    name: Name,
+    event: Observations[Domain][Name],
+  ) => Effect.Effect<void>
   readonly has: <Domain extends keyof Domains>(
     domain: Domain,
     name: keyof Domains[Domain] & keyof Failures[Domain],
@@ -81,8 +100,10 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const callbacks = new Map<string, Entry[]>()
+    const observers = new Map<string, Entry[]>()
     const wrappers = new Map<string, Entry<unknown>[]>()
-    const key = (domain: keyof Domains | keyof Middlewares, name: PropertyKey) => `${domain}.${String(name)}`
+    const key = (domain: keyof Domains | keyof Middlewares | keyof Observations, name: PropertyKey) =>
+      `${domain}.${String(name)}`
 
     const add = Effect.fn("PluginHooks.add")(function* <T>(entries: Map<string, T[]>, id: string, entry: T) {
       const scope = yield* Scope.Scope
@@ -101,6 +122,24 @@ const layer = Layer.effect(
 
     const register: Interface["register"] = (domain, name, callback, options) =>
       add(callbacks, key(domain, name), { callback, options })
+
+    const observe: Interface["observe"] = (domain, name, callback, options) =>
+      add(observers, key(domain, name), { callback, options })
+
+    const notify: Interface["notify"] = Effect.fnUntraced(function* (domain, name, event) {
+      for (const entry of observers.get(key(domain, name)) ?? []) {
+        if (entry.options?.providerID !== undefined && entry.options.providerID !== eventProviderID(event)) continue
+        yield* Effect.sync(() => entry.callback(event)).pipe(
+          Effect.flatMap((result: unknown) => {
+            if (result === undefined) return Effect.void
+            // A JavaScript observer can violate its type; do not run or await foreign work during settlement.
+            void Promise.resolve(result).catch(() => {})
+            return Effect.logWarning("Plugin source observer must be synchronous and return undefined")
+          }),
+          Effect.catchCause(() => Effect.logWarning("Plugin source observer failed")),
+        )
+      }
+    })
 
     const use: Interface["use"] = (domain, name, middleware, options) =>
       add(wrappers, key(domain, name), { callback: middleware, options })
@@ -137,7 +176,7 @@ const layer = Layer.effect(
         ),
       )
 
-    return Service.of({ has, register, trigger, use, middlewares })
+    return Service.of({ has, register, trigger, observe, notify, use, middlewares })
   }),
 )
 

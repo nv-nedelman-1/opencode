@@ -18,7 +18,7 @@ import type { StreamOptions } from "@opencode/ai/route"
 import type { SessionCompactionResult } from "@opencode/plugin/effect/session"
 import type { SessionError } from "@opencode/schema/session-error"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Context, Effect, Layer, Result, Stream } from "effect"
+import { Clock, Context, Effect, Layer, Result, Stream } from "effect"
 import { Agent } from "../agent.js"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
@@ -32,6 +32,7 @@ import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
 import type { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
+import { SessionModelOutcome } from "./model-outcome.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
@@ -207,6 +208,7 @@ export const layer = Layer.effect(
 
     const compact = Effect.fn("SessionCompaction.compact")(function* (
       trigger: Trigger,
+      started: bigint,
       settle: () => void,
     ): Effect.fn.Return<Outcome> {
       const settings = state.get()
@@ -215,12 +217,12 @@ export const layer = Layer.effect(
       // Only the user compacts when automatic compaction is off, overflow included.
       if (trigger.reason !== "manual" && !settings.auto) {
         settle()
-        yield* observe(trigger, "skipped")
+        yield* observe(trigger, "skipped", started)
         return { status: "skipped" }
       }
       if (trigger.reason === "auto" && !due(context, calculateCeiling(context.model.limit, settings.buffer))) {
         settle()
-        yield* observe(trigger, "skipped")
+        yield* observe(trigger, "skipped", started)
         return { status: "skipped" }
       }
       const native = context.model.compaction?.type === "native"
@@ -246,8 +248,8 @@ export const layer = Layer.effect(
         : summarize(selected, budget, settings.keep)
       return yield* compaction.pipe(
         Effect.matchEffect({
-          onSuccess: (result) => publish(selected, result, trigger, settle),
-          onFailure: (failure) => publish(selected, failure, trigger, settle),
+          onSuccess: (result) => publish(selected, result, started, trigger, settle),
+          onFailure: (failure) => publish(selected, failure, started, trigger, settle),
         }),
       )
     })
@@ -371,14 +373,28 @@ export const layer = Layer.effect(
           return Effect.gen(function* () {
             const history = yield* SessionHistory.load(db, context.session.id, "local").pipe(Effect.orDie)
             const retained = recentUserMessages(history, context.model, keep)
-            const response = yield* llm.compact(request, { ...prepared.options, mechanism: "trigger" })
+            const response = yield* SessionModelOutcome.observe(
+              hooks,
+              { sessionID: context.session.id, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+              (observer) =>
+                llm
+                  .compact(request, { ...prepared.options, mechanism: "trigger" })
+                  .pipe(
+                    Effect.tap((response) => Effect.sync(() => observer.finish(undefined, response.responseModel))),
+                  ),
+            )
             return yield* toResult([...retained, Message.assistant(response.checkpoint)], response.usage)
           })
         }
         if (LLMClient.canCompact(request)) {
-          return llm
-            .compact(request, { mechanism: "endpoint", http: prepared.options.http })
-            .pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
+          return SessionModelOutcome.observe(
+            hooks,
+            { sessionID: context.session.id, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+            (observer) =>
+              llm
+                .compact(request, { mechanism: "endpoint", http: prepared.options.http })
+                .pipe(Effect.tap(() => Effect.sync(() => observer.finish()))),
+          ).pipe(Effect.flatMap((response) => toResult(response.replacement, response.usage)))
         }
         return unsupported(`Native compaction is not supported for ${request.model.provider}/${request.model.route.id}`)
       }
@@ -525,59 +541,65 @@ export const layer = Layer.effect(
       const metadataKey = context.model.model.route.providerMetadataKey ?? context.model.model.provider
       const unusable = (error: SessionError.Error) => Effect.fail<Failure>({ error })
 
-      return llm.stream(request, options).pipe(
-        Stream.runFoldEffect(
-          (): Streamed => ({ text: "" }),
-          (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
-            if (LLMEvent.is.providerError(event)) {
-              if (event.classification === undefined)
-                return unusable({ type: "provider.error", message: event.message })
-              return Effect.fail(
-                new AIError({
-                  reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
-                }),
-              )
-            }
-
-            if (LLMEvent.is.textDelta(event)) {
-              return bus
-                .publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text })
-                .pipe(Effect.as({ ...streamed, text: streamed.text + event.text }))
-            }
-
-            if (LLMEvent.is.stepFinish(event)) {
-              return spend(context, SessionUsage.record(event.usage, context.model.cost)).pipe(
-                Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
-              )
-            }
-
-            if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
-            switch (event.reason.normalized) {
-              case "unknown":
-                return Effect.fail(
-                  new AIError({
-                    reason: new InvalidProviderOutputError({
-                      message: "The provider response ended with an unknown finish reason.",
-                      classification: "incomplete-stream",
+      return SessionModelOutcome.observe(
+        hooks,
+        { sessionID, agent: context.agent.id, model: context.model.ref, kind: "compaction" },
+        (observer) =>
+          llm.stream(request, options).pipe(
+            Stream.runFoldEffect(
+              (): Streamed => ({ text: "" }),
+              (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
+                observer.event(event)
+                if (LLMEvent.is.providerError(event)) {
+                  if (event.classification === undefined)
+                    return unusable({ type: "provider.error", message: event.message })
+                  return Effect.fail(
+                    new AIError({
+                      reason: new InvalidRequestError({ message: event.message, classification: event.classification }),
                     }),
-                  }),
-                )
-              case "error":
-                return Effect.fail(
-                  new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
-                )
-              case "length":
-                return unusable({
-                  type: "compaction.failed",
-                  message: "Compaction summary reached the output token limit",
-                })
-              case "content-filter":
-                return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
-              default:
-                return Effect.succeed(streamed)
-            }
-          },
-        ),
+                  )
+                }
+
+                if (LLMEvent.is.textDelta(event)) {
+                  return bus
+                    .publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text })
+                    .pipe(Effect.as({ ...streamed, text: streamed.text + event.text }))
+                }
+
+                if (LLMEvent.is.stepFinish(event)) {
+                  return spend(context, SessionUsage.record(event.usage, context.model.cost)).pipe(
+                    Effect.as({ ...streamed, providerState: event.providerMetadata?.[metadataKey] }),
+                  )
+                }
+
+                if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
+                switch (event.reason.normalized) {
+                  case "unknown":
+                    return Effect.fail(
+                      new AIError({
+                        reason: new InvalidProviderOutputError({
+                          message: "The provider response ended with an unknown finish reason.",
+                          classification: "incomplete-stream",
+                        }),
+                      }),
+                    )
+                  case "error":
+                    return Effect.fail(
+                      new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
+                    )
+                  case "length":
+                    return unusable({
+                      type: "compaction.failed",
+                      message: "Compaction summary reached the output token limit",
+                    })
+                  case "content-filter":
+                    return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
+                  default:
+                    return Effect.succeed(streamed)
+                }
+              },
+            ),
+          ),
       )
     }
 
@@ -653,10 +675,12 @@ export const layer = Layer.effect(
     const observe = (
       trigger: Trigger,
       status: PluginHooks.Domains["session"]["compaction.outcome"]["status"],
+      started: bigint,
       result?: Result,
     ) =>
       Effect.gen(function* () {
         if (!(yield* hooks.has("session", "compaction.outcome", trigger.context.model.ref.providerID))) return
+        const durationMs = Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000
         const context = trigger.context
         const unknown =
           context.messages.findLastIndex(SessionProviderContext.isCheckpoint) >
@@ -677,6 +701,7 @@ export const layer = Layer.effect(
             model: context.model.ref,
             trigger: trigger.reason,
             status,
+            durationMs,
             ...(!unknown ? { before: estimateContext(context) } : {}),
             ...(after !== undefined ? { after } : {}),
             ...(context.model.limit.context > 0 ? { limit: context.model.limit.context } : {}),
@@ -696,6 +721,7 @@ export const layer = Layer.effect(
     const publish = Effect.fnUntraced(function* (
       trigger: Trigger,
       outcome: Result | Failure,
+      started: bigint,
       source = trigger,
       settle?: () => void,
     ): Effect.fn.Return<Outcome> {
@@ -713,7 +739,7 @@ export const layer = Layer.effect(
           ...usage,
         })
         settle?.()
-        yield* observe(source, outcome.error.type === "compaction.interrupted" ? "interrupted" : "failed")
+        yield* observe(source, outcome.error.type === "compaction.interrupted" ? "interrupted" : "failed", started)
         return { status: "failed", error: outcome.error }
       }
 
@@ -732,7 +758,7 @@ export const layer = Layer.effect(
         { metadata: outcome.metadata },
       )
       settle?.()
-      yield* observe(source, "completed", outcome)
+      yield* observe(source, "completed", started, outcome)
       return { status: "completed" }
     })
 
@@ -741,19 +767,22 @@ export const layer = Layer.effect(
       reload: state.reload,
       // A manual compaction settles through its `/compact` inbox item, which the runner owns.
       compact: (trigger) =>
-        Effect.suspend(() => {
+        Effect.gen(function* () {
+          const started = yield* Clock.monotonicTimeNanos
           const state = { settled: false }
-          return compact(trigger, () => {
+          return yield* compact(trigger, started, () => {
             state.settled = true
           }).pipe(
             Effect.onInterrupt(() =>
               state.settled
                 ? Effect.void
                 : trigger.reason === "manual"
-                  ? observe(trigger, "interrupted")
-                  : publish(trigger, {
-                      error: { type: "compaction.interrupted", message: "Compaction was interrupted" },
-                    }),
+                  ? observe(trigger, "interrupted", started)
+                  : publish(
+                      trigger,
+                      { error: { type: "compaction.interrupted", message: "Compaction was interrupted" } },
+                      started,
+                    ),
             ),
             Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
           )

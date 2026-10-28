@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import type { SessionContext } from "@opencode/plugin/effect/session"
+import type { ToolProvenance } from "@opencode/plugin/effect/tool"
 import { Agent } from "@opencode/schema/agent"
 import { Event } from "@opencode/schema/event"
 import { Form } from "@opencode/schema/form"
@@ -13,6 +14,8 @@ import { Session } from "@opencode/schema/session"
 import { SessionEvent } from "@opencode/schema/session-event"
 import { SessionMessage } from "@opencode/schema/session-message"
 import { Skill } from "@opencode/schema/skill"
+import { Tool } from "@opencode/schema/tool"
+import { AbsolutePath } from "@opencode/schema/schema"
 import { Effect, Schema } from "effect"
 import type { ScopeHandle } from "nemo-relay-node"
 import { RelayHost } from "../src/host"
@@ -23,6 +26,12 @@ const sibling = Session.ID.make("ses_sibling")
 const assistantMessageID = SessionMessage.ID.make("msg_observe")
 const tokens = { input: 5, output: 3, reasoning: 1, cache: { read: 2, write: 0 } }
 const model = { providerID: Provider.ID.make("provider"), id: Model.ID.make("model") }
+const secretSkill = () => ({
+  id: Skill.ID.make("SECRET"),
+  name: Skill.Name.make("SECRET"),
+  path: AbsolutePath.make("/SECRET"),
+  content: "SECRET",
+})
 
 const published = <D extends Event.Definition>(
   definition: D & Schema.ConstraintDecoder<unknown, never>,
@@ -43,7 +52,7 @@ const makeFixture = (seen = new Set<string>()) => {
   const marks: Parameters<RelayHost.Runtime["mark"]>[] = []
   const opened: Parameters<RelayHost.Runtime["open"]>[] = []
   const closed: Parameters<RelayHost.Runtime["close"]>[] = []
-  const observer = RelayObserve.make({
+  const runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close"> = {
     admit: (id) => {
       if (seen.has(id)) return false
       seen.add(id)
@@ -55,8 +64,22 @@ const makeFixture = (seen = new Set<string>()) => {
     },
     mark: (...args) => marks.push(args),
     close: (...args) => closed.push(args),
-  })
-  return { observer, marks, opened, closed }
+  }
+  const observer = RelayObserve.make(runtime)
+  const capture = (id: string, provenance: ToolProvenance, target = sessionID) =>
+    Effect.runSync(
+      observer.toolExecution({
+        sessionID: target,
+        messageID: assistantMessageID,
+        id: Tool.CallID.make(id),
+        agent: Agent.ID.make("build"),
+        tool: "SECRET",
+        input: { SECRET: "SECRET" },
+        provenance,
+      }),
+    )
+  const send = (event: Parameters<typeof observer.event>[0]) => Effect.runSync(observer.event(event))
+  return { observer, capture, send, runtime, marks, opened, closed }
 }
 
 test("interleaved executions retain independent host timings and outcomes", () => {
@@ -90,6 +113,45 @@ test("interleaved executions retain independent host timings and outcomes", () =
     "opencode.observation.source": "host",
     "opencode.event_id": expect.any(String),
   })
+})
+
+test("run usage summaries are isolated observed step samples, not another billing counter", () => {
+  const fixture = makeFixture()
+  const first = published(
+    SessionEvent.Step.Ended,
+    { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0), tokens },
+    120,
+  )
+  for (const event of [
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(SessionEvent.Execution.Started, { sessionID: sibling }, 110),
+    first,
+    first,
+    published(
+      SessionEvent.Step.Ended,
+      {
+        sessionID: sibling,
+        assistantMessageID,
+        finish: "stop",
+        cost: Money.USD.make(0),
+        tokens: { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+      130,
+    ),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 140),
+    published(SessionEvent.Execution.Succeeded, { sessionID: sibling }, 150),
+    published(SessionEvent.Execution.Started, { sessionID }, 160),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 170),
+  ])
+    fixture.send(event)
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2]),
+  ).toMatchObject([
+    { accounting_source: "host_step", usage_sample_count: 1, input_tokens: 7, output_tokens: 4, cache_read_tokens: 2 },
+    { usage_sample_count: 1, input_tokens: 10, output_tokens: 0, cache_read_tokens: 0 },
+    expect.not.objectContaining({ usage_sample_count: expect.anything() }),
+  ])
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.usage.recorded")).toHaveLength(2)
 })
 
 test("step, retry, and compaction observations whitelist host data without duplicating provider accounting", () => {
@@ -247,6 +309,74 @@ test("shared event admission prevents a second Location observer reopening or cl
   expect(second.marks).toEqual([])
 })
 
+test("interleaved Location observers share run accounting and complete pending waits once", () => {
+  const fixture = makeFixture()
+  const second = RelayObserve.make(fixture.runtime)
+  const permission = Permission.ID.create()
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 110 },
+      120,
+    ),
+    published(Permission.Event.Asked, { sessionID, id: permission, action: "bash", resources: ["SECRET"] }, 130),
+  ].forEach((event) => {
+    fixture.send(event)
+    Effect.runSync(second.event(event))
+  })
+  ;[
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 150),
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 200),
+  ].forEach((event) => {
+    Effect.runSync(second.event(event))
+    fixture.send(event)
+  })
+
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2])).toEqual([
+    expect.objectContaining({ duration_ms: 100, step_count: 1, permission_wait_count: 1 }),
+  ])
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.permission.wait.completed").map((mark) => mark[2]),
+  ).toEqual([expect.objectContaining({ resolution: "cancelled", duration_ms: 70 })])
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")).toHaveLength(1)
+  expect(fixture.opened).toHaveLength(1)
+  expect(fixture.closed).toHaveLength(1)
+})
+
+test("Location turnover preserves child parentage and first-output state while the runtime remains active", () => {
+  const fixture = makeFixture()
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID }, 100),
+    published(
+      SessionEvent.Step.Started,
+      { sessionID, assistantMessageID, model, agent: Agent.ID.make("build"), started: 100 },
+      110,
+    ),
+    published(
+      SessionEvent.Forked,
+      { sessionID: sibling, parentID: sessionID, boundary: { type: "through", messageID: assistantMessageID } },
+      120,
+    ),
+  ].forEach(fixture.send)
+
+  // Only the surviving/new Location receives later events; the process runtime is unchanged.
+  const surviving = RelayObserve.make(fixture.runtime)
+  ;[
+    published(SessionEvent.Execution.Started, { sessionID: sibling }, 130),
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 140),
+    published(SessionEvent.Text.Delta, { sessionID, assistantMessageID, ordinal: 0, delta: "SECRET" }, 150),
+  ].forEach((event) => Effect.runSync(surviving.event(event)))
+
+  expect(fixture.opened).toEqual([
+    [sessionID, undefined, 100_000],
+    [sibling, sessionID, 130_000],
+  ])
+  expect(
+    fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output").map((mark) => mark[2]),
+  ).toEqual([expect.objectContaining({ duration_ms: 40, output_kind: "text" })])
+})
+
 test("skill requests and successful loads are distinct from user activation and never export skill content", () => {
   const fixture = makeFixture()
   ;[
@@ -268,7 +398,11 @@ test("skill requests and successful loads are distinct from user activation and 
     ),
     published(Skill.Event.Updated, {}, 140),
     published(McpEvent.StatusChanged, { server: "SECRET" }, 150),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach((event) => {
+    Effect.runSync(fixture.observer.event(event))
+    if (event.type === "session.tool.input.started")
+      fixture.capture("call1", { origin: "builtin", execution: "local", category: "skill" })
+  })
 
   expect(
     fixture.marks.filter((mark) => mark[1] !== "opencode.tool.completed").map((mark) => [mark[1], mark[2]]),
@@ -282,7 +416,9 @@ test("skill requests and successful loads are distinct from user activation and 
         category: "skill",
         outcome: "success",
         provider_executed: false,
-        execution: "unknown",
+        execution: "local",
+        tool_origin: "builtin",
+        approval: "unknown",
         result_family: "success",
       },
     ],
@@ -295,6 +431,7 @@ test("skill requests and successful loads are distinct from user activation and 
 
 test("provider tools and concurrent host tools get distinct nonadditive host summaries", () => {
   const fixture = makeFixture()
+  fixture.capture("shared", { origin: "builtin", execution: "local", category: "terminal" }, sibling)
   ;[
     published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "shared", name: "websearch" }, 100),
     published(
@@ -326,10 +463,12 @@ test("provider tools and concurrent host tools get distinct nonadditive host sum
       "opencode.tool.completed",
       {
         count: 1,
-        category: "web",
+        category: "unknown",
         outcome: "success",
         provider_executed: true,
         execution: "provider",
+        tool_origin: "unknown",
+        approval: "unknown",
         result_family: "success",
       },
     ],
@@ -341,7 +480,9 @@ test("provider tools and concurrent host tools get distinct nonadditive host sum
         category: "terminal",
         outcome: "cancelled",
         provider_executed: false,
-        execution: "unknown",
+        execution: "local",
+        tool_origin: "builtin",
+        approval: "unknown",
         result_family: "cancelled",
         error_type: "aborted",
       },
@@ -352,10 +493,21 @@ test("provider tools and concurrent host tools get distinct nonadditive host sum
 
 test("V2 subagent tool calls and their permissions are classified as delegation", () => {
   const fixture = makeFixture()
+  fixture.capture("call", { origin: "builtin", execution: "local", category: "delegation" })
   const permission = Permission.ID.create()
   ;[
     published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "call", name: "subagent" }, 100),
-    published(Permission.Event.Asked, { sessionID, id: permission, action: "subagent", resources: ["SECRET"] }, 110),
+    published(
+      Permission.Event.Asked,
+      {
+        sessionID,
+        id: permission,
+        action: "subagent",
+        resources: ["SECRET"],
+        source: { type: "tool", messageID: assistantMessageID, id: "call" },
+      },
+      110,
+    ),
     published(Permission.Event.Replied, { sessionID, requestID: permission, reply: "once" }, 120),
     published(
       SessionEvent.Tool.Success,
@@ -372,7 +524,9 @@ test("V2 subagent tool calls and their permissions are classified as delegation"
       category: "delegation",
       outcome: "success",
       provider_executed: false,
-      execution: "unknown",
+      execution: "local",
+      tool_origin: "builtin",
+      approval: "allowed_after_ask",
       result_family: "success",
     },
   ])
@@ -570,6 +724,7 @@ test("source observations preserve missing native estimates and finalized retry/
       ...identity,
       trigger: "overflow",
       status: "completed",
+      durationMs: 125,
       before: 800,
       after: 200,
       sourceEstimatedTokens: 700,
@@ -609,6 +764,7 @@ test("source observations preserve missing native estimates and finalized retry/
   expect(fixture.marks[1][2]).toMatchObject({
     trigger: "overflow",
     compaction_status: "completed",
+    duration_ms: 125,
     before_tokens: 800,
     after_tokens: 200,
     retained_ratio: 0.25,
@@ -619,6 +775,7 @@ test("source observations preserve missing native estimates and finalized retry/
   expect(fixture.marks[2][2]).not.toHaveProperty("before_tokens")
   expect(fixture.marks[2][2]).not.toHaveProperty("after_tokens")
   expect(fixture.marks[2][2]).not.toHaveProperty("retained_ratio")
+  expect(fixture.marks[2][2]).not.toHaveProperty("duration_ms")
   expect(fixture.marks[3][2]).toMatchObject({
     call_role: "compaction",
     will_retry: true,
@@ -645,6 +802,7 @@ test("tool execution durations exclude input streaming and terminal families nev
   ] as const
   cases.forEach(([metadata, result], index) => {
     const id = String(index)
+    fixture.capture(id, { origin: "builtin", execution: "local", category: "terminal" })
     ;[
       published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id, name: "shell" }, 100),
       published(
@@ -737,7 +895,7 @@ test("run operation mix counts logical boundaries, not retries as extra steps, a
   )
   run(published(SessionEvent.Execution.Succeeded, { sessionID }, 200))
   expect(fixture.marks.find((mark) => mark[1] === "opencode.tool.completed")?.[2]).toMatchObject({
-    result_family: "blocked",
+    result_family: "cancelled",
     outcome: "cancelled",
   })
   expect(fixture.marks.find((mark) => mark[1] === "opencode.agent.run.completed")?.[2]).toMatchObject({
@@ -747,5 +905,464 @@ test("run operation mix counts logical boundaries, not retries as extra steps, a
     retry_count: 1,
     compaction_count: 1,
   })
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("source model outcomes cover auxiliary calls without duplicating logical steps or billing", () => {
+  const fixture = makeFixture()
+  ;(["primary", "title", "compaction", "generate"] as const).forEach((kind) =>
+    Effect.runSync(
+      fixture.observer.modelOutcome({
+        sessionID,
+        agent: Agent.ID.make("SECRET"),
+        model,
+        kind,
+        status: "completed",
+        durationMs: 25,
+        finishReason: "stop",
+        ...(kind === "compaction" ? { firstOutputMs: 10, firstOutputKind: "reasoning" as const } : {}),
+        ...(kind === "title" ? {} : { responseModel: "nvidia/nemotron-SECRET" }),
+      }),
+    ),
+  )
+  expect(fixture.marks).toHaveLength(4)
+  expect(fixture.marks.every((mark) => mark[1] === "opencode.llm.host_call.completed")).toBe(true)
+  expect(fixture.marks[0][2]).toMatchObject({
+    count: 1,
+    call_role: "primary",
+    outcome: "success",
+    duration_ms: 25,
+    finish: "stop",
+    response_model_family: "nemotron",
+  })
+  expect(fixture.marks[1][2]).not.toHaveProperty("response_model_family")
+  expect(fixture.marks[1][2]).not.toHaveProperty("first_output_ms")
+  expect(fixture.marks[2][2]).toMatchObject({ first_output_ms: 10, output_kind: "reasoning" })
+  expect(fixture.marks.map((mark) => mark[0])).toEqual([sessionID, undefined, undefined, undefined])
+  expect(JSON.stringify(fixture.marks)).not.toMatch(/SECRET|tokens|cost_usd/)
+})
+
+test("auxiliary summaries preserve metrics without borrowing a concurrent execution's parent", () => {
+  const fixture = makeFixture()
+  const identity = { sessionID, agent: Agent.ID.make("build"), model }
+  fixture.send(published(SessionEvent.Execution.Started, { sessionID }, 100))
+  fixture.marks.length = 0
+  Effect.runSync(fixture.observer.context({ ...identity, messages: [], system: [], options: {} }, "generate"))
+  Effect.runSync(fixture.observer.contextUsage({ ...identity, kind: "generate", measured: 60, estimated: 20 }))
+  Effect.runSync(
+    fixture.observer.retryDecision({
+      ...identity,
+      kind: "generate",
+      error: { type: "provider.rate-limit", message: "SECRET" },
+      attempt: 1,
+      retryable: true,
+      decision: { retry: false },
+      source: "policy",
+      reason: "exhausted",
+    }),
+  )
+  Effect.runSync(fixture.observer.compactionOutcome({ ...identity, trigger: "manual", status: "completed" }))
+  Effect.runSync(
+    fixture.observer.usage({
+      ...identity,
+      source: "generate",
+      tokens,
+      cost: Money.USD.make(0.01),
+      costSource: "host_calculated",
+    }),
+  )
+  Effect.runSync(fixture.observer.modelOutcome({ ...identity, kind: "generate", status: "completed", durationMs: 25 }))
+  expect(fixture.marks.map((mark) => mark[1])).toEqual([
+    "opencode.context.prepared",
+    "opencode.context.usage",
+    "opencode.llm.retry.decision",
+    "opencode.compaction.outcome",
+    "opencode.llm.usage.recorded",
+    "opencode.llm.host_call.completed",
+  ])
+  expect(fixture.marks.every((mark) => mark[0] === undefined)).toBe(true)
+  expect(
+    fixture.marks.every(
+      (mark) => (mark[3] as Record<string, unknown>)["opencode.execution.attribution"] === "unavailable",
+    ),
+  ).toBe(true)
+  expect(fixture.marks[4][2]).toMatchObject({ tokens, cost_usd: 0.01, call_role: "generate" })
+  expect(fixture.marks[5][2]).toMatchObject({ count: 1, duration_ms: 25, outcome: "success", call_role: "generate" })
+  Effect.runSync(fixture.observer.modelOutcome({ ...identity, kind: "primary", status: "completed", durationMs: 50 }))
+  expect(fixture.marks.at(-1)?.[0]).toBe(sessionID)
+  expect(fixture.marks.at(-1)?.[3]).not.toHaveProperty("opencode.execution.attribution")
+})
+
+test("skill loads compare only successful, privately retained session snapshots", () => {
+  const fixture = makeFixture()
+  const skill = secretSkill()
+  const load = (target: Session.ID, status: "completed" | "failed", content = skill.content) =>
+    Effect.runSync(
+      fixture.observer.skillLoad({
+        sessionID: target,
+        channel: "tool",
+        status,
+        sourceKind: "directory",
+        skill: { ...skill, content },
+      }),
+    )
+  load(sessionID, "completed")
+  load(sibling, "completed", "SECRET_SIBLING")
+  load(sessionID, "failed", "SECRET_CHANGED")
+  load(sessionID, "completed")
+  load(sessionID, "completed", "SECRET_CHANGED")
+  expect(fixture.marks.map((mark) => mark[2])).toEqual([
+    expect.not.objectContaining({ repeat_load: true }),
+    expect.not.objectContaining({ repeat_load: true }),
+    expect.not.objectContaining({ repeat_load: true }),
+    expect.objectContaining({ repeat_load: true, content_changed: false, comparison_window: "session_memory" }),
+    expect.objectContaining({ repeat_load: true, content_changed: true }),
+  ])
+  fixture.send(published(SessionEvent.Deleted, { sessionID }, 100))
+  load(sessionID, "completed")
+  expect(fixture.marks.at(-1)?.[2]).not.toHaveProperty("repeat_load")
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test.each(["skills", "sessions"])("skill comparison evicts old %s without claiming first-ever use", (dimension) => {
+  const fixture = makeFixture()
+  const load = (index: number) =>
+    Effect.runSync(
+      fixture.observer.skillLoad({
+        sessionID: dimension === "sessions" ? Session.ID.make(`ses_${index}`) : sessionID,
+        channel: "user_activation",
+        status: "completed",
+        sourceKind: "unknown",
+        skill: { ...secretSkill(), id: Skill.ID.make(dimension === "skills" ? String(index) : "skill") },
+      }),
+    )
+  const capacity = dimension === "sessions" ? 256 : 64
+  for (let index = 0; index <= capacity; index++) load(index)
+  load(0)
+  expect(fixture.marks.at(-1)?.[2]).not.toHaveProperty("repeat_load")
+  expect(fixture.marks.at(-1)?.[2]).not.toHaveProperty("content_changed")
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("catalog changes export effective transitions without skill identities or contents", () => {
+  const fixture = makeFixture()
+  Effect.runSync(
+    fixture.observer.skillCatalog({
+      changes: [
+        {
+          action: "added",
+          sourceKind: "directory",
+          contentChanged: false,
+          skill: secretSkill(),
+        },
+        {
+          action: "updated",
+          sourceKind: "embedded",
+          previousSourceKind: "directory",
+          contentChanged: true,
+          skill: secretSkill(),
+        },
+      ],
+    }),
+  )
+  expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
+    [
+      undefined,
+      "opencode.skill.catalog.changed",
+      { count: 1, catalog_action: "added", source_kind: "directory", content_changed: false },
+    ],
+    [
+      undefined,
+      "opencode.skill.catalog.changed",
+      {
+        count: 1,
+        catalog_action: "updated",
+        source_kind: "embedded",
+        previous_source_kind: "directory",
+        content_changed: true,
+      },
+    ],
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("final tool results expose reported truncation, timeout and builtin delegation without private metadata", () => {
+  const fixture = makeFixture()
+  const cases: {
+    id: string
+    category: ToolProvenance["category"]
+    metadata: Event.Data<typeof SessionEvent.Tool.Success>["metadata"]
+  }[] = [
+    { id: "terminal", category: "terminal" as const, metadata: { timeout: true, truncated: true, SECRET: "SECRET" } },
+    {
+      id: "delegate",
+      category: "delegation" as const,
+      metadata: {
+        delegation: { kind: "continued", requestedMode: "foreground", returnMode: "background" },
+        sessionID: "SECRET",
+      },
+    },
+    {
+      id: "other",
+      category: "extension" as const,
+      metadata: { delegation: { kind: "new", requestedMode: "background", returnMode: "background" } },
+    },
+  ]
+  cases.forEach((item) => {
+    fixture.capture(item.id, { origin: "builtin", execution: "local", category: item.category })
+    fixture.send(
+      published(
+        SessionEvent.Tool.Success,
+        {
+          sessionID,
+          assistantMessageID,
+          id: item.id,
+          executed: false,
+          metadata: item.metadata,
+          content: [{ type: "text", text: "SECRET" }],
+        },
+        100,
+      ),
+    )
+  })
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
+    { result_family: "timeout", output_truncated: true },
+    { delegation_kind: "continued", requested_mode: "foreground", return_mode: "background" },
+    expect.not.objectContaining({ delegation_kind: "new" }),
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+const unrelatedMetadata: NonNullable<Event.Data<typeof SessionEvent.Tool.Success>["metadata"]>[] = [
+  { exit: 1, truncated: "yes" },
+  { exit: 1, delegation: { kind: "SECRET" } },
+]
+test.each(unrelatedMetadata)("unrelated metadata cannot erase terminal exit facts %#", (metadata) => {
+  const fixture = makeFixture()
+  fixture.capture("terminal", { origin: "builtin", execution: "local", category: "terminal" })
+  fixture.send(
+    published(
+      SessionEvent.Tool.Success,
+      {
+        sessionID,
+        assistantMessageID,
+        id: "terminal",
+        executed: false,
+        content: [{ type: "text", text: "done" }],
+        metadata,
+      },
+      100,
+    ),
+  )
+  expect(fixture.marks[0]?.[2]).toMatchObject({ result_family: "nonzero_exit" })
+  expect(fixture.marks[0]?.[2]).not.toHaveProperty("output_truncated")
+})
+
+test("MCP recovery keeps reconnect and retry states separate without guessing execution ownership", () => {
+  const fixture = makeFixture()
+  for (const phase of ["reconnect", "retry"] as const) {
+    Effect.runSync(
+      fixture.observer.mcpRecovery({
+        operation: "tool",
+        sessionID,
+        reason: "session_expired",
+        phase,
+        outcome: "started",
+      }),
+    )
+    Effect.runSync(
+      fixture.observer.mcpRecovery({
+        operation: "tool",
+        sessionID,
+        reason: "session_expired",
+        phase,
+        outcome: phase === "reconnect" ? "succeeded" : "interrupted",
+        durationMs: 12,
+      }),
+    )
+  }
+  expect(fixture.marks.map((mark) => mark[1])).toEqual([
+    "opencode.mcp.recovery.started",
+    "opencode.mcp.recovery.completed",
+    "opencode.mcp.recovery.started",
+    "opencode.mcp.recovery.completed",
+  ])
+  expect(fixture.marks.map((mark) => mark[0])).toEqual([undefined, undefined, undefined, undefined])
+  expect(fixture.marks[3]?.[2]).toMatchObject({
+    mcp_operation: "tool",
+    recovery_phase: "retry",
+    outcome: "cancelled",
+    duration_ms: 12,
+  })
+})
+
+test("host provenance survives delayed bus events and nested CodeMode entries without guessing tool names", () => {
+  const fixture = makeFixture()
+  fixture.capture("call", { origin: "builtin", execution: "local", category: "code_execution" })
+  fixture.capture("call", { origin: "mcp", execution: "mcp", category: "extension" })
+  fixture.capture("mcp", { origin: "mcp", execution: "mcp", category: "extension" })
+  ;["call", "mcp", "unobserved"].forEach((id) => {
+    fixture.send(published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id, name: "bash" }, 100))
+    fixture.send(
+      published(
+        SessionEvent.Tool.Success,
+        { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
+        200,
+      ),
+    )
+  })
+  expect(fixture.marks.map((mark) => mark[2])).toMatchObject([
+    { category: "code_execution", tool_origin: "builtin", execution: "local" },
+    { category: "extension", tool_origin: "mcp", execution: "mcp" },
+    { category: "unknown", tool_origin: "unknown", execution: "unknown" },
+  ])
+})
+
+test("an older queued run terminal cannot erase a subsequent run's captured tool provenance", () => {
+  const fixture = makeFixture()
+  fixture.send(published(SessionEvent.Execution.Started, { sessionID }, 100))
+  fixture.capture("next", { origin: "mcp", execution: "mcp", category: "extension" })
+  ;[
+    published(SessionEvent.Execution.Succeeded, { sessionID }, 150),
+    published(SessionEvent.Execution.Started, { sessionID }, 160),
+    published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id: "next", name: "bash" }, 170),
+    published(
+      SessionEvent.Tool.Success,
+      { sessionID, assistantMessageID, id: "next", executed: false, content: [{ type: "text", text: "SECRET" }] },
+      180,
+    ),
+  ].forEach(fixture.send)
+  expect(fixture.marks.find((mark) => mark[1] === "opencode.tool.completed")?.[2]).toMatchObject({
+    tool_origin: "mcp",
+    execution: "mcp",
+    category: "extension",
+  })
+})
+
+test("permission facts attach only to the matching call and denial remains sticky", () => {
+  const fixture = makeFixture()
+  ;["one", "two"].forEach((id) => fixture.capture(id, { origin: "plugin", execution: "local", category: "extension" }))
+  ;(["deny", "allow"] as const).forEach((effect) =>
+    Effect.runSync(
+      fixture.observer.permissionDecision({
+        sessionID,
+        action: "bash",
+        resources: ["SECRET"],
+        effect,
+        origin: "rules",
+        source: { type: "tool", messageID: assistantMessageID, id: "one" },
+      }),
+    ),
+  )
+  ;["one", "two"].forEach((id) =>
+    fixture.send(
+      published(
+        SessionEvent.Tool.Failed,
+        {
+          sessionID,
+          assistantMessageID,
+          id,
+          executed: false,
+          error: { type: "aborted", message: "SECRET" },
+        },
+        200,
+      ),
+    ),
+  )
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
+    { approval: "denied", result_family: "cancelled", outcome: "cancelled" },
+    { approval: "unknown", result_family: "cancelled", outcome: "cancelled" },
+  ])
+  expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
+})
+
+test("cleanup rejection never claims a user actor or gets erased by a parallel allowed ask", () => {
+  const fixture = makeFixture()
+  fixture.capture("call", { origin: "plugin", execution: "local", category: "extension" })
+  const requests = [Permission.ID.create(), Permission.ID.create()]
+  requests.forEach((id) =>
+    fixture.send(
+      published(
+        Permission.Event.Asked,
+        {
+          sessionID,
+          id,
+          action: "bash",
+          resources: ["SECRET"],
+          source: { type: "tool", messageID: assistantMessageID, id: "call" },
+        },
+        100,
+      ),
+    ),
+  )
+  requests.forEach((requestID, index) =>
+    fixture.send(
+      published(
+        Permission.Event.Replied,
+        {
+          sessionID,
+          requestID,
+          reply: index === 0 ? "reject" : "once",
+        },
+        110,
+      ),
+    ),
+  )
+  fixture.send(
+    published(
+      SessionEvent.Tool.Failed,
+      {
+        sessionID,
+        assistantMessageID,
+        id: "call",
+        executed: false,
+        error: { type: "aborted", message: "SECRET" },
+      },
+      120,
+    ),
+  )
+  expect(fixture.marks.at(-1)?.[2]).toMatchObject({ approval: "rejected", result_family: "cancelled" })
+  expect(JSON.stringify(fixture.marks)).not.toMatch(/SECRET|user_rejected/)
+})
+
+test("denied nested gates do not misclassify a recovered success or unrelated terminal failure", () => {
+  const fixture = makeFixture()
+  ;["success", "failure", "blocked"].forEach((id) => {
+    fixture.capture(id, { origin: "builtin", execution: "local", category: "code_execution" })
+    Effect.runSync(
+      fixture.observer.permissionDecision({
+        sessionID,
+        action: "read",
+        resources: ["SECRET"],
+        effect: "deny",
+        origin: "rules",
+        source: { type: "tool", messageID: assistantMessageID, id },
+      }),
+    )
+    fixture.send(
+      id === "success"
+        ? published(
+            SessionEvent.Tool.Success,
+            { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
+            100,
+          )
+        : published(
+            SessionEvent.Tool.Failed,
+            {
+              sessionID,
+              assistantMessageID,
+              id,
+              executed: false,
+              error: { type: id === "blocked" ? "permission.rejected" : "tool.execution", message: "SECRET" },
+            },
+            100,
+          ),
+    )
+  })
+  expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([
+    { approval: "denied", result_family: "success", outcome: "success" },
+    { approval: "denied", result_family: "error", outcome: "failed" },
+    { approval: "denied", result_family: "blocked", outcome: "failed" },
+  ])
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
 })

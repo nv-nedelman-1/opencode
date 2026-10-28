@@ -28,7 +28,8 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
 import { Shell } from "@opencode/schema/shell"
-import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Clock, DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { TestClock } from "effect/testing"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -67,6 +68,7 @@ const client = Layer.mock(LLMClient.Service)({
       }),
       LLMEvent.finish({
         reason: { normalized: "stop" },
+        responseModel: "summary-accepted",
       }),
     )
   },
@@ -421,6 +423,11 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     let hooked = 0
     const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
     const usage: PluginHooks.Domains["session"]["usage"][] = []
+    const modelOutcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      modelOutcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "compaction.outcome", (event) =>
       Effect.sync(() => {
         observed.push(event)
@@ -480,6 +487,15 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       retainedEstimatedTokens: 0,
     })
     expect(observed[0]?.before).toBeGreaterThan(0)
+    expect(modelOutcomes).toHaveLength(1)
+    expect(modelOutcomes[0]).toMatchObject({
+      kind: "compaction",
+      status: "completed",
+      responseModel: "summary-accepted",
+      sessionID,
+    })
+    expect(modelOutcomes[0]).not.toHaveProperty("tokens")
+    expect(modelOutcomes[0]).not.toHaveProperty("cost")
     expect(observed[0]?.after).toBeGreaterThan(0)
     expect(observed[0]?.sourceEstimatedTokens).toBeGreaterThan(0)
     expect(requests[0]?.promptCacheKey).toBe(parentID)
@@ -549,6 +565,11 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
       },
     ]
     let contexts = 0
+    const modelOutcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
+    yield* hooks.observe("session", "model.outcome", (event) => {
+      modelOutcomes.push(event)
+      return undefined
+    })
     yield* hooks.register("session", "context", () => Effect.sync(() => contexts++))
     yield* hooks.register("session", "compaction", (event) =>
       Effect.sync(() => {
@@ -565,6 +586,7 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
 
     expect(contexts).toBe(0)
     expect(requests).toEqual([])
+    expect(modelOutcomes).toEqual([])
     expect(yield* store.context(sessionID)).toMatchObject([
       { type: "compaction", reason: "manual", summary: "## Objective\n- hooked summary", recent: "" },
     ])
@@ -589,11 +611,11 @@ it.effect("cancelling a slow terminal observer does not change an already comple
     const hooks = yield* PluginHooks.Service
     const compaction = yield* SessionCompaction.Service
     const db = (yield* Database.Service).db
-    const observed: string[] = []
+    const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
     const completed = yield* Deferred.make<void>()
     yield* hooks.register("session", "compaction.outcome", (event) =>
       Effect.sync(() => {
-        observed.push(event.status)
+        observed.push(event)
       }).pipe(
         Effect.andThen(
           event.status === "completed"
@@ -616,8 +638,10 @@ it.effect("cancelling a slow terminal observer does not change an already comple
       })
       .pipe(Effect.forkScoped)
     yield* Deferred.await(completed)
+    yield* TestClock.adjust("50 millis")
     yield* Fiber.interrupt(pending)
-    expect(observed).toEqual(["completed"])
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).toMatchObject({ status: "completed", durationMs: 0 })
     const terminal = yield* db
       .select({ type: EventTable.type })
       .from(EventTable)
@@ -630,6 +654,83 @@ it.effect("cancelling a slow terminal observer does not change an already comple
     expect(
       terminal.filter((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Ended.type, 1)),
     ).toHaveLength(1)
+  }),
+)
+
+it.effect("compaction outcomes measure monotonic time through settlement despite wall-clock corrections", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    const hooks = yield* PluginHooks.Service
+    const clock = yield* Clock.Clock
+    let wallTime = clock.currentTimeMillisUnsafe()
+    const shifted = {
+      ...clock,
+      currentTimeMillisUnsafe: () => wallTime,
+      currentTimeMillis: Effect.sync(() => wallTime),
+    }
+    const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+    yield* hooks.register("session", "compaction.outcome", (event) =>
+      Effect.sync(() => {
+        expect(Object.isFrozen(event)).toBe(true)
+        observed.push(event)
+      }),
+    )
+    const cases = [
+      { status: "completed", reason: "overflow" },
+      { status: "failed", reason: "overflow" },
+      { status: "interrupted", reason: "overflow" },
+      { status: "interrupted", reason: "manual" },
+      { status: "skipped", reason: "auto" },
+    ] as const
+    for (const [index, item] of cases.entries()) {
+      const session = yield* insertSession(Session.ID.make(`ses_compaction_duration_${index}`))
+      const messages = [
+        SessionMessage.User.make({
+          id: SessionMessage.ID.create(),
+          type: "user",
+          text: "Summarize this conversation",
+          time: { created: DateTime.makeUnsafe(0) },
+        }),
+      ]
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const registration = yield* hooks.register("session", "compaction", () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          yield* Deferred.await(release)
+        }),
+      )
+      const context = loaded(session, messages)
+      const pending = yield* (
+        item.reason === "manual"
+          ? compactManually(session, messages)
+          : compaction.compact({
+              reason: item.reason,
+              context:
+                item.status === "failed"
+                  ? { ...context, model: { ...context.model, compaction: { type: "native" } } }
+                  : context,
+            })
+      ).pipe(Effect.provideService(Clock.Clock, shifted), Effect.forkScoped)
+      if (item.status !== "skipped") {
+        yield* Deferred.await(entered)
+        wallTime += 60_000
+        yield* TestClock.adjust("125 millis")
+      }
+      if (item.status === "interrupted") yield* Fiber.interrupt(pending)
+      else {
+        yield* Deferred.succeed(release, undefined)
+        expect((yield* Fiber.join(pending)).status).toBe(item.status)
+      }
+      yield* registration.dispose
+      expect(observed).toHaveLength(index + 1)
+      expect(observed[index]).toMatchObject({
+        sessionID: session.id,
+        trigger: item.reason,
+        status: item.status,
+        durationMs: item.status === "skipped" ? 0 : 125,
+      })
+    }
   }),
 )
 

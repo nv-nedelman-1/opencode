@@ -27,9 +27,11 @@ import { Environment } from "@opencode/core/environment/index"
 import { EnvironmentUnavailable } from "@opencode/core/environment/unavailable"
 import { Location } from "@opencode/core/location"
 import { Mcp } from "@opencode/core/mcp/index"
+import type { MCPRecovery } from "@opencode/plugin/effect/mcp"
 import { McpClient } from "@opencode/core/mcp/client"
 import { McpStdio } from "@opencode/core/mcp/stdio"
 import { Permission } from "@opencode/core/permission"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { State } from "@opencode/core/state"
@@ -296,6 +298,7 @@ function resourceMcpLayer(
   ).pipe(
     Layer.provideMerge(Mcp.layer(options)),
     Layer.provideMerge(Form.layer),
+    Layer.provideMerge(AppNodeBuilder.build(PluginHooks.node)),
     Layer.provide(
       Layer.mergeAll(
         overrides?.managed ? Layer.succeed(ManagedPolicy.Service, overrides.managed) : ManagedPolicy.layer,
@@ -508,7 +511,7 @@ const permissions = Layer.mock(Permission.Service, {
 })
 const events = Layer.mock(Bus.Service, { subscribe: () => Stream.never })
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
+  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, PluginHooks.node]), [
     Mcp.node.replace(mcp),
     Permission.node.replace(permissions),
     Bus.node.replace(events),
@@ -1117,33 +1120,156 @@ for (const status of [400, 404]) {
   )
 }
 
-test("reconnects and retries a tool call after the MCP session expires", async () => {
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const server = yield* resourceServer()
-        yield* Effect.gen(function* () {
-          const service = yield* Mcp.Service
-          yield* service.callTool({ server: "resources", name: "echo", args: { n: 1 } })
-          expect(server.state.toolCalls).toHaveLength(1)
-          expect(server.state.initializations).toBe(1)
+for (const operation of ["tool", "resource", "prompt"] as const)
+  test(`observes actual MCP ${operation} recovery without counting ordinary requests`, async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* resourceServer()
+          yield* Effect.gen(function* () {
+            const service = yield* Mcp.Service
+            const hooks = yield* PluginHooks.Service
+            const observed: MCPRecovery[] = []
+            const sessionID = Session.ID.make("ses_mcp_recovery")
+            yield* hooks.observe("mcp", "recovery", (event) => {
+              observed.push(event)
+              return undefined
+            })
+            const run = () =>
+              operation === "tool"
+                ? service.callTool({
+                    server: "resources",
+                    name: "echo",
+                    sessionID,
+                  })
+                : operation === "resource"
+                  ? service.readResource({ server: "resources", uri: "docs://readme" })
+                  : service.prompt({ server: "resources", name: "greet" })
+            yield* run()
+            expect(observed).toEqual([])
+            expect(server.state.initializations).toBe(1)
+            yield* service.prompts().pipe(
+              Effect.filterOrFail(
+                (prompts) => prompts.length > 0,
+                () => new Error("initial prompt catalog pending"),
+              ),
+              Effect.retry({ times: 100, schedule: Schedule.spaced("1 millis") }),
+            )
 
-          // The restarted server does not know the client's session, so the next request 404s.
-          yield* Effect.promise(server.restart)
-          const result = yield* service.callTool({ server: "resources", name: "echo", args: { n: 2 } })
+            // The restarted server does not know the client's session, so the next request 404s.
+            yield* Effect.promise(server.restart)
+            yield* run()
+            expect(observed.map((event) => [event.phase, event.outcome])).toEqual([
+              ["reconnect", "started"],
+              ["reconnect", "succeeded"],
+              ["retry", "started"],
+              ["retry", "succeeded"],
+            ])
+            expect(observed.every((event) => Object.isFrozen(event))).toBe(true)
+            expect(observed.filter((event) => event.phase === "retry")).toEqual([
+              {
+                operation,
+                reason: "session_expired",
+                phase: "retry",
+                outcome: "started",
+                ...(operation === "tool" ? { sessionID } : {}),
+              },
+              {
+                operation,
+                reason: "session_expired",
+                phase: "retry",
+                outcome: "succeeded",
+                durationMs: expect.any(Number),
+                ...(operation === "tool" ? { sessionID } : {}),
+              },
+            ])
+            expect(server.state.initializations).toBe(2)
+            expect(server.state.sessions).toHaveLength(2)
+            expect((yield* service.servers()).find((entry) => entry.name === "resources")?.status).toEqual({
+              status: "connected",
+            })
+          }).pipe(Effect.provide(resourceMcpLayer(server.url)))
+        }),
+      ),
+    )
+  })
 
-          expect(result.isError).toBe(false)
-          expect(server.state.toolCalls.map((call) => call.arguments)).toEqual([{ n: 1 }, { n: 2 }])
-          expect(server.state.initializations).toBe(2)
-          expect(server.state.sessions).toHaveLength(2)
-          expect((yield* service.servers()).find((entry) => entry.name === "resources")?.status).toEqual({
-            status: "connected",
+for (const mode of ["ordinary_error", "retry_error", "retry_interrupted", "reconnect_error"] as const)
+  test(`MCP recovery observations distinguish ${mode}`, async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const blocked = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          let failing = false
+          let generation = 0
+          const server = yield* resourceServer({
+            respond: async (request) => {
+              if (request.method !== "POST") return
+              const body: unknown = await request.clone().json()
+              if (typeof body !== "object" || body === null || !("method" in body) || !("id" in body)) return
+              if (body.method === "initialize") generation++
+              if (!failing) return
+              if (body.method === "tools/call" && mode === "retry_interrupted" && generation > 1) {
+                await Effect.runPromise(
+                  Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release))),
+                )
+                return
+              }
+              if (
+                (body.method === "tools/call" &&
+                  (mode === "ordinary_error" || (mode === "retry_error" && generation > 1))) ||
+                (body.method === "initialize" && mode === "reconnect_error")
+              )
+                return Response.json({
+                  jsonrpc: "2.0",
+                  id: body.id,
+                  error: { code: -32603, message: "fixture failure" },
+                })
+            },
           })
-        }).pipe(Effect.provide(resourceMcpLayer(server.url)))
-      }),
-    ),
-  )
-})
+          yield* Effect.gen(function* () {
+            const service = yield* Mcp.Service
+            const hooks = yield* PluginHooks.Service
+            const observed: MCPRecovery[] = []
+            yield* hooks.observe("mcp", "recovery", (event) => {
+              observed.push(event)
+              return undefined
+            })
+            const run = service.callTool({ server: "resources", name: "echo" })
+            yield* run
+            yield* service.prompts().pipe(
+              Effect.filterOrFail(
+                (prompts) => prompts.length > 0,
+                () => new Error("initial prompt catalog pending"),
+              ),
+              Effect.retry({ times: 100, schedule: Schedule.spaced("1 millis") }),
+            )
+            failing = true
+            if (mode !== "ordinary_error") yield* Effect.promise(server.restart)
+            if (mode === "retry_interrupted") {
+              const pending = yield* run.pipe(Effect.forkScoped({ startImmediately: true }))
+              yield* Deferred.await(blocked)
+              yield* Fiber.interrupt(pending)
+            } else {
+              expect(Exit.isFailure(yield* run.pipe(Effect.exit))).toBe(true)
+            }
+            expect(observed.map((event) => event.phase + ":" + event.outcome)).toEqual(
+              mode === "ordinary_error"
+                ? []
+                : [
+                    "reconnect:started",
+                    "reconnect:" + (mode === "reconnect_error" ? "failed" : "succeeded"),
+                    ...(mode === "reconnect_error"
+                      ? []
+                      : ["retry:started", "retry:" + (mode === "retry_interrupted" ? "interrupted" : "failed")]),
+                  ],
+            )
+          }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)), Effect.provide(resourceMcpLayer(server.url)))
+        }),
+      ),
+    )
+  })
 
 describe.each([
   ["legacy", undefined],
@@ -2012,6 +2138,7 @@ const shutdownIt = testEffect(
       Form.node,
       Environment.node,
       Location.node,
+      PluginHooks.node,
     ]),
     [
       Location.node.replace(
@@ -2346,6 +2473,12 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
     invocations = []
     const registry = yield* Tool.Service
     const registration = yield* McpTool.Service
+    const hooks = yield* PluginHooks.Service
+    const provenance: unknown[] = []
+    yield* hooks.use("tool", "execute", (event, next) => {
+      provenance.push({ tool: event.tool, provenance: event.provenance })
+      return next(event.input)
+    })
     yield* registration.flush
     const toolSet = yield* registry.snapshot()
 
@@ -2386,6 +2519,11 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
       args: {},
       sessionID: codeModeSessionID,
     })
+    expect(provenance).toEqual([
+      { tool: "direct_lookup", provenance: { origin: "mcp", execution: "mcp", category: "extension" } },
+      { tool: "execute", provenance: { origin: "builtin", execution: "local", category: "code_execution" } },
+      { tool: "demo_search", provenance: { origin: "mcp", execution: "mcp", category: "extension" } },
+    ])
   }),
 )
 

@@ -1,5 +1,5 @@
 import type { SessionApi } from "@opencode/client/effect/api"
-import type { GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
+import type { FinishReason, GenerationOptionsFields, Message, SystemPart } from "@opencode/ai"
 import type { Agent } from "@opencode/schema/agent"
 import type { Model } from "@opencode/schema/model"
 import type { Money } from "@opencode/schema/money"
@@ -10,7 +10,7 @@ import type { SessionError } from "@opencode/schema/session-error"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import type { TokenUsage } from "@opencode/schema/token-usage"
 import type { Effect, JsonSchema, Types } from "effect"
-import type { ModelHooks, ModelMiddleware } from "./registration.js"
+import type { ModelHooks, ModelMiddleware, Observers } from "./registration.js"
 
 export interface SessionPrompt {
   readonly sessionID: Session.ID
@@ -168,6 +168,8 @@ export interface SessionCompactionOutcome {
   readonly model: Model.Ref
   readonly trigger: "auto" | "overflow" | "manual"
   readonly status: "skipped" | "completed" | "failed" | "interrupted"
+  /** Elapsed time from invocation through terminal settlement, before outcome callbacks. */
+  readonly durationMs?: number
   readonly before?: number
   readonly after?: number
   readonly limit?: number
@@ -182,10 +184,45 @@ export interface SessionUsage {
   readonly sessionID: Session.ID
   readonly agent: Agent.ID
   readonly model: Model.Ref
-  readonly source: "title" | "compaction"
+  readonly source: "title" | "compaction" | "generate"
   readonly tokens: TokenUsage.Info
   readonly cost: Money.USD
   readonly costSource: "host_calculated"
+}
+
+/** One actual model invocation, not a physical HTTP retry or a tool execution. Does not charge usage. */
+export interface SessionModelOutcome {
+  readonly sessionID: Session.ID
+  readonly agent: Agent.ID
+  /** Configured selection; never substituted for an unreported response model. */
+  readonly model: Model.Ref
+  readonly kind: SessionRequestKind
+  readonly status: "completed" | "failed" | "interrupted"
+  /** Monotonic elapsed time through stream consumption, before observation callbacks. */
+  readonly durationMs: number
+  /** Provider-reported response model, only when the accepted response supplies it. */
+  readonly responseModel?: string
+  /** Normalized terminal reason; raw provider text is never exposed here. */
+  readonly finishReason?: FinishReason
+  readonly errorKind?:
+    | "authentication"
+    | "rate-limit"
+    | "quota"
+    | "content-filter"
+    | "invalid-request"
+    | "unsupported-operation"
+    | "no-route"
+    | "provider-internal"
+    | "transport"
+    | "timeout"
+    | "invalid-output"
+    | "context-overflow"
+    | "payload-too-large"
+    | "incomplete-stream"
+    | "unknown"
+  /** Monotonic time to meaningful streamed content; omitted for buffered/native responses. */
+  readonly firstOutputMs?: number
+  readonly firstOutputKind?: "text" | "reasoning" | "tool"
 }
 
 /** One physical HTTP model request, after `http.request` hooks have run. */
@@ -231,6 +268,10 @@ export interface SessionHooks {
   readonly usage: SessionUsage
 }
 
+export interface SessionObservations {
+  readonly "model.outcome": SessionModelOutcome
+}
+
 export type SessionDomain = Pick<
   SessionApi<unknown>,
   | "create"
@@ -250,5 +291,6 @@ export type SessionDomain = Pick<
   | "context"
 > & {
   readonly hook: ModelHooks<SessionHooks>
+  readonly observe: Observers<SessionObservations>
   readonly middleware: ModelMiddleware<SessionMiddlewares>
 }

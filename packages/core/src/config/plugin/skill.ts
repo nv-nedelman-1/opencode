@@ -20,12 +20,13 @@ export const Plugin = define({
   id: "opencode.config.skill",
   effect: Effect.fn(function* (ctx) {
     const config = yield* Config.Service
+    const catalog = yield* Skill.Service
     const discovery = yield* SkillDiscovery.Service
     const fs = yield* FSUtil.Service
     const global = yield* Global.Service
     const location = yield* Location.Service
     const watcher = yield* Watcher.Service
-    const loaded: { entries: Entry[]; skills: Skill.Info[] } = {
+    const loaded: { entries: Entry[]; skills: { skill: Skill.Info; sourceKind: Source["type"] }[] } = {
       entries: yield* config.entries(),
       skills: [],
     }
@@ -149,17 +150,17 @@ export const Plugin = define({
     const refresh = Effect.fn("ConfigSkillPlugin.refresh")(
       function* (file?: string) {
         yield* FiberMap.clear(watches)
-        const skills = new Map<Skill.ID, Skill.Info>()
+        const skills = new Map<Skill.ID, { skill: Skill.Info; sourceKind: Source["type"] }>()
         const current = sources()
         for (const source of current) {
-          for (const skill of yield* load(source)) skills.set(skill.id, skill)
+          for (const skill of yield* load(source)) skills.set(skill.id, { skill, sourceKind: source.type })
         }
         loaded.skills = Array.from(skills.values())
         if (file) {
           yield* Effect.logInfo("skills rescanned", {
             file,
             sources: current.map(Skill.Source.key),
-            skills: loaded.skills.map((skill) => skill.id),
+            skills: loaded.skills.map(({ skill }) => skill.id),
           })
         }
       },
@@ -175,8 +176,8 @@ export const Plugin = define({
       Effect.forkScoped({ startImmediately: true }),
     )
     yield* refresh()
-    yield* ctx.skill.transform((editor) => {
-      for (const skill of loaded.skills) editor.add(skill)
+    yield* catalog.transform((editor) => {
+      for (const { skill, sourceKind } of loaded.skills) editor.add(skill, sourceKind)
     })
     yield* ctx.event.subscribe().pipe(
       Stream.filter((event) => event.type === "config.updated"),

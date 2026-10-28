@@ -241,6 +241,7 @@ const GeminiPromptFeedback = Schema.StructWithRest(
 type GeminiPromptFeedback = Schema.Schema.Type<typeof GeminiPromptFeedback>
 
 const GeminiEvent = Schema.Struct({
+  modelVersion: lenient(Schema.String),
   error: Schema.optional(Schema.Unknown),
   candidates: optionalNull(Schema.Array(GeminiCandidate)),
   promptFeedback: optionalNull(GeminiPromptFeedback),
@@ -255,6 +256,7 @@ interface ParserState {
   readonly hasToolCalls: boolean
   readonly promptFeedback?: GeminiPromptFeedback
   readonly usage?: Usage
+  readonly responseModel?: string
   readonly lifecycle: Lifecycle.State
   readonly reasoningSignature?: string
   readonly textSignature?: string
@@ -574,6 +576,7 @@ const finish = (state: ParserState): ReadonlyArray<LLMEvent> => {
       raw: finishReason,
     },
     usage: state.usage,
+    responseModel: state.responseModel,
     providerMetadata:
       state.promptFeedback === undefined
         ? undefined
@@ -606,6 +609,7 @@ const step = (state: ParserState, event: GeminiEvent) => {
     )
   const nextState = {
     ...state,
+    responseModel: event.modelVersion?.trim() ? event.modelVersion : state.responseModel,
     promptFeedback: event.promptFeedback ?? state.promptFeedback,
     usage: event.usageMetadata
       ? (mapUsage(event.usageMetadata, state.providerMetadataKey) ?? state.usage)

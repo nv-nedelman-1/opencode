@@ -6,6 +6,7 @@ import { Effect, Schema } from "effect"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Skill } from "../../skill.js"
 import { Permission } from "../../permission.js"
+import { PluginHooks } from "../../plugin/hooks.js"
 
 export const name = "skill"
 
@@ -35,6 +36,7 @@ export const Plugin = {
     const fs = yield* FSUtil.Service
     const skills = yield* Skill.Service
     const permission = yield* Permission.Service
+    const hooks = yield* PluginHooks.Service
     yield* ctx.tool
       .transform((editor) =>
         editor.add({
@@ -45,19 +47,30 @@ export const Plugin = {
           output: Output,
           execute: (input, context) =>
             Effect.gen(function* () {
-              const skill = yield* skills.get(input.id)
-              if (!skill) return yield* unableToLoad(input.id)
-              return yield* Effect.gen(function* () {
-                yield* permission.assert({
-                  action: name,
-                  resources: [skill.id],
-                  save: [skill.id],
+              const resolved = yield* skills.resolve(input.id)
+              const skill = resolved?.skill
+              return yield* Skill.observeLoad(
+                hooks,
+                {
                   sessionID: context.sessionID,
-                  agent: context.agent,
-                  source: { type: "tool", messageID: context.messageID, id: context.id },
-                })
-                return { name: skill.name, ...(yield* Skill.prepare(fs, skill)) }
-              }).pipe(Effect.mapError((error) => unableToLoad(input.id, error)))
+                  channel: "tool",
+                  skill,
+                  sourceKind: resolved?.sourceKind,
+                },
+                skill === undefined
+                  ? unableToLoad(input.id)
+                  : Effect.gen(function* () {
+                      yield* permission.assert({
+                        action: name,
+                        resources: [skill.id],
+                        save: [skill.id],
+                        sessionID: context.sessionID,
+                        agent: context.agent,
+                        source: { type: "tool", messageID: context.messageID, id: context.id },
+                      })
+                      return { name: skill.name, ...(yield* Skill.prepare(fs, skill)) }
+                    }).pipe(Effect.mapError((error) => unableToLoad(input.id, error))),
+              )
             }).pipe(
               Effect.map((output) => ({
                 output,

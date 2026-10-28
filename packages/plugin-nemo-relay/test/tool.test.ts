@@ -12,6 +12,7 @@ import { RelayTool } from "../src/tool"
 type Bridge = (
   input: unknown,
   next: (input: unknown, signal: AbortSignal) => Promise<{ result: unknown }>,
+  metadata?: unknown,
 ) => Promise<{ result: unknown }>
 
 const call: ToolExecution = {
@@ -28,11 +29,20 @@ const run = (
   next: Parameters<ToolMiddlewares["execute"]>[1],
   signal?: AbortSignal,
   release = () => {},
+  execution: ToolExecution = call,
 ) => {
   const parent = { uuid: "scope_tool_unit" } as ScopeHandle
   const runtime: RelayHost.Runtime = {
     relay: {
-      toolCallExecuteAsync: (_name: string, input: unknown, callback: Parameters<Bridge>[1]) => bridge(input, callback),
+      toolCallExecuteAsync: (
+        _name: string,
+        input: unknown,
+        callback: Parameters<Bridge>[1],
+        _parent: unknown,
+        _codec: unknown,
+        _responseCodec: unknown,
+        metadata: unknown,
+      ) => bridge(input, callback, metadata),
     } as unknown as RelayHost.Relay,
     scope: () => Effect.succeed(parent),
     open: () => parent,
@@ -42,17 +52,48 @@ const run = (
       Effect.succeed({
         parent,
         run: (callback) => callback(),
+        mark: () => {},
         onCancel: () => {},
         release,
       }),
     close: () => {},
   }
-  return Effect.runPromiseExit(RelayTool.middleware(runtime, () => Effect.succeed(undefined))(call, next), { signal })
+  return Effect.runPromiseExit(RelayTool.middleware(runtime, () => Effect.succeed(undefined))(execution, next), {
+    signal,
+  })
 }
 
 const forward: Bridge = (input, next) => next(input, new AbortController().signal)
+const replace = (result: unknown) =>
+  run(
+    async () => ({ result }),
+    () => Effect.die("replacement must not dispatch the tool"),
+  )
 
 describe("Relay tool middleware boundaries", () => {
+  test("native tool spans receive captured provenance rather than classifying their name", async () => {
+    let observed: unknown
+    const exit = await run(
+      (input, next, metadata) => {
+        observed = metadata
+        return forward(input, next)
+      },
+      () => Effect.succeed({ content: "ok" }),
+      undefined,
+      () => {},
+      {
+        ...call,
+        tool: "bash",
+        provenance: { origin: "mcp", execution: "mcp", category: "extension" },
+      },
+    )
+    expect(Exit.isSuccess(exit)).toBe(true)
+    expect(observed).toMatchObject({
+      "opencode.tool_origin": "mcp",
+      "opencode.tool_execution": "mcp",
+      "opencode.tool_category": "extension",
+    })
+  })
   test("keeps result identity and projects stateful results only once", async () => {
     const state = { reads: 0 }
     const result = {
@@ -102,12 +143,51 @@ describe("Relay tool middleware boundaries", () => {
     const defect = new Error("permission declined")
     const died = await run(recover, () => Effect.die(defect))
     expect(Exit.isFailure(died) && Cause.squash(died.cause)).toBe(defect)
-    expect(
-      await run(
-        async () => ({ result: { content: "cached" } }),
-        () => Effect.die("must not run"),
-      ),
-    ).toEqual(Exit.succeed({ content: "cached" }))
+    expect(await replace({ content: "cached" })).toEqual(Exit.succeed({ content: "cached" }))
+  })
+
+  test.each([
+    { value: { answer: 42 }, content: '{"answer":42}' },
+    { value: {}, content: "{}" },
+    { value: [1, { answer: 42 }, null], content: '[1,{"answer":42},null]' },
+    { value: null, content: "null" },
+    { value: 42, content: "42" },
+    { value: false, content: "false" },
+    { value: "cached", content: "cached" },
+    { value: { content: 42, answer: "retained" }, content: '{"content":42,"answer":"retained"}' },
+    {
+      value: { metadata: { source: "calculator" }, answer: 42 },
+      content: '{"metadata":{"source":"calculator"},"answer":42}',
+    },
+    { value: { content: "weather", temperature: 70 }, content: '{"content":"weather","temperature":70}' },
+  ])("preserves arbitrary JSON replacement $content", async ({ value, content }) => {
+    expect(await replace(value)).toEqual(Exit.succeed({ content }))
+  })
+
+  test.each([
+    { output: { answer: 42 } },
+    { content: "cached", metadata: { source: "intercept" } },
+    { metadata: { source: "intercept" } },
+    { content: [{ type: "text" as const, text: "cached" }] },
+  ])("retains recognized OpenCode result envelopes %#", async (value) => {
+    expect(await replace(value)).toEqual(Exit.succeed(value))
+  })
+
+  test("preserves arbitrary JSON substituted after the host tool completed without replaying it", async () => {
+    let calls = 0
+    const exit = await run(
+      async (input, next) => {
+        await next(input, new AbortController().signal)
+        return { result: { answer: 42 } }
+      },
+      () =>
+        Effect.sync(() => {
+          calls++
+          return { content: "original" }
+        }),
+    )
+    expect(exit).toEqual(Exit.succeed({ content: '{"answer":42}' }))
+    expect(calls).toBe(1)
   })
 
   test.each(["serial", "concurrent"])("rejects %s repeated dispatch without replaying side effects", async (order) => {

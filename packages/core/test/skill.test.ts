@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
-import { Deferred, Effect, Fiber, Layer, Schedule, Stream } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Schedule, Stream } from "effect"
+import type { SkillCatalog, SkillLoad } from "@opencode/plugin/effect/skill"
 import { Agent } from "@opencode/core/agent"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -10,14 +11,18 @@ import { Document, Event } from "@opencode/schema/config"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Skill } from "@opencode/core/skill"
 import { SkillInstructions } from "@opencode/core/skill/instructions"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { State } from "@opencode/core/state"
+import { Session } from "@opencode/schema/session"
 import { testEffect } from "./lib/effect"
 import { readInitial } from "./lib/instructions"
+import { sourceObserver } from "./lib/source-observer"
 import { registerIntegrationPolicy } from "./fixture/policy"
 
 const configLayer = Config.testLayer()
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Skill.node, SkillInstructions.node, Agent.node, Bus.node, ManagedPolicy.node]),
+    LayerNode.group([Skill.node, SkillInstructions.node, Agent.node, Bus.node, ManagedPolicy.node, PluginHooks.node]),
     [Config.node.replace(configLayer)],
   ).pipe(Layer.provideMerge(configLayer)),
 )
@@ -32,6 +37,191 @@ const info = (id: string, description: string) =>
   })
 
 describe("Skill", () => {
+  it.effect("observes effective catalog changes without treating reloads or hidden sources as changes", () =>
+    Effect.gen(function* () {
+      const skills = yield* Skill.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: SkillCatalog[] = []
+      yield* hooks.observe("skill", "catalog", (event) => void seen.push(event))
+      let current = info("review", "Original")
+      yield* skills.transform((editor) => editor.add(current, "directory"))
+      yield* skills.reload()
+      expect(seen).toHaveLength(1)
+      const overlay = yield* skills.transform((editor) => editor.add(info("review", "Remote"), "url"))
+      current = { ...current, content: "Changed while hidden" }
+      yield* skills.reload()
+      expect(seen).toHaveLength(2)
+      yield* overlay.dispose
+      const remove = yield* skills.transform((editor) => editor.remove(current.id))
+      yield* remove.dispose
+      expect(
+        seen.map((event) =>
+          event.changes.map((change) => [
+            change.action,
+            change.sourceKind,
+            change.previousSourceKind,
+            change.contentChanged,
+          ]),
+        ),
+      ).toEqual([
+        [["added", "directory", undefined, false]],
+        [["updated", "url", "directory", false]],
+        [["updated", "directory", "url", true]],
+        [["removed", "directory", undefined, false]],
+        [["added", "directory", undefined, false]],
+      ])
+      expect(seen[0].changes[0].skill.content).toBe("# review")
+      expect(() => Object.assign(seen[0].changes[0].skill, { content: "Mutated" })).toThrow()
+      expect(Object.isFrozen(seen[0])).toBe(true)
+      expect(Object.isFrozen(seen[0].changes)).toBe(true)
+      expect(Object.isFrozen(seen[0].changes[0])).toBe(true)
+    }),
+  )
+
+  it.effect("observes only the committed catalog of a registration batch", () =>
+    Effect.gen(function* () {
+      const skills = yield* Skill.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: SkillCatalog[] = []
+      yield* hooks.observe("skill", "catalog", (event) => void seen.push(event))
+      yield* State.batch(
+        Effect.gen(function* () {
+          yield* skills.transform((editor) => editor.add(info("review", "Hidden"), "url"))
+          yield* skills.transform((editor) => editor.remove("review"))
+        }),
+      )
+      expect(seen).toEqual([])
+      yield* State.batch(
+        Effect.gen(function* () {
+          yield* skills.transform((editor) => editor.add(info("deploy", "First"), "directory"))
+          yield* skills.transform((editor) => editor.update("deploy", (skill) => (skill.content = "Final")))
+        }),
+      )
+      expect(seen).toHaveLength(1)
+      expect(seen[0].changes).toMatchObject([
+        { action: "added", sourceKind: "directory", skill: { id: "deploy", content: "Final" } },
+      ])
+    }),
+  )
+
+  it.effect("keeps source provenance with effective registrations and restores it on disposal", () =>
+    Effect.gen(function* () {
+      const skills = yield* Skill.Service
+      const original = info("review", "Original")
+      yield* skills.transform((editor) => editor.add(original))
+      expect((yield* skills.resolve(original.id))?.sourceKind).toBe("unknown")
+      const overlay = yield* skills.transform((editor) => editor.add(info("review", "Remote"), "url"))
+      const remote = yield* skills.resolve(original.id)
+      expect(remote?.sourceKind).toBe("url")
+      yield* skills.transform((editor) => editor.update("review", (skill) => (skill.content = "Updated")))
+      expect((yield* skills.resolve(original.id))?.sourceKind).toBe("url")
+      yield* overlay.dispose
+      expect((yield* skills.resolve(original.id))?.sourceKind).toBe("unknown")
+      expect(remote).toMatchObject({ skill: { description: "Remote" }, sourceKind: "url" })
+      yield* skills.transform((editor) => editor.remove("review"))
+      expect(yield* skills.resolve(original.id)).toBeUndefined()
+    }),
+  )
+
+  it.effect("reports load outcomes without changing results, failures, or interruption when an observer defects", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const observations: SkillLoad[] = []
+      yield* hooks.observe("skill", "load", (event) => void observations.push(event))
+      const observer = yield* hooks.observe("skill", "load", () => {
+        throw new Error("observer failure")
+      })
+      const input = {
+        sessionID: Session.ID.make("ses_skill_load"),
+        channel: "tool" as const,
+        skill: info("review", "Review"),
+        sourceKind: "directory" as const,
+      }
+      expect(yield* Skill.observeLoad(hooks, input, Effect.succeed("unchanged"))).toBe("unchanged")
+      const error = new Error("preparation failure")
+      expect(yield* Skill.observeLoad(hooks, input, Effect.fail(error)).pipe(Effect.flip)).toBe(error)
+      expect(
+        yield* Skill.observeLoad(
+          hooks,
+          { sessionID: input.sessionID, channel: input.channel },
+          Effect.fail(error),
+        ).pipe(Effect.flip),
+      ).toBe(error)
+      const interrupted = yield* Skill.observeLoad(hooks, input, Effect.interrupt).pipe(Effect.exit)
+      expect(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause)).toBe(true)
+      expect(observations.map((event) => [event.status, event.sourceKind])).toEqual([
+        ["completed", "directory"],
+        ["failed", "directory"],
+        ["unavailable", "unknown"],
+        ["interrupted", "directory"],
+      ])
+      yield* observer.dispose
+      // @ts-expect-error Returned Effects are not observers and must never be executed.
+      yield* hooks.observe("skill", "load", () => Effect.interrupt)
+      expect(yield* Skill.observeLoad(hooks, input, Effect.succeed("still unchanged"))).toBe("still unchanged")
+    }),
+  )
+
+  it.effect("observes frozen snapshots without exposing the mutable catalog or changing returned skills", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const skills = yield* Skill.Service
+      const original = info("review", "Original")
+      yield* skills.transform((editor) => editor.add(original, "directory"))
+      const resolved = (yield* skills.resolve(original.id))!
+      const seen: SkillLoad[] = []
+      yield* hooks.observe("skill", "load", (event) => {
+        expect(() => Object.assign(event, { status: "failed" })).toThrow()
+        expect(() => Object.assign(event.skill!, { content: "Changed" })).toThrow()
+        expect(() => Object.assign(event.skill!, { path: "/changed" })).toThrow()
+        return undefined
+      })
+      yield* hooks.observe("skill", "load", (event) => void seen.push(event))
+      expect(
+        yield* Skill.observeLoad(
+          hooks,
+          { sessionID: Session.ID.make("ses_skill_snapshot"), channel: "user_activation", ...resolved },
+          Effect.succeed(resolved.skill),
+        ),
+      ).toEqual(original)
+      expect(yield* skills.get(original.id)).toEqual(original)
+      expect(seen[0]).toMatchObject({ status: "completed", skill: original })
+      expect(seen[0].skill).not.toBe(resolved.skill)
+      expect(Object.isFrozen(resolved.skill)).toBe(false)
+      yield* skills.transform((editor) => editor.update(original.id, (skill) => (skill.content = "Updated")))
+      expect((yield* skills.get(original.id))?.content).toBe("Updated")
+      expect(seen[0].skill).toEqual(original)
+    }),
+  )
+
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    it.effect(`invalid async or Effect load observers cannot delay ${status} settlement`, () =>
+      Effect.gen(function* () {
+        const hooks = yield* PluginHooks.Service
+        const observer = yield* sourceObserver(hooks, "skill", "load")
+        const failure = new Error("original failure")
+        const input = {
+          sessionID: Session.ID.make("ses_load_stall"),
+          channel: "tool" as const,
+          sourceKind: "directory" as const,
+          skill: info("review", "Review"),
+        }
+        const work =
+          status === "completed"
+            ? Effect.succeed("unchanged")
+            : status === "failed"
+              ? Effect.fail(failure)
+              : Effect.interrupt
+        const exit = yield* observer.settle(Skill.observeLoad(hooks, input, work))
+        expect(observer.received[0]).toMatchObject({ ...input, status })
+        expect(Object.isFrozen(observer.received[0].skill)).toBe(true)
+        if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
+        if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
+        if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
+      }),
+    )
+  }
+
   it.live("hides and refuses denied skills while organization policy overrides local allows", () =>
     Effect.gen(function* () {
       const skills = yield* Skill.Service

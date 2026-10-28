@@ -1,11 +1,21 @@
 export * as RelayObserve from "./observe.js"
 
-import type { SessionContext, SessionHooks, SessionRequest, SessionRequestKind } from "@opencode/plugin/effect/session"
+import type {
+  SessionContext,
+  SessionHooks,
+  SessionModelOutcome,
+  SessionRequest,
+  SessionRequestKind,
+} from "@opencode/plugin/effect/session"
 import type { PermissionHooks } from "@opencode/plugin/effect/permission"
+import type { MCPRecovery } from "@opencode/plugin/effect/mcp"
+import type { SkillCatalog, SkillLoad } from "@opencode/plugin/effect/skill"
+import type { ToolExecution, ToolProvenance } from "@opencode/plugin/effect/tool"
 import type { EventManifest } from "@opencode/schema/event-manifest"
 import { Session } from "@opencode/schema/session"
 import type { SessionMessage } from "@opencode/schema/session-message"
 import { Effect, Option, Schema } from "effect"
+import { createHash } from "node:crypto"
 import type { RelayHost } from "./host.js"
 import { RelayMetrics } from "./metrics.js"
 
@@ -29,15 +39,22 @@ const errors = new Set([
   "provider.timeout",
 ])
 
+interface ToolState {
+  provenance?: ToolProvenance
+  started?: number
+  /** Gate history, not the cause of a potentially recovered terminal result. */
+  approval?: "automatic" | "asked" | "allowed_after_ask" | "rejected" | "denied"
+}
+
 interface SessionState {
   started?: number
   compaction?: number
+  readonly usage: { samples: number; input: number; output: number; cacheRead: number }
   readonly steps: Map<
     SessionMessage.ID,
     { readonly started: number; readonly model: SessionContext["model"]; streamed?: number; firstOutput?: true }
   >
-  readonly permissions: Map<string, { readonly started: number; readonly family: string }>
-  readonly tools: Map<string, { readonly category: string; started?: number; blocked?: true }>
+  readonly permissions: Map<string, { readonly started: number; readonly family: string; readonly toolKey?: string }>
   readonly counts: {
     steps: number
     tools: number
@@ -48,19 +65,41 @@ interface SessionState {
   }
 }
 
+const observers = new WeakMap<Parameters<typeof create>[0], ReturnType<typeof create>>()
+
+/** All Location subscribers share the state belonging to their process runtime. */
+export const make = (runtime: Parameters<typeof create>[0]) => {
+  const existing = observers.get(runtime)
+  if (existing) return existing
+  const observer = create(runtime)
+  observers.set(runtime, observer)
+  return observer
+}
+
 /** Host billing and native provider accounting are separate, non-additive planes. */
-export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close">) => {
+const create = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" | "close">) => {
   const parents = new Map<Session.ID, Session.ID>()
   const sessions = new Map<Session.ID, SessionState>()
+  // Source callbacks can lead the bus across run boundaries; calls settle by message/call ID, not run end.
+  const calls = new Map<Session.ID, Map<string, ToolState>>()
+  const toolState = (id: Session.ID) => {
+    const existing = calls.get(id)
+    if (existing) return existing
+    const created = new Map<string, ToolState>()
+    calls.set(id, created)
+    return created
+  }
   const forms = new Map<string, { readonly sessionID?: Session.ID; readonly started: number }>()
+  // Bounded, process-local comparison only; neither skill identities nor content hashes are exported.
+  const skillLoads = new Map<Session.ID, Map<string, string>>()
   const state = (id: Session.ID) => {
     const existing = sessions.get(id)
     if (existing) return existing
     const created: SessionState = {
       steps: new Map(),
       permissions: new Map(),
-      tools: new Map(),
       counts: { steps: 0, tools: 0, retries: 0, permissions: 0, forms: 0, compactions: 0 },
+      usage: { samples: 0, input: 0, output: 0, cacheRead: 0 },
     }
     sessions.set(id, created)
     return created
@@ -192,6 +231,15 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
                   compaction_count: current.counts.compactions,
                 }),
             ...(event.type === "session.execution.interrupted" ? { reason: event.data.reason } : {}),
+            ...(current?.usage.samples
+              ? {
+                  accounting_source: "host_step",
+                  usage_sample_count: current.usage.samples,
+                  input_tokens: current.usage.input,
+                  output_tokens: current.usage.output,
+                  cache_read_tokens: current.usage.cacheRead,
+                }
+              : {}),
             ...(event.type === "session.execution.failed" ? failure(event.data.error) : {}),
           })
           sessions.delete(event.data.sessionID)
@@ -219,6 +267,13 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
         case "session.step.failed": {
           const current = sessions.get(event.data.sessionID)
           const step = current?.steps.get(event.data.assistantMessageID)
+          if (current?.started !== undefined && event.data.tokens !== undefined) {
+            const usage = event.data.tokens
+            current.usage.samples++
+            current.usage.input += usage.input + usage.cache.read + usage.cache.write
+            current.usage.output += usage.output + usage.reasoning
+            current.usage.cacheRead += usage.cache.read
+          }
           const outcome =
             event.type === "session.step.ended"
               ? "success"
@@ -317,17 +372,15 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
             character_count: event.data.text.length,
           })
           return
-        case "session.tool.input.started":
-          state(event.data.sessionID).tools.set(`${event.data.assistantMessageID}:${event.data.id}`, {
-            category: toolCategory(event.data.name),
-          })
-          if (event.data.name === "skill") {
-            mark(event.data.sessionID, "opencode.skill.tool.requested", { count: 1 })
-          }
+        case "session.tool.input.started": {
+          const tools = toolState(event.data.sessionID)
+          const key = `${event.data.assistantMessageID}:${event.data.id}`
+          if (!tools.has(key)) tools.set(key, {})
           return
+        }
         case "session.tool.called": {
           const current = state(event.data.sessionID)
-          const tool = current.tools.get(`${event.data.assistantMessageID}:${event.data.id}`)
+          const tool = calls.get(event.data.sessionID)?.get(`${event.data.assistantMessageID}:${event.data.id}`)
           if (tool?.started !== undefined) return
           if (tool) tool.started = event.created
           current.counts.tools++
@@ -347,9 +400,14 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
         case "session.tool.success":
         case "session.tool.failed": {
           const key = `${event.data.assistantMessageID}:${event.data.id}`
-          const tools = sessions.get(event.data.sessionID)?.tools
+          const tools = calls.get(event.data.sessionID)
           const tool = tools?.get(key)
-          const category = tool?.category ?? "unknown"
+          const category = tool?.provenance?.category ?? "unknown"
+          const metadata = event.type === "session.tool.success" ? event.data.metadata : undefined
+          const delegation =
+            category === "delegation" && tool?.provenance?.origin === "builtin"
+              ? Option.getOrUndefined(delegationMetadata(metadata?.delegation))
+              : undefined
           const data = {
             count: 1,
             category,
@@ -360,30 +418,45 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
                   ? "cancelled"
                   : "failed",
             provider_executed: event.data.executed,
-            execution: event.data.executed ? "provider" : "unknown",
+            tool_origin: tool?.provenance?.origin ?? "unknown",
+            execution: event.data.executed ? "provider" : (tool?.provenance?.execution ?? "unknown"),
+            approval: tool?.approval ?? "unknown",
             ...duration(tool?.started, event.created),
             result_family:
-              tool?.blocked || (event.type === "session.tool.failed" && event.data.error.type === "permission.rejected")
+              event.type === "session.tool.failed" && event.data.error.type === "permission.rejected"
                 ? "blocked"
                 : event.type === "session.tool.failed"
                   ? event.data.error.type === "aborted"
                     ? "cancelled"
                     : "error"
                   : category === "terminal"
-                    ? terminalFamily(event.data.metadata)
+                    ? terminalFamily(metadata)
                     : "success",
+            ...(typeof metadata?.truncated !== "boolean" ? {} : { output_truncated: metadata.truncated }),
+            ...(delegation === undefined
+              ? {}
+              : {
+                  delegation_kind: delegation.kind,
+                  requested_mode: delegation.requestedMode,
+                  return_mode: delegation.returnMode,
+                }),
             ...(event.type === "session.tool.failed" ? failure(event.data.error) : {}),
           }
           mark(event.data.sessionID, "opencode.tool.completed", data)
           if (category === "skill") mark(event.data.sessionID, "opencode.skill.tool.completed", data)
           tools?.delete(key)
+          if (tools?.size === 0) calls.delete(event.data.sessionID)
           return
         }
         case "permission.asked": {
           const family = permissionFamily(event.data.action)
           const current = state(event.data.sessionID)
           if (current.permissions.has(event.data.id)) return
-          current.permissions.set(event.data.id, { started: event.created, family })
+          const toolKey =
+            event.data.source?.type === "tool" ? `${event.data.source.messageID}:${event.data.source.id}` : undefined
+          const tool = toolKey === undefined ? undefined : calls.get(event.data.sessionID)?.get(toolKey)
+          if (tool && tool.approval !== "denied" && tool.approval !== "rejected") tool.approval = "asked"
+          current.permissions.set(event.data.id, { started: event.created, family, toolKey })
           current.counts.permissions++
           mark(event.data.sessionID, "opencode.permission.wait.started", { count: 1, family })
           return
@@ -391,6 +464,9 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
         case "permission.replied": {
           const pending = sessions.get(event.data.sessionID)?.permissions.get(event.data.requestID)
           if (!pending) return
+          const tool = pending.toolKey === undefined ? undefined : calls.get(event.data.sessionID)?.get(pending.toolKey)
+          if (tool && tool.approval !== "denied" && tool.approval !== "rejected")
+            tool.approval = event.data.reply === "reject" ? "rejected" : "allowed_after_ask"
           mark(event.data.sessionID, "opencode.permission.wait.completed", {
             count: 1,
             resolution: event.data.reply,
@@ -431,6 +507,8 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           closeWaits(event.data.sessionID, event.created, event.id, "session_deleted")
           sessions.delete(event.data.sessionID)
           parents.delete(event.data.sessionID)
+          skillLoads.delete(event.data.sessionID)
+          calls.delete(event.data.sessionID)
           runtime.close(event.data.sessionID, "cancelled")
           return
       }
@@ -442,7 +520,7 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
   ) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        kind === "primary" ? event.sessionID : undefined,
         "opencode.context.prepared",
         {
           call_role: kind,
@@ -452,14 +530,14 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           system_character_count: event.system.reduce((count, part) => count + part.text.length, 0),
           ...(event.tools === undefined ? {} : { tool_count: Object.keys(event.tools).length }),
         },
-        hostMetadata,
+        kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
 
   const contextUsage = (event: SessionHooks["context.usage"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        event.kind === "primary" ? event.sessionID : undefined,
         "opencode.context.usage",
         {
           call_role: event.kind,
@@ -473,13 +551,13 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
               }),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
   const retryDecision = (event: SessionHooks["retry.decision"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        event.kind === "primary" ? event.sessionID : undefined,
         "opencode.llm.retry.decision",
         {
           count: 1,
@@ -493,18 +571,19 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           ...failure(event.error),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
       ),
     )
   const compactionOutcome = (event: SessionHooks["compaction.outcome"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        undefined,
         "opencode.compaction.outcome",
         {
           count: 1,
           trigger: event.trigger === "auto" ? "proactive" : event.trigger,
           compaction_status: event.status === "interrupted" ? "cancelled" : event.status,
+          ...(event.durationMs === undefined ? {} : { duration_ms: event.durationMs }),
           estimate_source: "host_context",
           ...(event.before === undefined ? {} : { before_tokens: event.before }),
           ...(event.after === undefined ? {} : { after_tokens: event.after }),
@@ -523,14 +602,20 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
             : { retained_ratio: event.after / event.before }),
           ...RelayMetrics.route(event.model),
         },
-        hostMetadata,
+        auxiliaryMetadata,
       ),
     )
   const permissionDecision = (event: PermissionHooks["decision"]) =>
     Effect.sync(() => {
-      if (event.effect === "deny" && event.source?.type === "tool") {
-        const tool = sessions.get(event.sessionID)?.tools.get(`${event.source.messageID}:${event.source.id}`)
-        if (tool) tool.blocked = true
+      const tool =
+        event.source?.type === "tool"
+          ? calls.get(event.sessionID)?.get(`${event.source.messageID}:${event.source.id}`)
+          : undefined
+      if (tool) {
+        if (event.effect === "deny") tool.approval = "denied"
+        else if (event.effect === "ask" && tool.approval !== "denied" && tool.approval !== "rejected")
+          tool.approval = "asked"
+        else if (event.effect === "allow" && tool.approval === undefined) tool.approval = "automatic"
       }
       runtime.mark(
         event.sessionID,
@@ -547,7 +632,7 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
   const usage = (event: SessionHooks["usage"]) =>
     Effect.sync(() =>
       runtime.mark(
-        event.sessionID,
+        undefined,
         "opencode.llm.usage.recorded",
         {
           call_role: event.source,
@@ -556,14 +641,135 @@ export const make = (runtime: Pick<RelayHost.Runtime, "admit" | "open" | "mark" 
           cost_usd: event.cost,
           tokens: event.tokens,
         },
+        auxiliaryMetadata,
+      ),
+    )
+
+  const toolExecution = (call: ToolExecution) =>
+    Effect.sync(() => {
+      const tools = toolState(call.sessionID)
+      const key = `${call.messageID}:${call.id}`
+      const tool = tools.get(key) ?? {}
+      tools.set(key, tool)
+      // CodeMode's nested tools share the outer call IDs; its first middleware entry owns the host summary.
+      if (tool.provenance || !call.provenance) return
+      tool.provenance = call.provenance
+      if (call.provenance.category === "skill")
+        runtime.mark(call.sessionID, "opencode.skill.tool.requested", { count: 1 }, hostMetadata)
+    })
+  const modelOutcome = (event: SessionModelOutcome) =>
+    Effect.sync(() =>
+      runtime.mark(
+        event.kind === "primary" ? event.sessionID : undefined,
+        "opencode.llm.host_call.completed",
+        {
+          count: 1,
+          call_role: event.kind,
+          outcome: event.status === "completed" ? "success" : event.status === "interrupted" ? "cancelled" : "failed",
+          duration_ms: event.durationMs,
+          ...(event.finishReason === undefined ? {} : { finish: event.finishReason }),
+          ...(event.errorKind === undefined ? {} : { error_kind: event.errorKind }),
+          ...(event.firstOutputMs === undefined
+            ? {}
+            : { first_output_ms: event.firstOutputMs, output_kind: event.firstOutputKind }),
+          ...RelayMetrics.route(event.model),
+          ...(event.responseModel === undefined
+            ? {}
+            : { response_model_family: RelayMetrics.modelFamily(event.responseModel) }),
+        },
+        event.kind === "primary" ? hostMetadata : auxiliaryMetadata,
+      ),
+    )
+  const skillLoad = (event: SkillLoad) =>
+    Effect.sync(() => {
+      const comparison: { repeat_load?: true; content_changed?: boolean } = {}
+      if (event.status === "completed" && event.skill) {
+        const loads = skillLoads.get(event.sessionID) ?? new Map<string, string>()
+        skillLoads.delete(event.sessionID)
+        skillLoads.set(event.sessionID, loads)
+        const fingerprint = createHash("sha256").update(event.skill.content).digest("hex")
+        const previous = loads.get(event.skill.id)
+        if (previous !== undefined)
+          Object.assign(comparison, { repeat_load: true, content_changed: previous !== fingerprint })
+        loads.delete(event.skill.id)
+        loads.set(event.skill.id, fingerprint)
+        if (loads.size > 64) loads.delete(loads.keys().next().value!)
+        if (skillLoads.size > 256) skillLoads.delete(skillLoads.keys().next().value!)
+      }
+      runtime.mark(
+        event.sessionID,
+        "opencode.skill.load.completed",
+        {
+          count: 1,
+          load_channel: event.channel,
+          load_status: event.status,
+          source_kind: event.sourceKind,
+          comparison_window: "session_memory",
+          ...comparison,
+        },
+        hostMetadata,
+      )
+    })
+
+  const skillCatalog = (event: SkillCatalog) =>
+    Effect.sync(() =>
+      event.changes.forEach((change) =>
+        runtime.mark(
+          undefined,
+          "opencode.skill.catalog.changed",
+          {
+            count: 1,
+            catalog_action: change.action,
+            source_kind: change.sourceKind,
+            ...(change.previousSourceKind === undefined ? {} : { previous_source_kind: change.previousSourceKind }),
+            content_changed: change.contentChanged,
+          },
+          hostMetadata,
+        ),
+      ),
+    )
+
+  const mcpRecovery = (event: MCPRecovery) =>
+    Effect.sync(() =>
+      runtime.mark(
+        undefined,
+        event.outcome === "started" ? "opencode.mcp.recovery.started" : "opencode.mcp.recovery.completed",
+        {
+          count: 1,
+          mcp_operation: event.operation,
+          recovery_phase: event.phase,
+          recovery_reason: event.reason,
+          ...(event.outcome === "started"
+            ? {}
+            : {
+                outcome:
+                  event.outcome === "succeeded" ? "success" : event.outcome === "interrupted" ? "cancelled" : "failed",
+              }),
+          ...(event.durationMs === undefined ? {} : { duration_ms: event.durationMs }),
+        },
         hostMetadata,
       ),
     )
 
-  return { event, context, contextUsage, retryDecision, compactionOutcome, permissionDecision, usage }
+  return {
+    event,
+    context,
+    contextUsage,
+    retryDecision,
+    compactionOutcome,
+    permissionDecision,
+    usage,
+    toolExecution,
+    modelOutcome,
+    skillLoad,
+    skillCatalog,
+    mcpRecovery,
+  }
 }
 
 const hostMetadata = { "opencode.observation.schema_version": "1", "opencode.observation.source": "host" }
+// Auxiliary summaries have no invocation owner token; a currently open Session execution may be unrelated.
+const auxiliaryMetadata = { ...hostMetadata, "opencode.execution.attribution": "unavailable" }
 
 const terminalMetadata = Schema.decodeUnknownOption(
   Schema.Struct({
@@ -571,6 +777,13 @@ const terminalMetadata = Schema.decodeUnknownOption(
     signal: Schema.optional(Schema.String),
     timeout: Schema.optional(Schema.Boolean),
     status: Schema.optional(Schema.Literals(["completed", "running"])),
+  }),
+)
+const delegationMetadata = Schema.decodeUnknownOption(
+  Schema.Struct({
+    kind: Schema.Literals(["new", "continued"]),
+    requestedMode: Schema.Literals(["foreground", "background"]),
+    returnMode: Schema.Literals(["foreground", "background"]),
   }),
 )
 const terminalFamily = (metadata: unknown) => {
@@ -597,19 +810,4 @@ const permissionFamily = (action: string) => {
   if (action === "skill") return "skill"
   if (["task", "subagent"].includes(action)) return "delegation"
   return "other"
-}
-
-const toolCategory = (name: string) => {
-  if (["read", "list", "ls"].includes(name)) return "file_read"
-  if (["write", "edit", "apply_patch", "patch"].includes(name)) return "file_write"
-  if (["bash", "shell"].includes(name)) return "terminal"
-  if (["grep", "glob", "lsp", "code_search"].includes(name)) return "code_search"
-  if (["webfetch", "websearch"].includes(name)) return "web"
-  if (["todo", "todowrite", "plan", "plan_exit"].includes(name)) return "planning"
-  if (["task", "subagent"].includes(name)) return "delegation"
-  if (name === "question") return "human_input"
-  if (name === "skill") return "skill"
-  if (name === "execute") return "code_execution"
-  if (["list_mcp_resources", "read_mcp_resource"].includes(name)) return "mcp_resource"
-  return "extension"
 }

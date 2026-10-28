@@ -130,6 +130,8 @@ export class CompactionCheckpointResponse extends Schema.Class<CompactionCheckpo
     ),
   ),
   responseID: Schema.String.check(Schema.isPattern(/\S/)),
+  /** Model identity echoed by the accepted native trigger response, when supplied. */
+  responseModel: Schema.optional(Schema.String),
   usage: Schema.optional(Usage),
 }) {}
 
@@ -283,6 +285,8 @@ export type StepFinish = Schema.Schema.Type<typeof StepFinish>
 export const Finish = Schema.Struct({
   type: Schema.tag("finish"),
   reason: FinishReasonDetails,
+  /** Model identity echoed by the provider, not the configured request selection. */
+  responseModel: Schema.optional(Schema.String),
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
 }).annotate({ identifier: "LLM.Event.Finish" })
@@ -453,6 +457,7 @@ interface ResponseState {
   readonly message: Message
   readonly usage?: Usage
   readonly finishReason?: FinishReasonDetails
+  readonly responseModel?: string
   readonly textParts: Readonly<Record<string, ContentAssembly>>
   readonly reasoningParts: Readonly<Record<string, ContentAssembly>>
   readonly toolInputs: Readonly<Record<string, ToolInputAssembly>>
@@ -474,6 +479,7 @@ const appendEvent = (state: ResponseState, event: LLMEvent): ResponseState => {
       events,
       usage: event.usage ?? state.usage,
       finishReason: event.reason,
+      responseModel: event.responseModel,
     }
   }
   if (LLMEvent.is.providerError(event)) {
@@ -687,6 +693,8 @@ export class LLMResponse extends Schema.Class<LLMResponse>("LLM.Response")({
   events: Schema.Array(LLMEvent),
   usage: Schema.optional(Usage),
   finishReason: FinishReasonDetails,
+  /** Absent when the provider does not report its accepted model identity. */
+  responseModel: Schema.optional(Schema.String),
 }) {
   /** Concatenated assistant text; each fragment's `text-end` value replaces its accumulated deltas when present. */
   get text() {
@@ -723,6 +731,7 @@ export namespace LLMResponse {
           events: [...state.events],
           usage: state.usage,
           finishReason: state.finishReason,
+          ...(state.responseModel === undefined ? {} : { responseModel: state.responseModel }),
         })
 
   /** Convenience reducer for callers that already have a collected event list. */

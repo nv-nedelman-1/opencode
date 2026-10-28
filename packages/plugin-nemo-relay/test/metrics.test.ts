@@ -24,8 +24,42 @@ test("host instruments preserve missing timing boundaries and ignore provider to
   })
   expect(JSON.stringify(completed)).not.toContain("SECRET")
   expect(RelayMetrics.measurements("opencode.agent.run.completed", { count: 1, outcome: "cancelled" })).toHaveLength(1)
+  expect(
+    RelayMetrics.measurements("opencode.agent.run.completed", { count: 1, outcome: "cancelled", reason: "shutdown" })[0]
+      ?.attributes,
+  ).toMatchObject({ outcome: "cancelled", reason: "shutdown" })
   expect(RelayMetrics.measurements("gen_ai.usage", { count: 1, tokens: 123 })).toEqual([])
   expect(RelayMetrics.measurements("opencode.agent.step.streamed", { duration_ms: 5 })).toEqual([])
+})
+
+test("run efficiency is an observed usage distribution, with unknown and zero input kept distinct", () => {
+  const data = {
+    count: 1,
+    outcome: "success",
+    usage_sample_count: 2,
+    input_tokens: 20,
+    output_tokens: 8,
+    cache_read_tokens: 5,
+  }
+  const result = RelayMetrics.measurements("opencode.agent.run.completed", data)
+  expect(
+    result
+      .filter((metric) => metric.name === "opencode.agent.run.observed_tokens")
+      .map((metric) => [metric.attributes?.kind, metric.kind, metric.value]),
+  ).toEqual([
+    ["input_total", 3, 20],
+    ["output_total", 3, 8],
+    ["cache_read", 3, 5],
+  ])
+  expect(result.find((metric) => metric.name === "opencode.agent.run.cache_read_ratio")?.value).toBe(0.25)
+  expect(result.every((metric) => !metric.name.startsWith("opencode.llm.tokens"))).toBe(true)
+  for (const payload of [{ count: 1 }, { ...data, input_tokens: 0, cache_read_tokens: 0 }]) {
+    expect(
+      RelayMetrics.measurements("opencode.agent.run.completed", payload).some(
+        (metric) => metric.name === "opencode.agent.run.cache_read_ratio",
+      ),
+    ).toBe(false)
+  }
 })
 
 test("tool, skill, compaction, and human wait dimensions are finite allowlists", () => {
@@ -54,6 +88,186 @@ test("tool, skill, compaction, and human wait dimensions are finite allowlists",
     { count: 1, duration_ms: Infinity },
     { count: "1" },
   ].forEach((data) => expect(RelayMetrics.measurements("opencode.agent.run.completed", data)).toEqual([]))
+})
+
+test("source-owned model, skill and tool measurements remain bounded and nonadditive", () => {
+  const model = RelayMetrics.measurements("opencode.llm.host_call.completed", {
+    count: 1,
+    call_role: "title",
+    outcome: "success",
+    duration_ms: 20,
+    model_family: "gpt",
+    response_model_family: "nemotron",
+    responseModel: "SECRET",
+    tokens: { input: 123 },
+    cost_usd: 9,
+  })
+  expect(model.map((metric) => metric.name)).toEqual([
+    "opencode.llm.host_call.completed.count",
+    "opencode.llm.host_call.duration",
+  ])
+  expect(model[0]?.attributes).toMatchObject({
+    scope: "host_call",
+    call_role: "title",
+    model_family: "gpt",
+    response_model_family: "nemotron",
+  })
+  const skill = RelayMetrics.measurements("opencode.skill.load.completed", {
+    count: 1,
+    load_channel: "user_mention",
+    load_status: "completed",
+    source_kind: "url",
+    comparison_window: "session_memory",
+    repeat_load: true,
+    content_changed: false,
+    id: "SECRET",
+    content: "SECRET",
+  })
+  expect(skill).toHaveLength(1)
+  expect(skill[0]?.attributes).toMatchObject({
+    load_channel: "user_mention",
+    load_status: "completed",
+    source_kind: "url",
+    repeat_load: true,
+    content_changed: false,
+  })
+  const tool = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "extension",
+    tool_origin: "mcp",
+    execution: "mcp",
+    approval: "allowed_after_ask",
+    name: "SECRET",
+  })
+  expect(tool[0]?.attributes).toMatchObject({
+    category: "extension",
+    tool_origin: "mcp",
+    execution: "mcp",
+    approval: "allowed_after_ask",
+  })
+  expect(JSON.stringify([model, skill, tool])).not.toContain("SECRET")
+  ;[
+    ["opencode.llm.host_call.completed", { response_model_family: "SECRET" }],
+    ["opencode.skill.load.completed", { source_kind: "SECRET" }],
+    ["opencode.tool.completed", { approval: "SECRET" }],
+  ].forEach(([name, data]) =>
+    expect(RelayMetrics.measurements(name as string, { count: 1, ...(data as object) })).toEqual([]),
+  )
+})
+
+test("source-owned call detail keeps first output optional and provider errors bounded", () => {
+  const result = RelayMetrics.measurements("opencode.llm.host_call.completed", {
+    count: 1,
+    call_role: "compaction",
+    outcome: "failed",
+    duration_ms: 25,
+    finish: "length",
+    error_kind: "incomplete-stream",
+    first_output_ms: 10,
+    output_kind: "reasoning",
+    message: "SECRET",
+    responseModel: "SECRET",
+    tokens: { input: 99 },
+    cost_usd: 9,
+  })
+  expect(result.map((metric) => [metric.name, metric.value])).toEqual([
+    ["opencode.llm.host_call.completed.count", 1],
+    ["opencode.llm.host_call.duration", 25],
+    ["opencode.llm.host_call.first_output", 10],
+  ])
+  expect(result[2]?.attributes).toMatchObject({
+    scope: "host_call",
+    call_role: "compaction",
+    output_kind: "reasoning",
+    error_kind: "incomplete-stream",
+    finish: "length",
+  })
+  expect(JSON.stringify(result)).not.toMatch(/SECRET|cost_usd|tokens/)
+  expect(RelayMetrics.measurements("opencode.llm.host_call.completed", { count: 1, error_kind: "SECRET" })).toEqual([])
+})
+
+test("skill catalog metrics distinguish effective changes from authored lifecycle intent", () => {
+  const result = RelayMetrics.measurements("opencode.skill.catalog.changed", {
+    count: 2,
+    catalog_action: "updated",
+    source_kind: "embedded",
+    previous_source_kind: "directory",
+    content_changed: true,
+    skill: { id: "SECRET", content: "SECRET", path: "/SECRET" },
+  })
+  expect(result).toHaveLength(1)
+  expect(result[0]?.value).toBe(2)
+  expect(result[0]?.attributes).toMatchObject({
+    scope: "effective_catalog",
+    catalog_action: "updated",
+    source_kind: "embedded",
+    previous_source_kind: "directory",
+    content_changed: true,
+  })
+  expect(JSON.stringify(result)).not.toContain("SECRET")
+  expect(
+    RelayMetrics.measurements("opencode.skill.catalog.changed", { count: 1, catalog_action: "installed" }),
+  ).toEqual([])
+})
+
+test("tool result metrics count reported truncation, terminal timeouts and real delegation modes", () => {
+  const terminal = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "terminal",
+    outcome: "success",
+    result_family: "timeout",
+    output_truncated: true,
+  })
+  expect(terminal.map((metric) => metric.name)).toEqual([
+    "opencode.tool.completed.count",
+    "opencode.tool.terminal_result.count",
+    "opencode.tool.output_truncation.count",
+    "opencode.tool.timeout.count",
+  ])
+  const delegate = RelayMetrics.measurements("opencode.tool.completed", {
+    count: 1,
+    category: "delegation",
+    delegation_kind: "continued",
+    requested_mode: "foreground",
+    return_mode: "background",
+    sessionID: "SECRET",
+  })
+  expect(delegate[1]?.name).toBe("opencode.delegation.return.count")
+  expect(delegate[1]?.attributes).toMatchObject({
+    delegation_kind: "continued",
+    requested_mode: "foreground",
+    return_mode: "background",
+  })
+  expect(JSON.stringify(delegate)).not.toContain("SECRET")
+  expect(RelayMetrics.measurements("opencode.tool.completed", { count: 1, output_truncated: "yes" })).toEqual([])
+  expect(
+    RelayMetrics.measurements("opencode.tool.completed", {
+      count: 1,
+      category: "terminal",
+      result_family: "unknown",
+    }).some((metric) => metric.name === "opencode.tool.timeout.count"),
+  ).toBe(false)
+})
+
+test("MCP recovery exports source phase, terminal outcome and elapsed duration, never endpoint identity", () => {
+  const result = RelayMetrics.measurements("opencode.mcp.recovery.completed", {
+    count: 1,
+    mcp_operation: "resource",
+    recovery_phase: "retry",
+    recovery_reason: "session_expired",
+    outcome: "failed",
+    duration_ms: 12,
+    server: "SECRET",
+    url: "SECRET",
+    error: "SECRET",
+  })
+  expect(result.map((metric) => [metric.name, metric.value])).toEqual([
+    ["opencode.mcp.recovery.completed.count", 1],
+    ["opencode.mcp.recovery.duration", 12],
+  ])
+  expect(result[0]?.attributes).toMatchObject({ mcp_operation: "resource", recovery_phase: "retry", outcome: "failed" })
+  expect(JSON.stringify(result)).not.toContain("SECRET")
+  expect(RelayMetrics.measurements("opencode.mcp.recovery.started", { count: 1, mcp_operation: "SECRET" })).toEqual([])
 })
 
 test("context samples are per-request histograms and retry delay is explicitly the remaining delay", () => {
@@ -219,12 +433,14 @@ test("utilization, compaction estimates, and per-run operation mix omit unknowns
     count: 1,
     compaction_status: "completed",
     trigger: "proactive",
+    duration_ms: 125,
     before_tokens: 1_000,
     after_tokens: 200,
     retained_ratio: 0.2,
   })
   expect(compaction.map((metric) => [metric.name, metric.value])).toEqual([
     ["opencode.compaction.outcome.count", 1],
+    ["opencode.compaction.attempt.duration", 125],
     ["opencode.compaction.context_tokens", 1_000],
     ["opencode.compaction.context_tokens", 200],
     ["opencode.compaction.retained_ratio", 0.2],

@@ -3,6 +3,8 @@ export { CallID, Content, Error, FileContent, TextContent } from "@opencode/sche
 export type { Context, Metadata, Namespace, Options, Result } from "@opencode/schema/tool"
 
 import { ToolDefinition, type ToolCall } from "@opencode/ai"
+import type { ToolProvenance } from "@opencode/plugin/effect/tool"
+import type { Plugin } from "@opencode/schema/plugin"
 import { Tool } from "@opencode/schema/tool"
 import { Context, Effect, Layer, Result, Schema, SchemaIssue, Types } from "effect"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -27,18 +29,25 @@ export interface Editor {
   readonly list: () => readonly (Tool.Info & { readonly id: string })[]
   readonly get: (id: string) => (Tool.Info & { readonly id: string }) | undefined
   readonly namespace: (namespace: Tool.Namespace) => void
-  readonly add: (tool: Tool.Info) => void
-  readonly update: (id: string, update: (tool: Types.Mutable<Tool.Info>) => void) => void
+  readonly add: {
+    (tool: Tool.Info): void
+    (tool: Tool.Info, provenance: ToolProvenance): void
+  }
+  readonly update: (id: string, update: (tool: Types.Mutable<Tool.Info>) => void, provenance?: ToolProvenance) => void
   readonly remove: (id: string) => void
 }
 
 type Data = {
-  tools: Map<string, Tool.Info & { readonly id: string }>
+  tools: Map<string, Tool.Info & { readonly id: string; readonly provenance: ToolProvenance }>
   namespaces: Map<string, Tool.Namespace>
   errors: { kind: "tool" | "namespace"; name: string; namespace?: string; error: RegistrationError }[]
 }
 
 export interface Interface extends State.Transformable<Editor> {
+  readonly transform: (
+    callback: Parameters<State.Transform<Editor>>[0],
+    provenance?: ToolProvenance,
+  ) => ReturnType<State.Transform<Editor>>
   readonly list: () => Effect.Effect<ReadonlyArray<Tool.Info & { readonly id: string }>>
   readonly snapshot: (permissions?: Permission.Ruleset) => Effect.Effect<Snapshot>
 }
@@ -115,6 +124,7 @@ const layer = Layer.effect(
       name: string,
       input: unknown,
       context: Tool.Context,
+      provenance: ToolProvenance,
     ) {
       const middlewares = yield* hooks.middlewares("tool", "execute")
       const call = {
@@ -123,6 +133,7 @@ const layer = Layer.effect(
         agent: context.agent,
         messageID: context.messageID,
         id: context.id,
+        provenance,
       }
       const run = middlewares.reduceRight(
         (next: (input: unknown) => Effect.Effect<Tool.Result, Tool.Error>, middleware) => (input: unknown) =>
@@ -140,6 +151,7 @@ const layer = Layer.effect(
         messageID: context.messageID,
         id: context.id,
         input,
+        provenance,
       }
       if ("failure" in execution) {
         const afterEvent: PluginHooks.Domains["tool"]["execute.after"] = {
@@ -187,20 +199,21 @@ const layer = Layer.effect(
           }
           editor.namespaces.set(namespace.name, { ...namespace })
         },
-        add: (tool) => {
+        add: (tool, provenance: ToolProvenance = unknownProvenance) => {
           const error = registrationError(tool)
           if (error) {
             editor.errors.push({ kind: "tool", name: tool.name, namespace: tool.options?.namespace, error })
             return
           }
           const id = effectiveName(tool)
-          editor.tools.set(id, { ...tool, id, options: tool.options && { ...tool.options } })
+          editor.tools.set(id, { ...tool, id, options: tool.options && { ...tool.options }, provenance })
         },
-        update: (id, update) => {
+        update: (id, update, provenance = unknownProvenance) => {
           const current = editor.tools.get(id)
           if (!current) return
           const tool = { ...current, options: current.options && { ...current.options } }
           update(tool)
+          tool.provenance = tool.execute === current.execute ? current.provenance : provenance
           tool.name = current.name
           tool.id = id
           if (tool.options?.namespace !== current.options?.namespace)
@@ -232,13 +245,22 @@ const layer = Layer.effect(
     })
 
     return Service.of({
-      transform: state.transform,
+      transform: (callback, provenance = unknownProvenance) => {
+        const captured = Object.freeze({ ...provenance })
+        return state.transform((editor) =>
+          callback({
+            ...editor,
+            add: (tool) => editor.add(tool, captured),
+            update: (id, update) => editor.update(id, update, captured),
+          }),
+        )
+      },
       reload: state.reload,
       list: () => Effect.sync(() => Array.from(state.get().tools.values())),
       snapshot: Effect.fn("Tool.snapshot")((permissions) =>
         Effect.sync(() => {
           const data = state.get()
-          const active = new Map<string, Tool.Info>()
+          const active = new Map<string, Tool.Info & { readonly provenance: ToolProvenance }>()
           const rules = permissions ?? []
           for (const [name, tool] of data.tools) {
             if (whollyDisabled(tool.options?.permission ?? name, rules)) continue
@@ -252,7 +274,15 @@ const layer = Layer.effect(
           const codeModeTool = codeModeEnabled
             ? CodeModeTool.create(codeModeInventory, (name, tool, input, context) =>
                 beforeExecute(name, input, context).pipe(
-                  Effect.flatMap((event) => executeTool(tool, name, event.input, context)),
+                  Effect.flatMap((event) =>
+                    executeTool(
+                      tool,
+                      name,
+                      event.input,
+                      context,
+                      codeModeTools.get(name)?.provenance ?? unknownProvenance,
+                    ),
+                  ),
                 ),
               )
             : undefined
@@ -288,9 +318,9 @@ const layer = Layer.effect(
                 return yield* new Tool.Error({ message: `Tool is not available for this request: ${event.tool}` })
               const name = requested?.name ?? event.tool
               if (name === "execute" && codeModeTool)
-                return yield* executeTool(codeModeTool, name, event.input, context)
+                return yield* executeTool(codeModeTool, name, event.input, context, codeModeProvenance)
               const tool = direct.get(name)
-              if (tool) return yield* executeTool(tool, name, event.input, context)
+              if (tool) return yield* executeTool(tool, name, event.input, context, tool.provenance)
               return yield* new Tool.Error({
                 message: `No tool named "${name}" is currently available. Please use a tool from the available tool list.`,
               })
@@ -306,6 +336,40 @@ const whollyDisabled = (action: string, rules: Permission.Ruleset) => {
   const rule = rules.findLast((rule) => Wildcard.match(action, rule.action))
   return rule?.resource === "*" && rule.effect === "deny"
 }
+
+const unknownProvenance: ToolProvenance = Object.freeze({ origin: "unknown", execution: "local", category: "unknown" })
+const codeModeProvenance: ToolProvenance = Object.freeze({
+  origin: "builtin",
+  execution: "local",
+  category: "code_execution",
+})
+
+// Only an actual built-in activation can select these categories. Names chosen by plugins do not.
+const builtinCategories: Readonly<Record<string, ToolProvenance["category"]>> = {
+  "opencode.tool.read": "file_read",
+  "opencode.tool.write": "file_write",
+  "opencode.tool.edit": "file_write",
+  "opencode.tool.patch": "file_write",
+  "opencode.tool.shell": "terminal",
+  "opencode.tool.glob": "code_search",
+  "opencode.tool.grep": "code_search",
+  "opencode.tool.webfetch": "web",
+  "opencode.tool.websearch": "web",
+  "opencode.tool.subagent": "delegation",
+  "opencode.tool.question": "human_input",
+  "opencode.tool.skill": "skill",
+  "opencode.tools": "extension",
+  "opencode.tools.mcp-resources": "mcp_resource",
+}
+
+export const provenance = (source: Plugin.Source | undefined, pluginID: string): ToolProvenance =>
+  source === undefined
+    ? unknownProvenance
+    : Object.freeze({
+        origin: source.type === "builtin" ? "builtin" : "plugin",
+        execution: "local",
+        category: source.type === "builtin" ? (builtinCategories[pluginID] ?? "unknown") : "extension",
+      })
 
 const formatSchemaIssue = SchemaIssue.makeFormatterDefault()
 

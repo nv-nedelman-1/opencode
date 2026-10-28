@@ -1,10 +1,12 @@
 import fs from "fs/promises"
 import path from "path"
 import { describe, expect } from "bun:test"
-import { Effect, Layer } from "effect"
+import { Cause, Effect, Exit, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Permission } from "@opencode/core/permission"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
+import type { SkillLoad } from "@opencode/plugin/effect/skill"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { Skill } from "@opencode/core/skill"
@@ -25,7 +27,7 @@ import { registerIntegrationPolicy } from "./fixture/policy"
 const skillToolNode = makeLocationNode({
   name: "test/skill-tool-plugin",
   layer: Layer.effectDiscard(registerToolPlugin(SkillTool.Plugin)),
-  deps: [Tool.node, FSUtil.node, Skill.node, Permission.node],
+  deps: [Tool.node, FSUtil.node, Skill.node, Permission.node, PluginHooks.node],
 })
 
 const sessionID = Session.ID.make("ses_skill_tool_test")
@@ -92,27 +94,34 @@ describe("SkillTool", () => {
           let current = [info]
           const assertions: Permission.AssertInput[] = []
           let deny = false
+          let interrupt = false
           const permission = permissionLayer({
             assert: (input) =>
               Effect.sync(() => assertions.push(input)).pipe(
                 Effect.andThen(
-                  deny
-                    ? Effect.fail(
-                        new Permission.BlockedError({
-                          rules: [],
-                          permission: input.action,
-                          resources: input.resources,
-                        }),
-                      )
-                    : Effect.void,
+                  interrupt
+                    ? Effect.interrupt
+                    : deny
+                      ? Effect.fail(
+                          new Permission.BlockedError({
+                            rules: [],
+                            permission: input.action,
+                            resources: input.resources,
+                          }),
+                        )
+                      : Effect.void,
                 ),
               ),
           })
           const skills = Layer.mock(Skill.Service, {
+            resolve: (id) => {
+              const skill = current.find((skill) => skill.id === id)
+              return Effect.succeed(skill ? { skill, sourceKind: "unknown" as const } : undefined)
+            },
             get: (id) => Effect.succeed(current.find((skill) => skill.id === id)),
             list: () => Effect.succeed(current),
           })
-          const skillToolLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, skillToolNode]), [
+          const skillToolLayer = AppNodeBuilder.build(LayerNode.group([Tool.node, skillToolNode, PluginHooks.node]), [
             Permission.node.replace(permission),
             Skill.node.replace(skills),
             Image.node.replace(imagePassthrough),
@@ -120,6 +129,12 @@ describe("SkillTool", () => {
 
           return yield* Effect.gen(function* () {
             const registry = yield* Tool.Service
+            const hooks = yield* PluginHooks.Service
+            const loads: SkillLoad[] = []
+            yield* hooks.observe("skill", "load", (event) => {
+              loads.push(event)
+              return undefined
+            })
             expect((yield* toolDefinitions(registry))[0]).toMatchObject({
               name: "skill",
               description: SkillTool.description,
@@ -173,6 +188,14 @@ describe("SkillTool", () => {
               error: { type: "permission.rejected", message: "Permission denied: skill" },
             })
             deny = false
+            interrupt = true
+            const interrupted = yield* executeTool(registry, {
+              sessionID,
+              ...toolIdentity,
+              call: { type: "tool-call", id: "call-interrupted-skill", name: "skill", input: { id: "effect" } },
+            }).pipe(Effect.exit)
+            expect(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause)).toBe(true)
+            interrupt = false
             const flat = Skill.Info.make({
               id: Skill.ID.make("public"),
               name: Skill.Name.make("Public"),
@@ -197,6 +220,14 @@ describe("SkillTool", () => {
               status: "completed",
               content: [{ type: "text", text: Skill.toModelOutput(flat, []) }],
             })
+            expect(loads.map((load) => [load.channel, load.status, load.skill?.id])).toEqual([
+              ["tool", "completed", Skill.ID.make("effect")],
+              ["tool", "completed", Skill.ID.make("effect")],
+              ["tool", "unavailable", undefined],
+              ["tool", "failed", Skill.ID.make("effect")],
+              ["tool", "interrupted", Skill.ID.make("effect")],
+              ["tool", "completed", Skill.ID.make("public")],
+            ])
           }).pipe(Effect.provide(skillToolLayer))
         }),
       ),

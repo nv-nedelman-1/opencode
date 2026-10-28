@@ -253,6 +253,23 @@ export const make = Effect.fn("PluginHost.make")(function* (
       transform: commands.transform,
     },
     event: {
+      observe: (callback) =>
+        Effect.acquireRelease(
+          bus.listen(
+            (event) =>
+              EventManifest.isServer(event) || isRpcEvent(event)
+                ? Effect.gen(function* () {
+                    const result: unknown = yield* Effect.sync(() => callback(event))
+                    if (result === undefined) return
+                    // Untyped plugins can violate the synchronous contract; never await their work.
+                    void Promise.resolve(result).catch(() => {})
+                    yield* Effect.logWarning("Plugin event observer must be synchronous and return undefined")
+                  }).pipe(Effect.catchCause(() => Effect.logWarning("Plugin event observer failed")))
+                : Effect.void,
+            { location: { directory: location.directory, workspaceID: location.workspaceID } },
+          ),
+          (dispose) => dispose,
+        ).pipe(Effect.map((dispose) => ({ dispose }))),
       subscribe: () =>
         bus
           .subscribe()
@@ -379,6 +396,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
         }),
     },
     mcp: {
+      observe: (name, callback) => hooks.observe("mcp", name, callback),
       list: (input) => {
         const ref = locationRef(input)
         if (ref && !isCurrentLocation(ref))
@@ -449,6 +467,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
         }),
     },
     skill: {
+      observe: (name, callback) => hooks.observe("skill", name, callback),
       list: () => response(skill.list()),
       reload: skill.reload,
       transform: (callback) =>
@@ -534,6 +553,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
     },
     session: {
       hook: (name, callback, options) => hooks.register("session", name, callback, options),
+      observe: (name, callback, options) => hooks.observe("session", name, callback, options),
       middleware: (name, middleware, options) => hooks.use("session", name, middleware, options),
       create: (input) =>
         sessions.create({

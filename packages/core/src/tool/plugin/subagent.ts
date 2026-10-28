@@ -261,7 +261,15 @@ export const Plugin = {
                   output.status === "completed"
                     ? `<subagent sessionID="${output.sessionID}" state="completed">\n${output.output}\n</subagent>`
                     : output.output,
-                metadata: { sessionID: output.sessionID, status: output.status },
+                metadata: {
+                  sessionID: output.sessionID,
+                  status: output.status,
+                  delegation: {
+                    kind: input.sessionID === undefined ? "new" : "continued",
+                    requestedMode: input.background === true ? "background" : "foreground",
+                    returnMode: output.status === "running" ? "background" : "foreground",
+                  },
+                },
               })),
             ),
         }),

@@ -914,6 +914,32 @@ it.effect("emits malformed AI SDK tool input without executing it", () =>
   }),
 )
 
+it.effect("preserves reported AI SDK model identity without substituting the configured alias", () =>
+  Effect.gen(function* () {
+    const aisdk = yield* AISDK.Service
+    for (const accepted of [undefined, "accepted-snapshot"] as const) {
+      yield* aisdk.hook.sdk((event) => {
+        event.sdk = {
+          languageModel: () =>
+            streamModel([
+              ...(accepted === undefined ? [] : [{ type: "response-metadata" as const, modelId: accepted }]),
+              { type: "response-metadata", id: "response-id-without-model" },
+              { type: "text-delta", id: "text", delta: "answer" },
+              { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+            ]),
+        }
+      })
+      const resolved = yield* aisdk.model(model(`identity-${accepted ?? "missing"}`))
+      const response = yield* LLMClient.generate(LLM.request({ model: resolved, prompt: "Hello" })).pipe(
+        Effect.provide(client),
+      )
+      expect(response.responseModel).toBe(accepted)
+      expect(response.events.find(LLMEvent.is.finish)?.responseModel).toBe(accepted)
+      if (accepted === undefined) expect(response.events.find(LLMEvent.is.finish)).not.toHaveProperty("responseModel")
+    }
+  }),
+)
+
 it.effect("keeps malformed provider-executed AI SDK input terminal", () =>
   Effect.gen(function* () {
     const aisdk = yield* AISDK.Service

@@ -11,6 +11,7 @@ import { KV } from "./kv.js"
 import { PluginHost } from "./plugin/host.js"
 import { type Failure, type Generation, Service } from "./plugin/service.js"
 import { State } from "./state.js"
+import { Tool } from "./tool.js"
 
 export { awaitActivation, type Generation, type Interface, Service } from "./plugin/service.js"
 
@@ -19,6 +20,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const kv = yield* KV.Service
+    const tools = yield* Tool.Service
     const scope = yield* Scope.make()
     // One slot per requested definition in activation order, including ones whose setup failed, so
     // the prefix diff below stays index-aligned and a failed revision is not retried until it changes.
@@ -62,7 +64,14 @@ const layer = Layer.effect(
         })
       })
       const exit = yield* Effect.suspend(() =>
-        plugin.effect({ ...host, storage: PluginHost.storage(kv, plugin.id) }),
+        plugin.effect({
+          ...host,
+          storage: PluginHost.storage(kv, plugin.id),
+          tool: {
+            ...host.tool,
+            transform: (callback) => tools.transform(callback, Tool.provenance(plugin.source, plugin.id)),
+          },
+        }),
       ).pipe(
         grouped,
         inherit,

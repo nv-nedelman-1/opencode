@@ -62,15 +62,27 @@ export const prepare = Effect.fn("SessionPrompt.prepare")(function* (request: {
         Effect.gen(function* () {
           const name = prepared.get(attachment.id)
           if (name !== undefined) return { id: attachment.id, name, mention: attachment.mention }
-          const skill = yield* skillService.get(attachment.id)
-          if (!skill) return yield* new SkillNotFoundError({ skill: attachment.id })
-          prepared.set(skill.id, skill.name)
-          return {
-            id: skill.id,
-            name: skill.name,
-            text: (yield* Skill.prepare(fs, skill).pipe(Effect.orDie)).output,
-            mention: attachment.mention,
-          }
+          const resolved = yield* skillService.resolve(attachment.id)
+          const skill = resolved?.skill
+          return yield* Skill.observeLoad(
+            hooks,
+            {
+              sessionID: request.session.id,
+              channel: "user_mention",
+              skill,
+              sourceKind: resolved?.sourceKind,
+            },
+            Effect.gen(function* () {
+              if (!skill) return yield* new SkillNotFoundError({ skill: attachment.id })
+              prepared.set(skill.id, skill.name)
+              return {
+                id: skill.id,
+                name: skill.name,
+                text: (yield* Skill.prepare(fs, skill).pipe(Effect.orDie)).output,
+                mention: attachment.mention,
+              }
+            }),
+          )
         }),
       )
     })

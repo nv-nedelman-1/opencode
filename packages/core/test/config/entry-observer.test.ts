@@ -17,6 +17,7 @@ describe("ConfigEntryObserver", () => {
         changes: () => Stream.empty,
       })
       const event = {
+        observe: () => Effect.die("unused event.observe"),
         subscribe: () =>
           Stream.unwrap(Ref.set(current, [document("raced")]).pipe(Effect.as(Stream.fromPubSub(updates)))),
       }

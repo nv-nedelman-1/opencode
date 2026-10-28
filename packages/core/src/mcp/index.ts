@@ -4,9 +4,24 @@ import { Mcp } from "@opencode/schema/mcp"
 import { McpEvent } from "@opencode/schema/mcp-event"
 import { ephemeral } from "@opencode/schema/event"
 import type { Session } from "@opencode/schema/session"
+import type { MCPRecovery } from "@opencode/plugin/effect/mcp"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
-import { Cause, Context, Effect, Exit, FiberSet, Latch, Layer, Schema, Scope, Semaphore, Stream, Types } from "effect"
+import {
+  Cause,
+  Clock,
+  Context,
+  Effect,
+  Exit,
+  FiberSet,
+  Latch,
+  Layer,
+  Schema,
+  Scope,
+  Semaphore,
+  Stream,
+  Types,
+} from "effect"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { Credential } from "../credential.js"
 import { Bus } from "../bus.js"
@@ -15,6 +30,7 @@ import { Form } from "../form.js"
 import { Integration } from "../integration.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
 import { Location } from "../location.js"
+import { PluginHooks } from "../plugin/hooks.js"
 import { waitForAbort } from "@opencode/util/process"
 import { State } from "../state.js"
 import type { McpClient } from "./client.js"
@@ -160,6 +176,7 @@ export const layer = (options?: Options) =>
       const forms = yield* Form.Service
       const integration = yield* Integration.Service
       const credentials = yield* Credential.Service
+      const hooks = yield* PluginHooks.Service
       const root = yield* Effect.scope
       const fork = yield* FiberSet.makeRuntime<never, void, never>()
 
@@ -335,14 +352,56 @@ export const layer = (options?: Options) =>
             ),
           )
 
+      const observeRecovery = <A, E>(
+        request: Pick<MCPRecovery, "operation" | "sessionID">,
+        phase: MCPRecovery["phase"],
+        run: Effect.Effect<A, E>,
+        succeeded = () => true,
+      ) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const started = yield* Clock.monotonicTimeNanos
+            const event = { ...request, reason: "session_expired" as const, phase }
+            yield* hooks.notify("mcp", "recovery", Object.freeze({ ...event, outcome: "started" }))
+            return yield* restore(run).pipe(
+              Effect.onExit((exit) =>
+                Effect.gen(function* () {
+                  yield* hooks.notify(
+                    "mcp",
+                    "recovery",
+                    Object.freeze({
+                      ...event,
+                      outcome: Exit.hasInterrupts(exit)
+                        ? "interrupted"
+                        : Exit.isFailure(exit) || !succeeded()
+                          ? "failed"
+                          : "succeeded",
+                      durationMs: Number((yield* Clock.monotonicTimeNanos) - started) / 1_000_000,
+                    }),
+                  )
+                }),
+              ),
+            )
+          }),
+        )
+
       // Re-establishes a server whose HTTP session the server dropped, unless another path already
       // replaced the connection while this one waited for the lock.
-      const recover = (name: ServerName, entry: ServerEntry, connection: McpClient.Connection) =>
+      const recover = (
+        name: ServerName,
+        entry: ServerEntry,
+        connection: McpClient.Connection,
+        request: Pick<MCPRecovery, "operation" | "sessionID"> = { operation: "background" },
+      ) =>
         Effect.gen(function* () {
           if (entry.client !== connection) return
           yield* Effect.logInfo("mcp session expired, reconnecting", { server: name })
-          yield* stopServer(name, entry)
-          yield* startServer(name, entry)
+          yield* observeRecovery(
+            request,
+            "reconnect",
+            stopServer(name, entry).pipe(Effect.andThen(startServer(name, entry))),
+            () => entry.client !== undefined,
+          )
         }).pipe(locks.withLock(name))
 
       // Runs a request against the live connection and, if that request observed a session expiry,
@@ -351,6 +410,7 @@ export const layer = (options?: Options) =>
         name: ServerName,
         entry: ServerEntry,
         connection: McpClient.Connection,
+        request: Pick<MCPRecovery, "operation" | "sessionID">,
         run: (connection: McpClient.Connection) => Effect.Effect<A, E>,
       ) =>
         run(connection).pipe(
@@ -358,14 +418,16 @@ export const layer = (options?: Options) =>
             // The client module is loaded lazily, so match the tagged error by tag rather than class.
             (error) => "_tag" in error && error._tag === "MCP.SessionExpiredError",
             (error) =>
-              recover(name, entry, connection).pipe(
-                Effect.flatMap(() => (entry.client ? run(entry.client) : Effect.fail(error))),
+              recover(name, entry, connection, request).pipe(
+                Effect.flatMap(() =>
+                  entry.client ? observeRecovery(request, "retry", run(entry.client)) : Effect.fail(error),
+                ),
               ),
           ),
         )
 
       const loadCatalog = (name: ServerName, entry: ServerEntry, connection: McpClient.Connection) =>
-        recovering(name, entry, connection, (connection) =>
+        recovering(name, entry, connection, { operation: "catalog" }, (connection) =>
           Effect.all(
             {
               resources: connection.resources(),
@@ -675,8 +737,12 @@ export const layer = (options?: Options) =>
               tool: input.name,
               message: unavailable(target.name, target.entry.status),
             })
-          const result = yield* recovering(target.name, target.entry, target.entry.client, (connection) =>
-            connection.callTool({ name: input.name, args: input.args, sessionID: input.sessionID }),
+          const result = yield* recovering(
+            target.name,
+            target.entry,
+            target.entry.client,
+            { operation: "tool", sessionID: input.sessionID },
+            (connection) => connection.callTool({ name: input.name, args: input.args, sessionID: input.sessionID }),
           ).pipe(
             Effect.mapError(
               (error) =>
@@ -707,8 +773,12 @@ export const layer = (options?: Options) =>
           const target = yield* requireServer(input.server)
           yield* target.entry.startup.await
           if (!target.entry.client) return undefined
-          const result = yield* recovering(target.name, target.entry, target.entry.client, (connection) =>
-            connection.prompt({ name: input.name, args: input.args }),
+          const result = yield* recovering(
+            target.name,
+            target.entry,
+            target.entry.client,
+            { operation: "prompt" },
+            (connection) => connection.prompt({ name: input.name, args: input.args }),
           ).pipe(Effect.orElseSucceed(() => undefined))
           if (!result) return undefined
           return { ...result, server: target.name, name: input.name }
@@ -735,8 +805,12 @@ export const layer = (options?: Options) =>
           const target = yield* requireServer(input.server)
           yield* target.entry.startup.await
           if (!target.entry.client) return undefined
-          const result = yield* recovering(target.name, target.entry, target.entry.client, (connection) =>
-            connection.readResource({ uri: input.uri }),
+          const result = yield* recovering(
+            target.name,
+            target.entry,
+            target.entry.client,
+            { operation: "resource" },
+            (connection) => connection.readResource({ uri: input.uri }),
           )
           if (!result) return undefined
           return ResourceContent.make({
@@ -775,7 +849,7 @@ export function configured(options?: Options) {
   return makeLocationNode({
     service: Service,
     layer: layer(options),
-    deps: [Location.node, Environment.node, Bus.node, Form.node, Integration.node, Credential.node],
+    deps: [Location.node, Environment.node, Bus.node, Form.node, Integration.node, Credential.node, PluginHooks.node],
   })
 }
 

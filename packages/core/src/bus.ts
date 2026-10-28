@@ -159,7 +159,7 @@ export interface Interface {
     readonly follow?: boolean
   }) => Stream.Stream<LogItem>
   /** @deprecated Use `subscribe()` and consume the returned stream. */
-  readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
+  readonly listen: (listener: Subscriber, options?: { readonly location: Location.Ref }) => Effect.Effect<Unsubscribe>
   readonly project: <D extends Event.Definition>(definition: D, projector: Subscriber<D>) => Effect.Effect<void>
   readonly replay: (
     event: SerializedEvent,
@@ -723,23 +723,21 @@ export function configured(options?: Options) {
             .pipe(Effect.orDie)
         }
 
+        const matchesLocation = (event: Event.Payload, location: Location.Ref) => {
+          const matches = (ref: Location.Ref) =>
+            ref.directory === location.directory && ref.workspaceID === location.workspaceID
+          const refs = routes.get(event)
+          if (refs) return refs.some(matches)
+          return !event.location || matches(event.location)
+        }
+
         const local = <A extends Event.Payload>(stream: Stream.Stream<A>) =>
           Stream.unwrap(
             Effect.serviceOption(Location.Service).pipe(
               Effect.map((location) =>
                 Option.match(location, {
                   onNone: () => stream,
-                  onSome: (location) => {
-                    const matches = (ref: Location.Ref) =>
-                      ref.directory === location.directory && ref.workspaceID === location.workspaceID
-                    return stream.pipe(
-                      Stream.filter((event) => {
-                        const refs = routes.get(event)
-                        if (refs) return refs.some(matches)
-                        return !event.location || matches(event.location)
-                      }),
-                    )
-                  },
+                  onSome: (location) => stream.pipe(Stream.filter((event) => matchesLocation(event, location))),
                 }),
               ),
             ),
@@ -870,11 +868,18 @@ export function configured(options?: Options) {
             }),
           )
 
-        const listen = (listener: Subscriber): Effect.Effect<Unsubscribe> =>
+        const listen = (
+          listener: Subscriber,
+          options?: { readonly location: Location.Ref },
+        ): Effect.Effect<Unsubscribe> =>
           Effect.sync(() => {
-            listeners.push(listener)
+            const location = options?.location
+            const registered = location
+              ? (event: Event.Payload) => (matchesLocation(event, location) ? listener(event) : Effect.void)
+              : listener
+            listeners.push(registered)
             return Effect.sync(() => {
-              const index = listeners.indexOf(listener)
+              const index = listeners.indexOf(registered)
               if (index >= 0) listeners.splice(index, 1)
             })
           })

@@ -25,6 +25,7 @@ import { SessionProjector } from "@opencode/core/session/projector"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { Skill } from "@opencode/core/skill"
+import type { SkillLoad } from "@opencode/plugin/effect/skill"
 import { Event } from "@opencode/schema/event"
 import { testEffect } from "./lib/effect"
 import { globalProjectNode } from "./lib/project"
@@ -101,6 +102,8 @@ describe("Session.skill", () => {
       const sessions = yield* Session.Service
       const managed = yield* ManagedPolicy.Service
       const session = yield* sessions.create({ location })
+      const loads: SkillLoad[] = []
+      yield* observeLoads(session, loads)
       yield* managed.set({ statements: [{ action: "integration.use", resource: "skill:effect", effect: "deny" }] })
       expect(
         yield* sessions.skill({ sessionID: session.id, skill: info.id, resume: false }).pipe(Effect.flip),
@@ -117,6 +120,10 @@ describe("Session.skill", () => {
       ).toMatchObject({ _tag: "Session.SkillNotFoundError", skill: info.id })
       expect(yield* sessions.messages({ sessionID: session.id })).toEqual([])
       expect(yield* sessions.inbox(session.id)).toEqual([])
+      expect(loads.map((load) => [load.channel, load.status])).toEqual([
+        ["user_activation", "unavailable"],
+        ["user_mention", "unavailable"],
+      ])
     }),
   )
 
@@ -126,6 +133,8 @@ describe("Session.skill", () => {
       const database = yield* Database.Service
       const bus = yield* Bus.Service
       const session = yield* sessions.create({ location })
+      const loads: SkillLoad[] = []
+      yield* observeLoads(session, loads)
       const id = SessionMessage.ID.make("msg_skill_attachment")
 
       yield* sessions.prompt({
@@ -160,6 +169,9 @@ describe("Session.skill", () => {
             },
           ],
         }),
+      ])
+      expect(loads.map((load) => [load.channel, load.status, load.skill?.id])).toEqual([
+        ["user_mention", "completed", Skill.ID.make("effect")],
       ])
     }),
   )
@@ -221,4 +233,14 @@ describe("Session.skill", () => {
       expect(yield* sessions.inbox(session.id)).toEqual([])
     }),
   )
+})
+
+const observeLoads = Effect.fnUntraced(function* (session: Session.Info, loads: SkillLoad[]) {
+  const locations = yield* LocationServiceMap.Service
+  yield* PluginHooks.Service.use((hooks) =>
+    hooks.observe("skill", "load", (event) => {
+      loads.push(event)
+      return undefined
+    }),
+  ).pipe(Effect.provide(locations.get(session.location)))
 })

@@ -34,7 +34,7 @@
     "@opencode/plugin": "workspace:*",
     "@opencode/schema": "workspace:*",
     "effect": "catalog:",
-    "nemo-relay-node": "0.10.0-rc.4"
+    "nemo-relay-node": "0.11.0-rc.1"
   },
   "devDependencies": {
     "@tsconfig/bun": "catalog:",

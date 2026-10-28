@@ -26,6 +26,7 @@ describe("SkillPlugin.Plugin", () => {
         host({
           app: { name: "test", version: "1.2.3", channel: "beta" },
           skill: {
+            observe: () => Effect.die("unused skill.observe"),
             list: () => Effect.die("unused skill.list"),
             transform: skill.transform,
             reload: skill.reload,
@@ -51,6 +52,8 @@ describe("SkillPlugin.Plugin", () => {
       )
       expect(report?.content).toContain("- opencode version: 1.2.3")
       expect(report?.content).toContain("- install/channel: beta")
+      expect((yield* skill.resolve(Skill.ID.make("opencode")))?.sourceKind).toBe("embedded")
+      expect((yield* skill.resolve(Skill.ID.make("report")))?.sourceKind).toBe("embedded")
     }),
   )
 
@@ -60,6 +63,7 @@ describe("SkillPlugin.Plugin", () => {
       yield* SkillPlugin.Plugin.effect(
         host({
           skill: {
+            observe: () => Effect.die("unused skill.observe"),
             list: () => Effect.die("unused skill.list"),
             transform: skill.transform,
             reload: skill.reload,

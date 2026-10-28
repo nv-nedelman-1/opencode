@@ -107,6 +107,45 @@ function waitForRequest(input: Partial<Permission.AssertInput> = {}) {
 }
 
 describe("Permission", () => {
+  it.effect("retains exact tool source identity across shared permission actions and hook decisions", () =>
+    Effect.gen(function* () {
+      yield* setup([{ action: "edit", resource: "*", effect: "allow" }])
+      const service = yield* Permission.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: PluginHooks.Domains["permission"]["decision"][] = []
+      yield* hooks.register("permission", "decision", (event) =>
+        Effect.sync(() => {
+          seen.push(event)
+        }),
+      )
+      const first = { type: "tool", messageID: "msg_first", id: "call_write" } as const
+      const second = { type: "tool", messageID: "msg_second", id: "call_patch" } as const
+      yield* service.ask(assertion({ action: "edit", source: first }))
+      yield* setRules([{ action: "edit", resource: "*", effect: "deny" }])
+      yield* service.ask(assertion({ action: "edit", source: second }))
+      yield* setRules([])
+      const asked = yield* service.ask(assertion({ action: "edit", source: second }))
+      expect(asked.effect).toBe("ask")
+      expect((yield* service.list())[0]?.source).toEqual(second)
+      yield* service.reply({ requestID: asked.id, reply: "once" })
+      yield* hooks.register("permission", "evaluate", (event) =>
+        Effect.sync(() => {
+          event.effect = "allow"
+        }),
+      )
+      yield* service.ask(assertion({ action: "edit", source: first }))
+      expect(seen.map((event) => [event.source, event.effect, event.origin])).toEqual([
+        [first, "allow", "rules"],
+        [second, "deny", "rules"],
+        [second, "ask", "rules"],
+        [first, "allow", "hook"],
+      ])
+      expect(seen.every((event) => Object.isFrozen(event.source))).toBe(true)
+      expect(seen[0]!.source).not.toBe(first)
+      expect(yield* service.list()).toEqual([])
+    }),
+  )
+
   it.effect("returns the evaluated effect and only queues prompts", () =>
     Effect.gen(function* () {
       yield* setup([{ action: "read", resource: "*", effect: "allow" }])

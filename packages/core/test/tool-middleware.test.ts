@@ -7,6 +7,7 @@ import { Session } from "@opencode/core/session"
 import { SessionMessage } from "@opencode/core/session/message"
 import { Tool } from "@opencode/core/tool"
 import type { Info } from "@opencode/schema/tool"
+import type { ToolProvenance } from "@opencode/plugin/effect/tool"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Cause, Effect, Exit, Layer, Schema } from "effect"
 import { testEffect } from "./lib/effect"
@@ -41,6 +42,118 @@ const register = (execute: Info["execute"] = echo) =>
   })
 
 describe("Tool execute middleware", () => {
+  it.effect("captures registration provenance across overrides, updates, disposal and request aliases", () =>
+    Effect.gen(function* () {
+      const service = yield* Tool.Service
+      const hooks = yield* PluginHooks.Service
+      const seen: ToolProvenance[] = []
+      const terminal: ToolProvenance[] = []
+      yield* hooks.use("tool", "execute", (event, next) => {
+        seen.push(event.provenance!)
+        return next(event.input)
+      })
+      yield* hooks.register("tool", "execute.after", (event) =>
+        Effect.sync(() => {
+          terminal.push(event.provenance!)
+        }),
+      )
+      const definition = {
+        name: "read",
+        description: "A synthetic MCP tool whose name resembles a built-in",
+        input: Schema.Struct({ text: Schema.String }),
+        execute: echo,
+        options: { codemode: false },
+      } satisfies Info
+      const mcp = { origin: "mcp", execution: "mcp", category: "extension" } as const
+      yield* service.transform((editor) => editor.add(definition), mcp)
+      const original = yield* service.snapshot()
+      const replacement = yield* service.transform(
+        (editor) => editor.add(definition),
+        Tool.provenance({ type: "sdk" }, "opencode.tool.read"),
+      )
+      const selected = yield* service.snapshot()
+      const input = {
+        ...call({ text: "unchanged" }),
+        call: { ...call({ text: "unchanged" }).call, name: "read" },
+      }
+      yield* original.execute(input)
+      yield* selected.execute(input)
+      yield* replacement.dispose
+      yield* service.transform((editor) =>
+        editor.update("read", (tool) => {
+          tool.description = "Updated"
+        }),
+      )
+      const updated = yield* service.snapshot()
+      yield* updated.execute(input)
+      yield* service.transform(
+        (editor) =>
+          editor.update("read", (tool) => {
+            tool.execute = () => Effect.succeed({ content: "replaced" })
+          }),
+        Tool.provenance({ type: "sdk" }, "opencode.tool.read"),
+      )
+      const changed = yield* service.snapshot()
+      yield* changed.execute({
+        ...input,
+        call: { ...input.call, name: "alias" },
+        definitions: new Map([
+          ["alias", { type: "tool", name: "read", description: "alias", inputSchema: { type: "object" } }],
+        ]),
+      })
+      yield* service.transform(
+        (editor) => editor.add({ ...definition, name: "target" }),
+        Tool.provenance({ type: "builtin" }, "opencode.tool.read"),
+      )
+      yield* hooks.register("tool", "execute.before", (event) =>
+        Effect.sync(() => {
+          event.tool = "target"
+        }),
+      )
+      const retargeted = yield* service.snapshot()
+      yield* retargeted.execute(input)
+      expect(seen).toEqual([
+        mcp,
+        { origin: "plugin", execution: "local", category: "extension" },
+        mcp,
+        { origin: "plugin", execution: "local", category: "extension" },
+        { origin: "builtin", execution: "local", category: "file_read" },
+      ])
+      expect(terminal).toEqual(seen)
+      expect(seen.every(Object.isFrozen)).toBe(true)
+    }),
+  )
+
+  it.effect("classifies only actual built-in registrations and keeps untagged tools unknown", () =>
+    Effect.gen(function* () {
+      expect(Tool.provenance({ type: "builtin" }, "opencode.tool.read")).toEqual({
+        origin: "builtin",
+        execution: "local",
+        category: "file_read",
+      })
+      expect(Tool.provenance({ type: "sdk" }, "opencode.tool.read")).toEqual({
+        origin: "plugin",
+        execution: "local",
+        category: "extension",
+      })
+      expect(Tool.provenance(undefined, "opencode.tool.read")).toEqual({
+        origin: "unknown",
+        execution: "local",
+        category: "unknown",
+      })
+      const service = yield* register()
+      const hooks = yield* PluginHooks.Service
+      const seen: unknown[] = []
+      yield* hooks.use("tool", "execute", (event, next) => {
+        seen.push(event.provenance)
+        return next(event.input)
+      })
+      const snapshot = yield* service.snapshot()
+      yield* snapshot.execute(call({ text: "unchanged" }))
+      expect(seen).toEqual([{ origin: "unknown", execution: "local", category: "unknown" }])
+    }),
+  )
+
   it.effect("wraps execution after execute.before hooks and validates rewritten input", () =>
     Effect.gen(function* () {
       const service = yield* register()

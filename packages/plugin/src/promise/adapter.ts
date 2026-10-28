@@ -435,6 +435,7 @@ export function fromPromise(plugin: Plugin) {
             },
           },
           mcp: {
+            observe: (name, callback) => register(host.mcp.observe(name, callback)),
             list: adaptApiMethod(McpEndpoints["mcp.list"], host.mcp.list),
             transform: transform(host.mcp),
             reload: () => run(host.mcp.reload()),
@@ -456,6 +457,7 @@ export function fromPromise(plugin: Plugin) {
           },
           rpc: yield* rpcFromEffect(host.rpc, streams),
           skill: {
+            observe: (name, callback) => register(host.skill.observe(name, callback)),
             list: adaptApiMethod(SkillEndpoints["skill.list"], host.skill.list),
             transform: transform(host.skill),
             reload: () => run(host.skill.reload()),
@@ -585,6 +587,7 @@ export function fromPromise(plugin: Plugin) {
               register(
                 host.session.hook(name, (event) => Effect.promise(() => Promise.resolve(callback(event))), options),
               ),
+            observe: (name, callback, options) => register(host.session.observe(name, callback, options)),
             create: adaptApiMethod(SessionEndpoints["session.create"], host.session.create),
             get: adaptApiMethod(SessionEndpoints["session.get"], host.session.get),
             remove: adaptApiMethod(SessionEndpoints["session.remove"], host.session.remove),

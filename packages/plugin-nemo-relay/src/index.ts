@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin/effect"
 import { EventManifest } from "@opencode/schema/event-manifest"
 import type { Session } from "@opencode/schema/session"
 import { Tool } from "@opencode/schema/tool"
-import { Cause, Effect, Stream } from "effect"
+import { Cause, Effect } from "effect"
 import { RelayHost } from "./host.js"
 import { RelayModel } from "./model.js"
 import { RelayTool } from "./tool.js"
@@ -26,7 +26,7 @@ export default Plugin.define({
   id: "opencode.nemo-relay",
   effect: (ctx) =>
     Effect.gen(function* () {
-      const runtime = yield* RelayHost.acquire()
+      const runtime = yield* RelayHost.acquire({ client: ctx.app })
       if (!runtime) return
       if (runtime instanceof RelayHost.StartupFailure) {
         yield* ctx.tool.middleware("execute", () =>
@@ -46,9 +46,12 @@ export default Plugin.define({
           Effect.map((session) => session.parentID),
           Effect.orElseSucceed(() => undefined),
         )
-      yield* ctx.tool.middleware("execute", RelayTool.middleware(runtime, parentID))
-      yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
       const observed = RelayObserve.make(runtime)
+      const tool = RelayTool.middleware(runtime, parentID)
+      yield* ctx.tool.middleware("execute", (call, next) =>
+        observe(observed.toolExecution(call)).pipe(Effect.andThen(tool(call, next))),
+      )
+      yield* ctx.session.middleware("http", RelayModel.middleware(runtime, parentID))
       yield* ctx.session.hook("context", (event) => observe(observed.context(event)))
       yield* ctx.session.hook("compaction", (event) => observe(observed.context(event, "compaction")))
       yield* ctx.session.hook("generate", (event) => observe(observed.context(event, "generate")))
@@ -57,11 +60,26 @@ export default Plugin.define({
       yield* ctx.session.hook("retry.decision", (event) => observe(observed.retryDecision(event)))
       yield* ctx.session.hook("compaction.outcome", (event) => observe(observed.compactionOutcome(event)))
       yield* ctx.session.hook("usage", (event) => observe(observed.usage(event)))
+      yield* ctx.session.observe("model.outcome", (event) => {
+        Effect.runSync(observed.modelOutcome(event))
+        return undefined
+      })
+      yield* ctx.skill.observe("load", (event) => {
+        Effect.runSync(observed.skillLoad(event))
+        return undefined
+      })
+      yield* ctx.skill.observe("catalog", (event) => {
+        Effect.runSync(observed.skillCatalog(event))
+        return undefined
+      })
+      yield* ctx.mcp.observe("recovery", (event) => {
+        Effect.runSync(observed.mcpRecovery(event))
+        return undefined
+      })
       yield* ctx.permission.hook("decision", (event) => observe(observed.permissionDecision(event)))
-      yield* ctx.event.subscribe().pipe(
-        Stream.filter(EventManifest.isServer),
-        Stream.runForEach((event) => observe(observed.event(event))),
-        Effect.forkScoped({ startImmediately: true }),
-      )
+      yield* ctx.event.observe((event) => {
+        if (EventManifest.isServer(event)) Effect.runSync(observed.event(event))
+        return undefined
+      })
     }),
 })

@@ -18,4 +18,11 @@ export type ModelHooks<Spec> = <Name extends keyof Spec>(
   options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
 ) => Promise<Registration>
 
+/** Read-only source observations must be synchronous, non-blocking, and return undefined. */
+export type Observers<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  callback: (input: Spec[Name]) => undefined,
+  options?: Spec[Name] extends { readonly model: unknown } ? ModelHookOptions : never,
+) => Promise<Registration>
+
 export type Transform<Input> = (callback: (input: Input) => void) => Promise<Registration>
