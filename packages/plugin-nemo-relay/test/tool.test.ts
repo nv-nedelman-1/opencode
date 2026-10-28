@@ -64,6 +64,11 @@ const run = (
 }
 
 const forward: Bridge = (input, next) => next(input, new AbortController().signal)
+const replace = (result: unknown) =>
+  run(
+    async () => ({ result }),
+    () => Effect.die("replacement must not dispatch the tool"),
+  )
 
 describe("Relay tool middleware boundaries", () => {
   test("native tool spans receive captured provenance rather than classifying their name", async () => {
@@ -138,12 +143,7 @@ describe("Relay tool middleware boundaries", () => {
     const defect = new Error("permission declined")
     const died = await run(recover, () => Effect.die(defect))
     expect(Exit.isFailure(died) && Cause.squash(died.cause)).toBe(defect)
-    expect(
-      await run(
-        async () => ({ result: { content: "cached" } }),
-        () => Effect.die("must not run"),
-      ),
-    ).toEqual(Exit.succeed({ content: "cached" }))
+    expect(await replace({ content: "cached" })).toEqual(Exit.succeed({ content: "cached" }))
   })
 
   test.each([
@@ -161,12 +161,7 @@ describe("Relay tool middleware boundaries", () => {
     },
     { value: { content: "weather", temperature: 70 }, content: '{"content":"weather","temperature":70}' },
   ])("preserves arbitrary JSON replacement $content", async ({ value, content }) => {
-    expect(
-      await run(
-        async () => ({ result: value }),
-        () => Effect.die("replacement must not dispatch the tool"),
-      ),
-    ).toEqual(Exit.succeed({ content }))
+    expect(await replace(value)).toEqual(Exit.succeed({ content }))
   })
 
   test.each([
@@ -175,12 +170,7 @@ describe("Relay tool middleware boundaries", () => {
     { metadata: { source: "intercept" } },
     { content: [{ type: "text" as const, text: "cached" }] },
   ])("retains recognized OpenCode result envelopes %#", async (value) => {
-    expect(
-      await run(
-        async () => ({ result: value }),
-        () => Effect.die("replacement must not dispatch the tool"),
-      ),
-    ).toEqual(Exit.succeed(value))
+    expect(await replace(value)).toEqual(Exit.succeed(value))
   })
 
   test("preserves arbitrary JSON substituted after the host tool completed without replaying it", async () => {

@@ -45,15 +45,42 @@ const observations = () => ({
   cancel: undefined as (() => void) | undefined,
 })
 
-const call = (
-  request = new Request("https://provider.test/model", { method: "POST", body: '{"prompt":"hi"}' }),
-): SessionHttpCall => ({
+const providerRequest = (signal?: AbortSignal) =>
+  new Request("https://provider.test/model", { method: "POST", body: '{"prompt":"hi"}', signal })
+
+const call = (request = providerRequest()): SessionHttpCall => ({
   sessionID: Session.ID.make("ses_model_unit"),
   agent: Agent.ID.make("build"),
   model: { providerID: Provider.ID.make("test"), id: Model.ID.make("model") },
   kind: "primary",
   protocol: "custom-json",
   request,
+})
+
+const host = (
+  observed: ReturnType<typeof observations>,
+  api: RelayHost.Relay,
+  parent: ScopeHandle,
+  execute: RelayHost.Operation["run"] = (callback) => callback(),
+): RelayHost.Runtime => ({
+  relay: api,
+  scope: () => Effect.succeed(parent),
+  open: () => parent,
+  admit: () => true,
+  mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+  close: () => {},
+  lease: () =>
+    Effect.succeed({
+      parent,
+      run: execute,
+      mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+      onCancel: (cancel) => {
+        observed.cancel = cancel
+      },
+      release: () => {
+        observed.releases++
+      },
+    }),
 })
 
 const run = (
@@ -63,9 +90,9 @@ const run = (
   signal?: AbortSignal,
   observed = observations(),
 ) => {
-  const parent = { uuid: "scope_model_unit" } as ScopeHandle
-  const runtime: RelayHost.Runtime = {
-    relay: {
+  const runtime = host(
+    observed,
+    {
       OpenAIChatCodec: relay.OpenAIChatCodec,
       OpenAIResponsesCodec: relay.OpenAIResponsesCodec,
       AnthropicMessagesCodec: relay.AnthropicMessagesCodec,
@@ -84,24 +111,8 @@ const run = (
         return bridge(input, callback)
       },
     } as unknown as RelayHost.Relay,
-    scope: () => Effect.succeed(parent),
-    open: () => parent,
-    admit: () => true,
-    mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-    close: () => {},
-    lease: () =>
-      Effect.succeed({
-        parent,
-        run: (callback) => callback(),
-        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-        onCancel: (cancel) => {
-          observed.cancel = cancel
-        },
-        release: () => {
-          observed.releases++
-        },
-      }),
-  }
+    { uuid: "scope_model_unit" } as ScopeHandle,
+  )
   return Effect.runPromiseExit(RelayModel.middleware(runtime, () => Effect.succeed(undefined))(input, next), { signal })
 }
 
@@ -110,8 +121,9 @@ const forward: Bridge = (input, next) => next(input, new AbortController().signa
 const native = (observed: ReturnType<typeof observations>) => {
   const stack = relay.createScopeStack()
   const parent = relay.withScopeStack(stack, () => relay.pushScope("physical-attempt-test", 0)) as ScopeHandle
-  const runtime: RelayHost.Runtime = {
-    relay: {
+  const runtime = host(
+    observed,
+    {
       ...relay,
       llmCallExecuteAsync: (...args: Parameters<typeof relay.llmCallExecuteAsync>) => {
         const result = relay.llmCallExecuteAsync(...args)
@@ -125,22 +137,9 @@ const native = (observed: ReturnType<typeof observations>) => {
         return result
       },
     } as unknown as RelayHost.Relay,
-    scope: () => Effect.succeed(parent),
-    open: () => parent,
-    admit: () => true,
-    close: () => {},
-    mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-    lease: () =>
-      Effect.succeed({
-        parent,
-        run: <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
-        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-        onCancel: () => {},
-        release: () => {
-          observed.releases++
-        },
-      }),
-  }
+    parent,
+    <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
+  )
   return { runtime, parent, close: () => relay.withScopeStack(stack, () => relay.popScope(parent)) }
 }
 
@@ -403,13 +402,7 @@ describe("Relay model middleware contracts", () => {
       const requestAbort = new AbortController()
       const observed = observations()
       const pending = run(
-        call(
-          new Request("https://provider.test/model", {
-            method: "POST",
-            body: '{"prompt":"hi"}',
-            signal: requestAbort.signal,
-          }),
-        ),
+        call(providerRequest(requestAbort.signal)),
         async (input, next) => {
           const revoke = new AbortController()
           void next(input, revoke.signal).catch(() => undefined)
@@ -500,13 +493,7 @@ describe("Relay model middleware contracts", () => {
         const tail = Promise.withResolvers<void>()
         const abort = new AbortController()
         const pending = run(
-          call(
-            new Request("https://provider.test/model", {
-              method: "POST",
-              body: '{"prompt":"hi"}',
-              signal: abort.signal,
-            }),
-          ),
+          call(providerRequest(abort.signal)),
           async (input, next) => {
             if (dispatched) await next(input, new AbortController().signal)
             entered.resolve()
@@ -536,13 +523,7 @@ describe("Relay model middleware contracts", () => {
       const relayAbort = new AbortController()
       const requestAbort = new AbortController()
       const effectAbort = new AbortController()
-      const input = call(
-        new Request("https://provider.test/model", {
-          method: "POST",
-          body: '{"prompt":"hi"}',
-          signal: requestAbort.signal,
-        }),
-      )
+      const input = call(providerRequest(requestAbort.signal))
       const state: { request?: Request; calls: number; interrupted: boolean } = { calls: 0, interrupted: false }
       const pending = run(
         input,

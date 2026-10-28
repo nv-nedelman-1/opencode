@@ -19,6 +19,7 @@ import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Deferred, Effect, Exit, Fiber } from "effect"
 import { TestClock } from "effect/testing"
 import { testEffect } from "./lib/effect"
+import { sourceObserver } from "./lib/source-observer"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([PluginHooks.node])))
 const input = {
@@ -31,10 +32,7 @@ const input = {
 const collect = Effect.gen(function* () {
   const hooks = yield* PluginHooks.Service
   const outcomes: PluginHooks.Observations["session"]["model.outcome"][] = []
-  yield* hooks.observe("session", "model.outcome", (event) => {
-    outcomes.push(event)
-    return undefined
-  })
+  yield* hooks.observe("session", "model.outcome", (event) => void outcomes.push(event))
   return { hooks, outcomes }
 })
 
@@ -199,10 +197,7 @@ it.effect("classifies typed model failures without exposing provider payloads", 
       ["authentication", new AuthenticationError({ message: "private secret" })],
       ["rate-limit", new RateLimitError({ message: "private secret", retryAfterMs: 10 })],
       ["timeout", new TimeoutError({ message: "private secret", timeoutMs: 100 })],
-      [
-        "context-overflow",
-        new InvalidRequestError({ message: "private secret", classification: "context-overflow" }),
-      ],
+      ["context-overflow", new InvalidRequestError({ message: "private secret", classification: "context-overflow" })],
       [
         "incomplete-stream",
         new InvalidProviderOutputError({ message: "private secret", classification: "incomplete-stream" }),
@@ -241,69 +236,25 @@ it.effect("keeps overlapping invocation identities separate and omits unknown re
   }),
 )
 
-it.effect("invalid async or Effect observations cannot hold success, failure, or interruption settlement", () =>
-  Effect.gen(function* () {
-    const hooks = yield* PluginHooks.Service
-    for (const status of ["completed", "failed", "interrupted"] as const) {
-      yield* Effect.scoped(
-        Effect.gen(function* () {
-          const pending = Promise.withResolvers<undefined>()
-          const release = yield* Deferred.make<void>()
-          let foreignRan = false
-          let settled = false
-          let first: PluginHooks.Observations["session"]["model.outcome"] | undefined
-          const received: PluginHooks.Observations["session"]["model.outcome"][] = []
-          yield* hooks.observe("session", "model.outcome", (event) => {
-            first = event
-            throw new Error("private observer defect")
-          })
-          // @ts-expect-error Observations cannot return a pending promise, even from untyped plugins.
-          yield* hooks.observe("session", "model.outcome", () => pending.promise)
-          // @ts-expect-error Async callbacks are not source observers; rejected work is consumed, not awaited.
-          yield* hooks.observe("session", "model.outcome", async () => {
-            throw new Error("private async rejection")
-          })
-          const foreign = Effect.sync(() => {
-            foreignRan = true
-          }).pipe(Effect.andThen(Deferred.await(release)))
-          // @ts-expect-error Returning an Effect must not run it or hold uninterruptible cleanup.
-          yield* hooks.observe("session", "model.outcome", () => foreign)
-          yield* hooks.observe("session", "model.outcome", (event) => {
-            received.push(event)
-            return undefined
-          })
-          const failure = new Error("original failure")
-          const call = yield* SessionModelOutcome.observe(hooks, input, (observer) => {
-            if (status === "failed") return Effect.fail(failure)
-            if (status === "interrupted") return Effect.interrupt
-            observer.finish({ normalized: "stop" }, "accepted")
-            return Effect.succeed("unchanged")
-          }).pipe(
-            Effect.onExit(() =>
-              Effect.sync(() => {
-                settled = true
-              }),
-            ),
-            Effect.forkScoped({ startImmediately: true }),
-          )
-          yield* Effect.yieldNow
-          const settledBeforeRelease = settled
-          pending.resolve(undefined)
-          yield* Deferred.succeed(release, undefined)
-          const exit = yield* Fiber.await(call)
-          yield* Effect.promise(() => Promise.resolve())
-          expect(settledBeforeRelease).toBe(true)
-          expect(foreignRan).toBe(false)
-          expect(received).toHaveLength(1)
-          expect(received[0]).toBe(first!)
-          expect(received[0].status).toBe(status)
-          expect(Object.isFrozen(received[0])).toBe(true)
-          expect(Object.isFrozen(received[0].model)).toBe(true)
-          if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
-          if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
-          if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
+for (const status of ["completed", "failed", "interrupted"] as const) {
+  it.effect(`invalid async or Effect observations cannot hold ${status} settlement`, () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const observer = yield* sourceObserver(hooks, "session", "model.outcome")
+      const failure = new Error("original failure")
+      const exit = yield* observer.settle(
+        SessionModelOutcome.observe(hooks, input, (event) => {
+          if (status === "failed") return Effect.fail(failure)
+          if (status === "interrupted") return Effect.interrupt
+          event.finish({ normalized: "stop" }, "accepted")
+          return Effect.succeed("unchanged")
         }),
       )
-    }
-  }),
-)
+      expect(observer.received[0].status).toBe(status)
+      expect(Object.isFrozen(observer.received[0].model)).toBe(true)
+      if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
+      if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
+      if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
+    }),
+  )
+}

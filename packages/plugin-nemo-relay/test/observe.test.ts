@@ -26,6 +26,12 @@ const sibling = Session.ID.make("ses_sibling")
 const assistantMessageID = SessionMessage.ID.make("msg_observe")
 const tokens = { input: 5, output: 3, reasoning: 1, cache: { read: 2, write: 0 } }
 const model = { providerID: Provider.ID.make("provider"), id: Model.ID.make("model") }
+const secretSkill = () => ({
+  id: Skill.ID.make("SECRET"),
+  name: Skill.Name.make("SECRET"),
+  path: AbsolutePath.make("/SECRET"),
+  content: "SECRET",
+})
 
 const published = <D extends Event.Definition>(
   definition: D & Schema.ConstraintDecoder<unknown, never>,
@@ -72,7 +78,8 @@ const makeFixture = (seen = new Set<string>()) => {
         provenance,
       }),
     )
-  return { observer, capture, runtime, marks, opened, closed }
+  const send = (event: Parameters<typeof observer.event>[0]) => Effect.runSync(observer.event(event))
+  return { observer, capture, send, runtime, marks, opened, closed }
 }
 
 test("interleaved executions retain independent host timings and outcomes", () => {
@@ -83,7 +90,7 @@ test("interleaved executions retain independent host timings and outcomes", () =
     published(SessionEvent.Execution.Succeeded, { sessionID }, 180),
     published(SessionEvent.Execution.Interrupted, { sessionID: sibling, reason: "user" }, 200),
     published(SessionEvent.Execution.Succeeded, { sessionID }, 210),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.opened).toEqual([
     [sessionID, undefined, 100_000],
@@ -136,7 +143,7 @@ test("run usage summaries are isolated observed step samples, not another billin
     published(SessionEvent.Execution.Started, { sessionID }, 160),
     published(SessionEvent.Execution.Succeeded, { sessionID }, 170),
   ])
-    Effect.runSync(fixture.observer.event(event))
+    fixture.send(event)
   expect(
     fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2]),
   ).toMatchObject([
@@ -184,7 +191,7 @@ test("step, retry, and compaction observations whitelist host data without dupli
       { sessionID, reason: "auto", error: { type: "SECRET", message: "SECRET" } },
       270,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.marks[1][2]).toEqual({
     count: 1,
@@ -232,22 +239,20 @@ test("generic retries keep one observed step record and its earliest start", () 
       { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0), tokens },
       300,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.step.started")).toHaveLength(1)
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.completed")).toHaveLength(1)
   expect(fixture.marks[1][2]).toMatchObject({ duration_ms: 200 })
-  Effect.runSync(
-    fixture.observer.event(
-      published(
-        SessionEvent.Step.Failed,
-        {
-          sessionID,
-          assistantMessageID: SessionMessage.ID.make("msg_missing_start"),
-          error: { type: "aborted", message: "SECRET" },
-        },
-        320,
-      ),
+  fixture.send(
+    published(
+      SessionEvent.Step.Failed,
+      {
+        sessionID,
+        assistantMessageID: SessionMessage.ID.make("msg_missing_start"),
+        error: { type: "aborted", message: "SECRET" },
+      },
+      320,
     ),
   )
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.step.completed")[1]?.[2]).toEqual({
@@ -315,7 +320,7 @@ test("interleaved Location observers share run accounting and complete pending w
     ),
     published(Permission.Event.Asked, { sessionID, id: permission, action: "bash", resources: ["SECRET"] }, 130),
   ].forEach((event) => {
-    Effect.runSync(fixture.observer.event(event))
+    fixture.send(event)
     Effect.runSync(second.event(event))
   })
   ;[
@@ -323,7 +328,7 @@ test("interleaved Location observers share run accounting and complete pending w
     published(SessionEvent.Execution.Succeeded, { sessionID }, 200),
   ].forEach((event) => {
     Effect.runSync(second.event(event))
-    Effect.runSync(fixture.observer.event(event))
+    fixture.send(event)
   })
 
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.run.completed").map((mark) => mark[2])).toEqual([
@@ -351,7 +356,7 @@ test("Location turnover preserves child parentage and first-output state while t
       { sessionID: sibling, parentID: sessionID, boundary: { type: "through", messageID: assistantMessageID } },
       120,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   // Only the surviving/new Location receives later events; the process runtime is unchanged.
   const surviving = RelayObserve.make(fixture.runtime)
@@ -392,7 +397,7 @@ test("skill requests and successful loads are distinct from user activation and 
     published(Skill.Event.Updated, {}, 140),
     published(McpEvent.StatusChanged, { server: "SECRET" }, 150),
   ].forEach((event) => {
-    Effect.runSync(fixture.observer.event(event))
+    fixture.send(event)
     if (event.type === "session.tool.input.started")
       fixture.capture("call1", { origin: "builtin", execution: "local", category: "skill" })
   })
@@ -448,7 +453,7 @@ test("provider tools and concurrent host tools get distinct nonadditive host sum
       },
       130,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
     [
@@ -507,7 +512,7 @@ test("V2 subagent tool calls and their permissions are classified as delegation"
       { sessionID, assistantMessageID, id: "call", executed: false, content: [{ type: "text", text: "SECRET" }] },
       130,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.marks.map((mark) => mark[2])).toEqual([
     { count: 1, family: "delegation" },
@@ -544,7 +549,7 @@ test("parallel permission and form waits use their own source timestamps and omi
     published(Permission.Event.Replied, { sessionID, requestID: permission, reply: "reject" }, 180),
     published(Form.Event.Replied, { id: form, sessionID: "global", answer: { SECRET: "SECRET" } }, 220),
     published(Form.Event.Cancelled, { id: Form.ID.create(), sessionID }, 230),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   expect(fixture.marks[2][2]).toEqual({ count: 1, resolution: "reject", family: "terminal", duration_ms: 80 })
   expect(fixture.marks[3][0]).toBeUndefined()
@@ -571,7 +576,7 @@ test("logical first output ignores empty fragments and stops once, while stream 
       { sessionID, assistantMessageID, finish: "tool-calls", cost: Money.USD.make(0), tokens },
       300,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   const first = fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")
   expect(first).toHaveLength(1)
@@ -607,7 +612,7 @@ test("multiple pending waits cancel independently before run closure and late re
     published(Permission.Event.Replied, { sessionID, requestID: permissions[0], reply: "reject" }, 210),
     published(Form.Event.Cancelled, { id: form, sessionID }, 220),
     published(SessionEvent.Execution.Interrupted, { sessionID, reason: "user" }, 230),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
 
   const waits = fixture.marks.filter((mark) => mark[1].endsWith("wait.completed"))
   expect(waits.map((mark) => mark[2])).toEqual([
@@ -648,7 +653,7 @@ test.each([SessionEvent.Text.Ended, SessionEvent.Reasoning.Ended, SessionEvent.T
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 0, text: "" }, 120),
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 0, text: "SECRET" }, 200),
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 1, text: "SECRET" }, 300),
-    ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+    ].forEach(fixture.send)
     const first = fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")
     expect(first).toHaveLength(1)
     expect(first[0][2]).toMatchObject({
@@ -671,8 +676,8 @@ test("host billing counters use primary terminals and auxiliary charges, never c
     { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0.01), tokens },
     200,
   )
-  Effect.runSync(fixture.observer.event(ended))
-  Effect.runSync(fixture.observer.event(ended))
+  fixture.send(ended)
+  fixture.send(ended)
   Effect.runSync(
     fixture.observer.usage({
       sessionID,
@@ -684,13 +689,11 @@ test("host billing counters use primary terminals and auxiliary charges, never c
       costSource: "host_calculated",
     }),
   )
-  Effect.runSync(
-    fixture.observer.event(
-      published(
-        SessionEvent.Compaction.Ended,
-        { sessionID, reason: "auto", text: "SECRET", recent: "SECRET", cost: Money.USD.make(0.02), tokens },
-        300,
-      ),
+  fixture.send(
+    published(
+      SessionEvent.Compaction.Ended,
+      { sessionID, reason: "auto", text: "SECRET", recent: "SECRET", cost: Money.USD.make(0.02), tokens },
+      300,
     ),
   )
 
@@ -808,7 +811,7 @@ test("tool execution durations exclude input streaming and terminal families nev
         { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }], metadata },
         200,
       ),
-    ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+    ].forEach(fixture.send)
     expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed")[index]?.[2]).toMatchObject({
       outcome: "success",
       duration_ms: 50,
@@ -820,7 +823,7 @@ test("tool execution durations exclude input streaming and terminal families nev
 
 test("run operation mix counts logical boundaries, not retries as extra steps, and keeps configured denies distinct", () => {
   const fixture = makeFixture()
-  const run = (event: Parameters<typeof fixture.observer.event>[0]) => Effect.runSync(fixture.observer.event(event))
+  const run = fixture.send
   run(published(SessionEvent.Execution.Started, { sessionID }, 100))
   ;[110, 120].forEach((started) =>
     run(
@@ -938,7 +941,7 @@ test("source model outcomes cover auxiliary calls without duplicating logical st
 test("auxiliary summaries preserve metrics without borrowing a concurrent execution's parent", () => {
   const fixture = makeFixture()
   const identity = { sessionID, agent: Agent.ID.make("build"), model }
-  Effect.runSync(fixture.observer.event(published(SessionEvent.Execution.Started, { sessionID }, 100)))
+  fixture.send(published(SessionEvent.Execution.Started, { sessionID }, 100))
   fixture.marks.length = 0
   Effect.runSync(fixture.observer.context({ ...identity, messages: [], system: [], options: {} }, "generate"))
   Effect.runSync(fixture.observer.contextUsage({ ...identity, kind: "generate", measured: 60, estimated: 20 }))
@@ -988,12 +991,7 @@ test("auxiliary summaries preserve metrics without borrowing a concurrent execut
 
 test("skill loads compare only successful, privately retained session snapshots", () => {
   const fixture = makeFixture()
-  const skill = {
-    id: Skill.ID.make("SECRET"),
-    name: Skill.Name.make("SECRET"),
-    path: AbsolutePath.make("/SECRET"),
-    content: "SECRET",
-  }
+  const skill = secretSkill()
   const load = (target: Session.ID, status: "completed" | "failed", content = skill.content) =>
     Effect.runSync(
       fixture.observer.skillLoad({
@@ -1016,7 +1014,7 @@ test("skill loads compare only successful, privately retained session snapshots"
     expect.objectContaining({ repeat_load: true, content_changed: false, comparison_window: "session_memory" }),
     expect.objectContaining({ repeat_load: true, content_changed: true }),
   ])
-  Effect.runSync(fixture.observer.event(published(SessionEvent.Deleted, { sessionID }, 100)))
+  fixture.send(published(SessionEvent.Deleted, { sessionID }, 100))
   load(sessionID, "completed")
   expect(fixture.marks.at(-1)?.[2]).not.toHaveProperty("repeat_load")
   expect(JSON.stringify(fixture.marks)).not.toContain("SECRET")
@@ -1031,12 +1029,7 @@ test.each(["skills", "sessions"])("skill comparison evicts old %s without claimi
         channel: "user_activation",
         status: "completed",
         sourceKind: "unknown",
-        skill: {
-          id: Skill.ID.make(dimension === "skills" ? String(index) : "skill"),
-          name: Skill.Name.make("SECRET"),
-          path: AbsolutePath.make("/SECRET"),
-          content: "SECRET",
-        },
+        skill: { ...secretSkill(), id: Skill.ID.make(dimension === "skills" ? String(index) : "skill") },
       }),
     )
   const capacity = dimension === "sessions" ? 256 : 64
@@ -1056,24 +1049,14 @@ test("catalog changes export effective transitions without skill identities or c
           action: "added",
           sourceKind: "directory",
           contentChanged: false,
-          skill: {
-            id: Skill.ID.make("SECRET"),
-            name: Skill.Name.make("SECRET"),
-            path: AbsolutePath.make("/SECRET"),
-            content: "SECRET",
-          },
+          skill: secretSkill(),
         },
         {
           action: "updated",
           sourceKind: "embedded",
           previousSourceKind: "directory",
           contentChanged: true,
-          skill: {
-            id: Skill.ID.make("SECRET"),
-            name: Skill.Name.make("SECRET"),
-            path: AbsolutePath.make("/SECRET"),
-            content: "SECRET",
-          },
+          skill: secretSkill(),
         },
       ],
     }),
@@ -1123,20 +1106,18 @@ test("final tool results expose reported truncation, timeout and builtin delegat
   ]
   cases.forEach((item) => {
     fixture.capture(item.id, { origin: "builtin", execution: "local", category: item.category })
-    Effect.runSync(
-      fixture.observer.event(
-        published(
-          SessionEvent.Tool.Success,
-          {
-            sessionID,
-            assistantMessageID,
-            id: item.id,
-            executed: false,
-            metadata: item.metadata,
-            content: [{ type: "text", text: "SECRET" }],
-          },
-          100,
-        ),
+    fixture.send(
+      published(
+        SessionEvent.Tool.Success,
+        {
+          sessionID,
+          assistantMessageID,
+          id: item.id,
+          executed: false,
+          metadata: item.metadata,
+          content: [{ type: "text", text: "SECRET" }],
+        },
+        100,
       ),
     )
   })
@@ -1155,20 +1136,18 @@ const unrelatedMetadata: NonNullable<Event.Data<typeof SessionEvent.Tool.Success
 test.each(unrelatedMetadata)("unrelated metadata cannot erase terminal exit facts %#", (metadata) => {
   const fixture = makeFixture()
   fixture.capture("terminal", { origin: "builtin", execution: "local", category: "terminal" })
-  Effect.runSync(
-    fixture.observer.event(
-      published(
-        SessionEvent.Tool.Success,
-        {
-          sessionID,
-          assistantMessageID,
-          id: "terminal",
-          executed: false,
-          content: [{ type: "text", text: "done" }],
-          metadata,
-        },
-        100,
-      ),
+  fixture.send(
+    published(
+      SessionEvent.Tool.Success,
+      {
+        sessionID,
+        assistantMessageID,
+        id: "terminal",
+        executed: false,
+        content: [{ type: "text", text: "done" }],
+        metadata,
+      },
+      100,
     ),
   )
   expect(fixture.marks[0]?.[2]).toMatchObject({ result_family: "nonzero_exit" })
@@ -1219,18 +1198,12 @@ test("host provenance survives delayed bus events and nested CodeMode entries wi
   fixture.capture("call", { origin: "mcp", execution: "mcp", category: "extension" })
   fixture.capture("mcp", { origin: "mcp", execution: "mcp", category: "extension" })
   ;["call", "mcp", "unobserved"].forEach((id) => {
-    Effect.runSync(
-      fixture.observer.event(
-        published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id, name: "bash" }, 100),
-      ),
-    )
-    Effect.runSync(
-      fixture.observer.event(
-        published(
-          SessionEvent.Tool.Success,
-          { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
-          200,
-        ),
+    fixture.send(published(SessionEvent.Tool.Input.Started, { sessionID, assistantMessageID, id, name: "bash" }, 100))
+    fixture.send(
+      published(
+        SessionEvent.Tool.Success,
+        { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
+        200,
       ),
     )
   })
@@ -1243,7 +1216,7 @@ test("host provenance survives delayed bus events and nested CodeMode entries wi
 
 test("an older queued run terminal cannot erase a subsequent run's captured tool provenance", () => {
   const fixture = makeFixture()
-  Effect.runSync(fixture.observer.event(published(SessionEvent.Execution.Started, { sessionID }, 100)))
+  fixture.send(published(SessionEvent.Execution.Started, { sessionID }, 100))
   fixture.capture("next", { origin: "mcp", execution: "mcp", category: "extension" })
   ;[
     published(SessionEvent.Execution.Succeeded, { sessionID }, 150),
@@ -1254,7 +1227,7 @@ test("an older queued run terminal cannot erase a subsequent run's captured tool
       { sessionID, assistantMessageID, id: "next", executed: false, content: [{ type: "text", text: "SECRET" }] },
       180,
     ),
-  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
+  ].forEach(fixture.send)
   expect(fixture.marks.find((mark) => mark[1] === "opencode.tool.completed")?.[2]).toMatchObject({
     tool_origin: "mcp",
     execution: "mcp",
@@ -1278,19 +1251,17 @@ test("permission facts attach only to the matching call and denial remains stick
     ),
   )
   ;["one", "two"].forEach((id) =>
-    Effect.runSync(
-      fixture.observer.event(
-        published(
-          SessionEvent.Tool.Failed,
-          {
-            sessionID,
-            assistantMessageID,
-            id,
-            executed: false,
-            error: { type: "aborted", message: "SECRET" },
-          },
-          200,
-        ),
+    fixture.send(
+      published(
+        SessionEvent.Tool.Failed,
+        {
+          sessionID,
+          assistantMessageID,
+          id,
+          executed: false,
+          error: { type: "aborted", message: "SECRET" },
+        },
+        200,
       ),
     ),
   )
@@ -1306,50 +1277,44 @@ test("cleanup rejection never claims a user actor or gets erased by a parallel a
   fixture.capture("call", { origin: "plugin", execution: "local", category: "extension" })
   const requests = [Permission.ID.create(), Permission.ID.create()]
   requests.forEach((id) =>
-    Effect.runSync(
-      fixture.observer.event(
-        published(
-          Permission.Event.Asked,
-          {
-            sessionID,
-            id,
-            action: "bash",
-            resources: ["SECRET"],
-            source: { type: "tool", messageID: assistantMessageID, id: "call" },
-          },
-          100,
-        ),
+    fixture.send(
+      published(
+        Permission.Event.Asked,
+        {
+          sessionID,
+          id,
+          action: "bash",
+          resources: ["SECRET"],
+          source: { type: "tool", messageID: assistantMessageID, id: "call" },
+        },
+        100,
       ),
     ),
   )
   requests.forEach((requestID, index) =>
-    Effect.runSync(
-      fixture.observer.event(
-        published(
-          Permission.Event.Replied,
-          {
-            sessionID,
-            requestID,
-            reply: index === 0 ? "reject" : "once",
-          },
-          110,
-        ),
+    fixture.send(
+      published(
+        Permission.Event.Replied,
+        {
+          sessionID,
+          requestID,
+          reply: index === 0 ? "reject" : "once",
+        },
+        110,
       ),
     ),
   )
-  Effect.runSync(
-    fixture.observer.event(
-      published(
-        SessionEvent.Tool.Failed,
-        {
-          sessionID,
-          assistantMessageID,
-          id: "call",
-          executed: false,
-          error: { type: "aborted", message: "SECRET" },
-        },
-        120,
-      ),
+  fixture.send(
+    published(
+      SessionEvent.Tool.Failed,
+      {
+        sessionID,
+        assistantMessageID,
+        id: "call",
+        executed: false,
+        error: { type: "aborted", message: "SECRET" },
+      },
+      120,
     ),
   )
   expect(fixture.marks.at(-1)?.[2]).toMatchObject({ approval: "rejected", result_family: "cancelled" })
@@ -1370,26 +1335,24 @@ test("denied nested gates do not misclassify a recovered success or unrelated te
         source: { type: "tool", messageID: assistantMessageID, id },
       }),
     )
-    Effect.runSync(
-      fixture.observer.event(
-        id === "success"
-          ? published(
-              SessionEvent.Tool.Success,
-              { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
-              100,
-            )
-          : published(
-              SessionEvent.Tool.Failed,
-              {
-                sessionID,
-                assistantMessageID,
-                id,
-                executed: false,
-                error: { type: id === "blocked" ? "permission.rejected" : "tool.execution", message: "SECRET" },
-              },
-              100,
-            ),
-      ),
+    fixture.send(
+      id === "success"
+        ? published(
+            SessionEvent.Tool.Success,
+            { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }] },
+            100,
+          )
+        : published(
+            SessionEvent.Tool.Failed,
+            {
+              sessionID,
+              assistantMessageID,
+              id,
+              executed: false,
+              error: { type: id === "blocked" ? "permission.rejected" : "tool.execution", message: "SECRET" },
+            },
+            100,
+          ),
     )
   })
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed").map((mark) => mark[2])).toMatchObject([

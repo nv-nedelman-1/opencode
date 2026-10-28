@@ -67,17 +67,19 @@ const fixture = async (budget = 500, client?: ReturnType<typeof RelayClient.diag
     budget,
     client,
   )
+  const dispose = async () => {
+    await Effect.runPromise(runtime.shutdown)
+    await activation.close()
+    relay.deregisterSubscriber("host-lifecycle-test")
+  }
   return {
     relay,
     runtime,
     events,
     state,
     measurements,
-    dispose: async () => {
-      await Effect.runPromise(runtime.shutdown)
-      await activation.close()
-      relay.deregisterSubscriber("host-lifecycle-test")
-    },
+    dispose,
+    [Symbol.asyncDispose]: dispose,
   }
 }
 
@@ -155,36 +157,30 @@ test.each(["sequential", "overlapping"])(
 )
 
 test("an auxiliary stream cannot borrow a same-session execution without an owner", async () => {
-  const native = await fixture()
-  try {
-    const session = id("aux_execution")
-    const parent = native.runtime.open(session)
-    const response = await Effect.runPromise(
-      RelayModel.middleware(native.runtime, () => noParent)(modelCall(session, "compaction", true), () =>
-        Effect.succeed(
-          new Response('data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n', {
-            headers: { "content-type": "text/event-stream" },
-          }),
-        ),
+  await using native = await fixture()
+  const session = id("aux_execution")
+  const parent = native.runtime.open(session)
+  const response = await Effect.runPromise(
+    RelayModel.middleware(native.runtime, () => noParent)(modelCall(session, "compaction", true), () =>
+      Effect.succeed(
+        new Response('data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        }),
       ),
-    )
-    native.runtime.close(session, "success")
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.uuid === parent.uuid && event.scope_category === "end")).toHaveLength(
-      1,
-    )
-    await response.text()
-    await native.relay.flushSubscribers()
-    expect(
-      native.events.filter((event) => event.name === "openai.chat_completions" && event.scope_category === "start"),
-    ).toEqual([expect.objectContaining({ parent_uuid: expect.not.stringContaining(parent.uuid) })])
-    expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.name)).toEqual([
-      "opencode.session",
-      "openai.chat_completions",
-    ])
-  } finally {
-    await native.dispose()
-  }
+    ),
+  )
+  native.runtime.close(session, "success")
+  await native.relay.flushSubscribers()
+  expect(native.events.filter((event) => event.uuid === parent.uuid && event.scope_category === "end")).toHaveLength(1)
+  await response.text()
+  await native.relay.flushSubscribers()
+  expect(
+    native.events.filter((event) => event.name === "openai.chat_completions" && event.scope_category === "start"),
+  ).toEqual([expect.objectContaining({ parent_uuid: expect.not.stringContaining(parent.uuid) })])
+  expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.name)).toEqual([
+    "opencode.session",
+    "openai.chat_completions",
+  ])
 })
 
 test("shutdown cancels and drains an entryless auxiliary native call", async () => {
@@ -223,24 +219,20 @@ test("shutdown cancels and drains an entryless auxiliary native call", async () 
 })
 
 test("signed auxiliary coverage does not borrow an active execution", async () => {
-  const native = await fixture()
-  try {
-    const session = id("signed_auxiliary")
-    const primary = native.runtime.open(session)
-    await Effect.runPromise(
-      RelayModel.middleware(native.runtime, () => noParent)(
-        { ...modelCall(session, "generate"), protocol: "bedrock-converse" },
-        () => Effect.succeed(Response.json({})),
-      ),
-    )
-    await native.relay.flushSubscribers()
-    const coverage = native.events.filter((event) => event.name === "opencode.llm.coverage")
-    expect(coverage).toHaveLength(1)
-    expect(coverage[0]?.parent_uuid).not.toBe(primary.uuid)
-    native.runtime.close(session, "success")
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const session = id("signed_auxiliary")
+  const primary = native.runtime.open(session)
+  await Effect.runPromise(
+    RelayModel.middleware(native.runtime, () => noParent)(
+      { ...modelCall(session, "generate"), protocol: "bedrock-converse" },
+      () => Effect.succeed(Response.json({})),
+    ),
+  )
+  await native.relay.flushSubscribers()
+  const coverage = native.events.filter((event) => event.name === "opencode.llm.coverage")
+  expect(coverage).toHaveLength(1)
+  expect(coverage[0]?.parent_uuid).not.toBe(primary.uuid)
+  native.runtime.close(session, "success")
 })
 
 test.each(["idle", "active"])("an %s auxiliary keeps physical observations off the next execution", async (state) => {
@@ -284,310 +276,266 @@ test.each(["idle", "active"])("an %s auxiliary keeps physical observations off t
 })
 
 test("shutdown drains an unread auxiliary stream without creating an execution", async () => {
-  const native = await fixture()
-  try {
-    const response = await Effect.runPromise(
-      RelayModel.middleware(native.runtime, () => noParent)(modelCall(id("aux_unread"), "generate", true), () =>
-        Effect.succeed(
-          new Response('data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n', {
-            headers: { "content-type": "text/event-stream" },
-          }),
-        ),
+  await using native = await fixture()
+  const response = await Effect.runPromise(
+    RelayModel.middleware(native.runtime, () => noParent)(modelCall(id("aux_unread"), "generate", true), () =>
+      Effect.succeed(
+        new Response('data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n', {
+          headers: { "content-type": "text/event-stream" },
+        }),
       ),
-    )
-    await Effect.runPromise(native.runtime.shutdown)
-    await response.body?.cancel()
-    expect(native.events.filter((event) => event.name === "opencode.session")).toEqual([])
-    expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.name)).toEqual([
-      "openai.chat_completions",
-    ])
-    expect(native.state).toEqual({ flushes: 1, closes: 1 })
-  } finally {
-    await native.dispose()
-  }
+    ),
+  )
+  await Effect.runPromise(native.runtime.shutdown)
+  await response.body?.cancel()
+  expect(native.events.filter((event) => event.name === "opencode.session")).toEqual([])
+  expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.name)).toEqual([
+    "openai.chat_completions",
+  ])
+  expect(native.state).toEqual({ flushes: 1, closes: 1 })
 })
 
 test("released operations cannot publish against their closed execution or its successor", async () => {
-  const native = await fixture()
-  try {
-    const session = id("released_marks")
-    const operation = await Effect.runPromise(native.runtime.lease(session, noParent))
-    native.runtime.close(session, "success")
-    operation.release()
-    const successor = native.runtime.open(session)
-    operation.mark("review.late.operation", { count: 1 })
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.name === "review.late.operation")).toEqual([])
-    expect(native.events.filter((event) => event.uuid === successor.uuid && event.scope_category === "end")).toEqual([])
-    native.runtime.close(session, "success")
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const session = id("released_marks")
+  const operation = await Effect.runPromise(native.runtime.lease(session, noParent))
+  native.runtime.close(session, "success")
+  operation.release()
+  const successor = native.runtime.open(session)
+  operation.mark("review.late.operation", { count: 1 })
+  await native.relay.flushSubscribers()
+  expect(native.events.filter((event) => event.name === "review.late.operation")).toEqual([])
+  expect(native.events.filter((event) => event.uuid === successor.uuid && event.scope_category === "end")).toEqual([])
+  native.runtime.close(session, "success")
 })
 
 test("overlapping sessions and operation stacks retain isolated propagation across awaits", async () => {
-  const native = await fixture()
-  try {
-    const a = await Effect.runPromise(native.runtime.lease(id("a"), noParent))
-    const b = await Effect.runPromise(native.runtime.lease(id("b"), noParent))
-    const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
-    const run = (operation: RelayHost.Operation, name: string, gate: Promise<void>) =>
-      operation.run(async () => {
-        const scope = native.relay.pushScope(name, 9, operation.parent)
-        const before = native.relay.capturePropagationContext()
-        await gate
-        const after = native.relay.capturePropagationContext()
-        native.relay.popScope(scope)
-        return { scope, before, after }
-      })
-    const pendingA = run(a, "a.operation", gates[0].promise)
-    const pendingB = run(b, "b.operation", gates[1].promise)
-    gates[1].resolve()
-    const contextB = await pendingB
-    gates[0].resolve()
-    const contextA = await pendingA
-    a.release()
-    b.release()
-    native.runtime.close(id("a"), "success")
-    native.runtime.close(id("b"), "success")
-    await native.relay.flushSubscribers()
+  await using native = await fixture()
+  const a = await Effect.runPromise(native.runtime.lease(id("a"), noParent))
+  const b = await Effect.runPromise(native.runtime.lease(id("b"), noParent))
+  const gates = [Promise.withResolvers<void>(), Promise.withResolvers<void>()]
+  const run = (operation: RelayHost.Operation, name: string, gate: Promise<void>) =>
+    operation.run(async () => {
+      const scope = native.relay.pushScope(name, 9, operation.parent)
+      const before = native.relay.capturePropagationContext()
+      await gate
+      const after = native.relay.capturePropagationContext()
+      native.relay.popScope(scope)
+      return { scope, before, after }
+    })
+  const pendingA = run(a, "a.operation", gates[0].promise)
+  const pendingB = run(b, "b.operation", gates[1].promise)
+  gates[1].resolve()
+  const contextB = await pendingB
+  gates[0].resolve()
+  const contextA = await pendingA
+  a.release()
+  b.release()
+  native.runtime.close(id("a"), "success")
+  native.runtime.close(id("b"), "success")
+  await native.relay.flushSubscribers()
 
-    for (const [context, operation] of [
-      [contextA, a],
-      [contextB, b],
-    ] as const) {
-      expect(context.after).toEqual(context.before)
-      expect(context.before.parentUuid).toBe(context.scope.uuid)
-      expect(context.scope.parentUuid).toBe(operation.parent!.uuid)
-      expect(native.relay.propagationContextToTraceparent(context.after)).toBe(context.before.traceparent!)
-    }
-    expect(contextA.before.traceparent?.split("-")[1]).not.toBe(contextB.before.traceparent?.split("-")[1])
-    expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.uuid)).toEqual([
-      contextB.scope.uuid,
-      contextA.scope.uuid,
-      a.parent!.uuid,
-      b.parent!.uuid,
-    ])
-  } finally {
-    await native.dispose()
+  for (const [context, operation] of [
+    [contextA, a],
+    [contextB, b],
+  ] as const) {
+    expect(context.after).toEqual(context.before)
+    expect(context.before.parentUuid).toBe(context.scope.uuid)
+    expect(context.scope.parentUuid).toBe(operation.parent!.uuid)
+    expect(native.relay.propagationContextToTraceparent(context.after)).toBe(context.before.traceparent!)
   }
+  expect(contextA.before.traceparent?.split("-")[1]).not.toBe(contextB.before.traceparent?.split("-")[1])
+  expect(native.events.filter((event) => event.scope_category === "end").map((event) => event.uuid)).toEqual([
+    contextB.scope.uuid,
+    contextA.scope.uuid,
+    a.parent!.uuid,
+    b.parent!.uuid,
+  ])
 })
 
 test("host marks emit parented metric instruments once per admitted event", async () => {
-  const native = await fixture()
-  try {
-    const session = id("metrics")
-    const parent = native.runtime.open(session)
-    for (const _ of [0, 1])
-      native.runtime.mark(
-        session,
-        "opencode.agent.run.completed",
-        { count: 1, outcome: "success", duration_ms: 25 },
-        { "opencode.event_id": "metric-event" },
-        123_000,
-      )
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed")).toHaveLength(1)
-    expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
-      expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
-    ])
-    // A terminal event may finish several waits; suffixes preserve each sample without replaying it.
-    for (const requestID of ["a", "b", "a", "b"])
-      native.runtime.mark(
-        session,
-        "opencode.permission.wait.completed",
-        { count: 1, family: "terminal", resolution: "cancelled", duration_ms: 25 },
-        { "opencode.event_id": `terminal-event:permission:${requestID}` },
-      )
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.name === "opencode.permission.wait.completed.metrics")).toEqual([
-      expect.objectContaining({ parent_uuid: parent.uuid }),
-      expect.objectContaining({ parent_uuid: parent.uuid }),
-    ])
-    native.runtime.close(session, "success")
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const session = id("metrics")
+  const parent = native.runtime.open(session)
+  for (const _ of [0, 1])
+    native.runtime.mark(
+      session,
+      "opencode.agent.run.completed",
+      { count: 1, outcome: "success", duration_ms: 25 },
+      { "opencode.event_id": "metric-event" },
+      123_000,
+    )
+  await native.relay.flushSubscribers()
+  expect(native.events.filter((event) => event.name === "opencode.agent.run.completed")).toHaveLength(1)
+  expect(native.events.filter((event) => event.name === "opencode.agent.run.completed.metrics")).toEqual([
+    expect.objectContaining({ parent_uuid: parent.uuid, timestamp: "1970-01-01T00:00:00.123+00:00" }),
+  ])
+  // A terminal event may finish several waits; suffixes preserve each sample without replaying it.
+  for (const requestID of ["a", "b", "a", "b"])
+    native.runtime.mark(
+      session,
+      "opencode.permission.wait.completed",
+      { count: 1, family: "terminal", resolution: "cancelled", duration_ms: 25 },
+      { "opencode.event_id": `terminal-event:permission:${requestID}` },
+    )
+  await native.relay.flushSubscribers()
+  expect(native.events.filter((event) => event.name === "opencode.permission.wait.completed.metrics")).toEqual([
+    expect.objectContaining({ parent_uuid: parent.uuid }),
+    expect.objectContaining({ parent_uuid: parent.uuid }),
+  ])
+  native.runtime.close(session, "success")
 })
 
 test("actual native instruments receive bounded process dimensions without changing host event payloads", async () => {
-  const native = await fixture(
+  await using native = await fixture(
     500,
     RelayClient.diagnostics(
       { version: "2.0.25-SECRET", channel: "beta" },
       { platform: "linux", arch: "x64", versions: { node: "24.15.0" } },
     ),
   )
-  try {
-    native.runtime.mark(undefined, "opencode.agent.run.started", { count: 1 })
-    await native.relay.flushSubscribers()
-    expect(native.measurements).toEqual([
-      [
-        expect.objectContaining({
-          attributes: expect.objectContaining({
-            "opencode.client.version": "2.0.25",
-            "opencode.client.channel": "beta",
-            "opencode.host.os": "linux",
-            "opencode.runtime.family": "node",
-          }),
+  native.runtime.mark(undefined, "opencode.agent.run.started", { count: 1 })
+  await native.relay.flushSubscribers()
+  expect(native.measurements).toEqual([
+    [
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "opencode.client.version": "2.0.25",
+          "opencode.client.channel": "beta",
+          "opencode.host.os": "linux",
+          "opencode.runtime.family": "node",
         }),
-      ],
-    ])
-    expect(JSON.stringify(native.measurements)).not.toContain("SECRET")
-    expect(native.events.filter((event) => event.name === "opencode.agent.run.started.metrics")).toHaveLength(1)
-  } finally {
-    await native.dispose()
-  }
+      }),
+    ],
+  ])
+  expect(JSON.stringify(native.measurements)).not.toContain("SECRET")
+  expect(native.events.filter((event) => event.name === "opencode.agent.run.started.metrics")).toHaveLength(1)
 })
 
 test("parent close waits for child close and its final lease; release is idempotent", async () => {
-  const native = await fixture()
-  try {
-    const parent = native.runtime.open(id("parent"))
-    const child = native.runtime.open(id("child"), id("parent"))
-    const operation = await Effect.runPromise(native.runtime.lease(id("child"), Effect.succeed(id("parent"))))
-    const parentOperation = await Effect.runPromise(native.runtime.lease(id("parent"), noParent))
-    const parentTrace = parentOperation.run(() => native.relay.captureTraceparent())
-    const childTrace = operation.run(() => native.relay.captureTraceparent())
-    parentOperation.release()
-    native.runtime.close(id("parent"), "success")
-    native.runtime.close(id("child"), "failed")
-    await native.relay.flushSubscribers()
-    expect(native.events.filter((event) => event.scope_category === "end")).toEqual([])
-    operation.release()
-    operation.release()
-    await native.relay.flushSubscribers()
+  await using native = await fixture()
+  const parent = native.runtime.open(id("parent"))
+  const child = native.runtime.open(id("child"), id("parent"))
+  const operation = await Effect.runPromise(native.runtime.lease(id("child"), Effect.succeed(id("parent"))))
+  const parentOperation = await Effect.runPromise(native.runtime.lease(id("parent"), noParent))
+  const parentTrace = parentOperation.run(() => native.relay.captureTraceparent())
+  const childTrace = operation.run(() => native.relay.captureTraceparent())
+  parentOperation.release()
+  native.runtime.close(id("parent"), "success")
+  native.runtime.close(id("child"), "failed")
+  await native.relay.flushSubscribers()
+  expect(native.events.filter((event) => event.scope_category === "end")).toEqual([])
+  operation.release()
+  operation.release()
+  await native.relay.flushSubscribers()
 
-    expect(child.parentUuid).toBe(parent.uuid)
-    expect(childTrace.split("-")[1]).toBe(parentTrace.split("-")[1])
-    expect(childTrace.split("-")[2]).not.toBe(parentTrace.split("-")[2])
-    expect(
-      native.events
-        .filter((event) => event.scope_category === "end")
-        .map((event) => [event.uuid, event.metadata?.["otel.status_code"]]),
-    ).toEqual([
-      [child.uuid, "ERROR"],
-      [parent.uuid, "OK"],
-    ])
-  } finally {
-    await native.dispose()
-  }
+  expect(child.parentUuid).toBe(parent.uuid)
+  expect(childTrace.split("-")[1]).toBe(parentTrace.split("-")[1])
+  expect(childTrace.split("-")[2]).not.toBe(parentTrace.split("-")[2])
+  expect(
+    native.events
+      .filter((event) => event.scope_category === "end")
+      .map((event) => [event.uuid, event.metadata?.["otel.status_code"]]),
+  ).toEqual([
+    [child.uuid, "ERROR"],
+    [parent.uuid, "OK"],
+  ])
 })
 
 test("shutdown cancels and drains live work once, closes scopes, then rejects new leases", async () => {
-  const native = await fixture()
-  try {
-    const operation = await Effect.runPromise(native.runtime.lease(id("shutdown"), noParent))
-    const state = { cancelled: 0 }
-    operation.onCancel(() => {
-      state.cancelled++
-      queueMicrotask(operation.release)
-    })
-    await Effect.runPromise(native.runtime.shutdown)
-    await Effect.runPromise(native.runtime.shutdown)
-    expect(state.cancelled).toBe(1)
-    expect(native.state).toEqual({ flushes: 1, closes: 1 })
-    expect(
-      native.events
-        .filter((event) => event.scope_category === "end")
-        .map((event) => event.metadata?.["otel.status_code"]),
-    ).toEqual(["UNSET"])
-    const exit = await Effect.runPromiseExit(native.runtime.lease(id("late"), noParent))
-    expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("runtime is stopping")
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const operation = await Effect.runPromise(native.runtime.lease(id("shutdown"), noParent))
+  const state = { cancelled: 0 }
+  operation.onCancel(() => {
+    state.cancelled++
+    queueMicrotask(operation.release)
+  })
+  await Effect.runPromise(native.runtime.shutdown)
+  await Effect.runPromise(native.runtime.shutdown)
+  expect(state.cancelled).toBe(1)
+  expect(native.state).toEqual({ flushes: 1, closes: 1 })
+  expect(
+    native.events
+      .filter((event) => event.scope_category === "end")
+      .map((event) => event.metadata?.["otel.status_code"]),
+  ).toEqual(["UNSET"])
+  const exit = await Effect.runPromiseExit(native.runtime.lease(id("late"), noParent))
+  expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("runtime is stopping")
 })
 
 test("concurrent shutdown callers both await the accepted work", async () => {
-  const native = await fixture()
-  try {
-    const operation = await Effect.runPromise(native.runtime.lease(id("drain"), noParent))
-    const state = { cancellations: 0, completions: 0 }
-    operation.onCancel(() => {
-      state.cancellations++
-    })
-    const shutdowns = [
-      Effect.runPromise(native.runtime.shutdown),
-      Effect.runPromise(native.runtime.shutdown).then(() => {
-        state.completions++
-      }),
-    ]
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    const completedEarly = state.completions
-    operation.release()
-    await Promise.all(shutdowns)
-    expect(completedEarly).toBe(0)
-    expect(state.cancellations).toBe(1)
-    expect(native.state).toEqual({ flushes: 1, closes: 1 })
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const operation = await Effect.runPromise(native.runtime.lease(id("drain"), noParent))
+  const state = { cancellations: 0, completions: 0 }
+  operation.onCancel(() => {
+    state.cancellations++
+  })
+  const shutdowns = [
+    Effect.runPromise(native.runtime.shutdown),
+    Effect.runPromise(native.runtime.shutdown).then(() => {
+      state.completions++
+    }),
+  ]
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  const completedEarly = state.completions
+  operation.release()
+  await Promise.all(shutdowns)
+  expect(completedEarly).toBe(0)
+  expect(state.cancellations).toBe(1)
+  expect(native.state).toEqual({ flushes: 1, closes: 1 })
 })
 
 test("retired hosts reject stale observations without reopening scopes or publishing marks", async () => {
-  const native = await fixture()
-  try {
-    native.runtime.open(id("observation_shutdown"))
-    await Effect.runPromise(native.runtime.shutdown)
-    await native.runtime.retired
-    const before = native.events.length
-    expect(native.runtime.admit("stale-event")).toBe(false)
-    expect(() => native.runtime.open(id("stale_observation"))).toThrow("runtime is stopping")
-    native.runtime.mark(id("stale_observation"), "review.stale.mark", {})
-    native.runtime.mark(undefined, "review.stale.global", {})
-    await native.relay.flushSubscribers()
-    expect(native.events).toHaveLength(before)
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  native.runtime.open(id("observation_shutdown"))
+  await Effect.runPromise(native.runtime.shutdown)
+  await native.runtime.retired
+  const before = native.events.length
+  expect(native.runtime.admit("stale-event")).toBe(false)
+  expect(() => native.runtime.open(id("stale_observation"))).toThrow("runtime is stopping")
+  native.runtime.mark(id("stale_observation"), "review.stale.mark", {})
+  native.runtime.mark(undefined, "review.stale.global", {})
+  await native.relay.flushSubscribers()
+  expect(native.events).toHaveLength(before)
 })
 
 test("timed-out shutdown retains the native host until late work drains, then retires once", async () => {
-  const native = await fixture(10)
-  try {
-    const operation = await Effect.runPromise(native.runtime.lease(id("late_drain"), noParent))
-    const state = { cancellations: 0 }
-    operation.onCancel(() => {
-      state.cancellations++
-    })
-    await Promise.all([Effect.runPromise(native.runtime.shutdown), Effect.runPromise(native.runtime.shutdown)])
-    expect(native.state).toEqual({ flushes: 0, closes: 0 })
-    expect(native.events.filter((event) => event.scope_category === "end")).toEqual([])
-    operation.release()
-    operation.release()
-    await native.runtime.retired
-    await Effect.runPromise(native.runtime.shutdown)
-    expect(state.cancellations).toBe(1)
-    expect(native.state).toEqual({ flushes: 1, closes: 1 })
-    expect(
-      native.events
-        .filter((event) => event.scope_category === "end")
-        .map((event) => [event.uuid, event.metadata?.["otel.status_code"]]),
-    ).toEqual([[operation.parent!.uuid, "UNSET"]])
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture(10)
+  const operation = await Effect.runPromise(native.runtime.lease(id("late_drain"), noParent))
+  const state = { cancellations: 0 }
+  operation.onCancel(() => {
+    state.cancellations++
+  })
+  await Promise.all([Effect.runPromise(native.runtime.shutdown), Effect.runPromise(native.runtime.shutdown)])
+  expect(native.state).toEqual({ flushes: 0, closes: 0 })
+  expect(native.events.filter((event) => event.scope_category === "end")).toEqual([])
+  operation.release()
+  operation.release()
+  await native.runtime.retired
+  await Effect.runPromise(native.runtime.shutdown)
+  expect(state.cancellations).toBe(1)
+  expect(native.state).toEqual({ flushes: 1, closes: 1 })
+  expect(
+    native.events
+      .filter((event) => event.scope_category === "end")
+      .map((event) => [event.uuid, event.metadata?.["otel.status_code"]]),
+  ).toEqual([[operation.parent!.uuid, "UNSET"]])
 })
 
 test("parent lookup completing after shutdown cannot admit a new operation", async () => {
-  const native = await fixture()
-  try {
-    const parent = Promise.withResolvers<Session.ID | undefined>()
-    const pending = Effect.runPromiseExit(
-      native.runtime.lease(
-        id("late_parent"),
-        Effect.promise(() => parent.promise),
-      ),
-    )
-    await Effect.runPromise(native.runtime.shutdown)
-    parent.resolve(undefined)
-    const exit = await pending
-    expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("runtime is stopping")
-    expect(native.events).toEqual([])
-  } finally {
-    await native.dispose()
-  }
+  await using native = await fixture()
+  const parent = Promise.withResolvers<Session.ID | undefined>()
+  const pending = Effect.runPromiseExit(
+    native.runtime.lease(
+      id("late_parent"),
+      Effect.promise(() => parent.promise),
+    ),
+  )
+  await Effect.runPromise(native.runtime.shutdown)
+  parent.resolve(undefined)
+  const exit = await pending
+  expect(Exit.isFailure(exit) && String(Cause.squash(exit.cause))).toContain("runtime is stopping")
+  expect(native.events).toEqual([])
 })
 
 test("Location owners share process startup and only the last release closes sessions", async () => {

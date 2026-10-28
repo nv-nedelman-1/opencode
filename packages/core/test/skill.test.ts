@@ -16,6 +16,7 @@ import { State } from "@opencode/core/state"
 import { Session } from "@opencode/schema/session"
 import { testEffect } from "./lib/effect"
 import { readInitial } from "./lib/instructions"
+import { sourceObserver } from "./lib/source-observer"
 import { registerIntegrationPolicy } from "./fixture/policy"
 
 const configLayer = Config.testLayer()
@@ -41,10 +42,7 @@ describe("Skill", () => {
       const skills = yield* Skill.Service
       const hooks = yield* PluginHooks.Service
       const seen: SkillCatalog[] = []
-      yield* hooks.observe("skill", "catalog", (event) => {
-        seen.push(event)
-        return undefined
-      })
+      yield* hooks.observe("skill", "catalog", (event) => void seen.push(event))
       let current = info("review", "Original")
       yield* skills.transform((editor) => editor.add(current, "directory"))
       yield* skills.reload()
@@ -85,10 +83,7 @@ describe("Skill", () => {
       const skills = yield* Skill.Service
       const hooks = yield* PluginHooks.Service
       const seen: SkillCatalog[] = []
-      yield* hooks.observe("skill", "catalog", (event) => {
-        seen.push(event)
-        return undefined
-      })
+      yield* hooks.observe("skill", "catalog", (event) => void seen.push(event))
       yield* State.batch(
         Effect.gen(function* () {
           yield* skills.transform((editor) => editor.add(info("review", "Hidden"), "url"))
@@ -132,10 +127,7 @@ describe("Skill", () => {
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service
       const observations: SkillLoad[] = []
-      yield* hooks.observe("skill", "load", (event) => {
-        observations.push(event)
-        return undefined
-      })
+      yield* hooks.observe("skill", "load", (event) => void observations.push(event))
       const observer = yield* hooks.observe("skill", "load", () => {
         throw new Error("observer failure")
       })
@@ -184,10 +176,7 @@ describe("Skill", () => {
         expect(() => Object.assign(event.skill!, { path: "/changed" })).toThrow()
         return undefined
       })
-      yield* hooks.observe("skill", "load", (event) => {
-        seen.push(event)
-        return undefined
-      })
+      yield* hooks.observe("skill", "load", (event) => void seen.push(event))
       expect(
         yield* Skill.observeLoad(
           hooks,
@@ -205,79 +194,33 @@ describe("Skill", () => {
     }),
   )
 
-  it.effect("invalid async or Effect load observers cannot delay success, failure, or interruption", () =>
-    Effect.gen(function* () {
-      const hooks = yield* PluginHooks.Service
-      for (const status of ["completed", "failed", "interrupted"] as const) {
-        yield* Effect.scoped(
-          Effect.gen(function* () {
-            const pending = Promise.withResolvers<undefined>()
-            const release = yield* Deferred.make<void>()
-            let foreignRan = false
-            let settled = false
-            let first: SkillLoad | undefined
-            const received: SkillLoad[] = []
-            yield* hooks.observe("skill", "load", (event) => {
-              first = event
-              throw new Error("private observer defect")
-            })
-            // @ts-expect-error An untyped pending promise cannot hold load settlement.
-            yield* hooks.observe("skill", "load", () => pending.promise)
-            // @ts-expect-error Async observers are rejected by the source observation contract.
-            yield* hooks.observe("skill", "load", async () => {
-              throw new Error("private async rejection")
-            })
-            const foreign = Effect.sync(() => {
-              foreignRan = true
-            }).pipe(Effect.andThen(Deferred.await(release)))
-            // @ts-expect-error Do not run or await returned Effects in load finalizers.
-            yield* hooks.observe("skill", "load", () => foreign)
-            yield* hooks.observe("skill", "load", (event) => {
-              received.push(event)
-              return undefined
-            })
-            const failure = new Error("original failure")
-            const input = {
-              sessionID: Session.ID.make("ses_load_stall"),
-              channel: "tool" as const,
-              sourceKind: "directory" as const,
-              skill: info("review", "Review"),
-            }
-            const work =
-              status === "completed"
-                ? Effect.succeed("unchanged")
-                : status === "failed"
-                  ? Effect.fail(failure)
-                  : Effect.interrupt
-            const call = yield* Skill.observeLoad(hooks, input, work).pipe(
-              Effect.onExit(() =>
-                Effect.sync(() => {
-                  settled = true
-                }),
-              ),
-              Effect.forkScoped({ startImmediately: true }),
-            )
-            yield* Effect.yieldNow
-            const settledBeforeRelease = settled
-            pending.resolve(undefined)
-            yield* Deferred.succeed(release, undefined)
-            const exit = yield* Fiber.await(call)
-            yield* Effect.promise(() => Promise.resolve())
-            expect(settledBeforeRelease).toBe(true)
-            expect(foreignRan).toBe(false)
-            expect(received).toHaveLength(1)
-            expect(received[0]).toBe(first!)
-            expect(received[0]).toMatchObject({ ...input, status })
-            expect(Object.isFrozen(received[0])).toBe(true)
-            expect(Object.isFrozen(received[0].skill)).toBe(true)
-            if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
-            if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
-            if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
-          }),
-        )
-      }
-    }),
-  )
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    it.effect(`invalid async or Effect load observers cannot delay ${status} settlement`, () =>
+      Effect.gen(function* () {
+        const hooks = yield* PluginHooks.Service
+        const observer = yield* sourceObserver(hooks, "skill", "load")
+        const failure = new Error("original failure")
+        const input = {
+          sessionID: Session.ID.make("ses_load_stall"),
+          channel: "tool" as const,
+          sourceKind: "directory" as const,
+          skill: info("review", "Review"),
+        }
+        const work =
+          status === "completed"
+            ? Effect.succeed("unchanged")
+            : status === "failed"
+              ? Effect.fail(failure)
+              : Effect.interrupt
+        const exit = yield* observer.settle(Skill.observeLoad(hooks, input, work))
+        expect(observer.received[0]).toMatchObject({ ...input, status })
+        expect(Object.isFrozen(observer.received[0].skill)).toBe(true)
+        if (status === "completed") expect(exit).toEqual(Exit.succeed("unchanged"))
+        if (status === "failed") expect(exit).toEqual(Exit.fail(failure))
+        if (status === "interrupted") expect(Exit.hasInterrupts(exit)).toBe(true)
+      }),
+    )
+  }
 
   it.live("hides and refuses denied skills while organization policy overrides local allows", () =>
     Effect.gen(function* () {

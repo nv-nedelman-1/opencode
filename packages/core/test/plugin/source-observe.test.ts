@@ -16,6 +16,10 @@ import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
 
 const it = testEffect(PluginTestLayer)
+const record =
+  <Event>(events: [string, Event][], source: string) =>
+  (event: Event) =>
+    void events.push([source, event])
 const input = {
   sessionID: Session.ID.make("ses_source_observe"),
   agent: Agent.ID.make("build"),
@@ -48,22 +52,9 @@ it.effect(
       const promise = fromPromise({
         id: "promise-source-observer",
         setup: async (ctx) => {
-          await ctx.session.observe(
-            "model.outcome",
-            (event) => {
-              model.push(["promise", event])
-              return undefined
-            },
-            { providerID: "fixture" },
-          )
-          await ctx.skill.observe("load", (event) => {
-            skills.push(["promise", event])
-            return undefined
-          })
-          await ctx.mcp.observe("recovery", (event) => {
-            mcp.push(["promise", event])
-            return undefined
-          })
+          await ctx.session.observe("model.outcome", record(model, "promise"), { providerID: "fixture" })
+          await ctx.skill.observe("load", record(skills, "promise"))
+          await ctx.mcp.observe("recovery", record(mcp, "promise"))
         },
       })
       yield* plugins.activate([
@@ -72,31 +63,13 @@ it.effect(
           revision: "1",
           effect: (ctx) =>
             Effect.gen(function* () {
-              const registration = yield* ctx.session.observe(
-                "model.outcome",
-                (event) => {
-                  model.push(["effect", event])
-                  return undefined
-                },
-                { providerID: "fixture" },
-              )
+              const registration = yield* ctx.session.observe("model.outcome", record(model, "effect"), {
+                providerID: "fixture",
+              })
               dispose = registration.dispose
-              yield* ctx.session.observe(
-                "model.outcome",
-                () => {
-                  filtered++
-                  return undefined
-                },
-                { providerID: "other" },
-              )
-              yield* ctx.skill.observe("load", (event) => {
-                skills.push(["effect", event])
-                return undefined
-              })
-              yield* ctx.mcp.observe("recovery", (event) => {
-                mcp.push(["effect", event])
-                return undefined
-              })
+              yield* ctx.session.observe("model.outcome", () => void filtered++, { providerID: "other" })
+              yield* ctx.skill.observe("load", record(skills, "effect"))
+              yield* ctx.mcp.observe("recovery", record(mcp, "effect"))
             }),
         },
         { ...promise, revision: "1" },
@@ -157,14 +130,8 @@ it.effect("Promise adapter observations stay synchronous and do not await invali
         await ctx.skill.observe("load", async () => {
           throw new Error("private rejected work")
         })
-        await ctx.session.observe("model.outcome", (event) => {
-          seen.push(event.kind)
-          return undefined
-        })
-        await ctx.skill.observe("load", (event) => {
-          seen.push(event.channel)
-          return undefined
-        })
+        await ctx.session.observe("model.outcome", (event) => void seen.push(event.kind))
+        await ctx.skill.observe("load", (event) => void seen.push(event.channel))
       },
     })
     yield* plugins.activate([{ ...promise, revision: "1" }])
