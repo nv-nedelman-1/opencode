@@ -84,9 +84,11 @@ const chunks = [
   },
 ]
 
-const sseBody = (body: BodyInit) => new Response(body, { headers: { "content-type": "text/event-stream" } })
-const wire = (items: ReadonlyArray<unknown>) => items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join("")
-const sse = (items: ReadonlyArray<unknown>) => sseBody(wire(items) + "data: [DONE]\n\n")
+const sse = (items: ReadonlyArray<unknown>) =>
+  new Response(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join("") + "data: [DONE]\n\n", {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  })
 
 const call = (body: Record<string, unknown>): SessionHttpCall => ({
   sessionID,
@@ -166,26 +168,22 @@ describe("managed model execution", () => {
     async (mode) => {
       const state = { dispatches: 0 }
       if (mode !== "provider")
-        relay.registerLlmStreamExecutionIntercept(
-          "test-stream-aggregate",
-          10,
-          async function* (request, _context, next) {
-            if (mode === "replacement") {
-              yield* chunks
-              return
+        relay.registerLlmStreamExecutionIntercept("test-stream-aggregate", 10, async function* (request, _context, next) {
+          if (mode === "replacement") {
+            yield* chunks
+            return
+          }
+          for await (const chunk of await next(request)) {
+            const item = chunk as (typeof chunks)[number]
+            yield {
+              ...item,
+              choices: item.choices.map((choice) => ({
+                ...choice,
+                delta: { ...choice.delta, content: choice.delta.content.toUpperCase() },
+              })),
             }
-            for await (const chunk of await next(request)) {
-              const item = chunk as (typeof chunks)[number]
-              yield {
-                ...item,
-                choices: item.choices.map((choice) => ({
-                  ...choice,
-                  delta: { ...choice.delta, content: choice.delta.content.toUpperCase() },
-                })),
-              }
-            }
-          },
-        )
+          }
+        })
       try {
         const response = await runModel(
           {
@@ -245,11 +243,14 @@ describe("managed model execution", () => {
   test("proxy keepalives cannot truncate a live SSE response", async () => {
     const response = await runModel(call({ stream: true }), () =>
       Effect.succeed(
-        sseBody(
-          wire(chunks.slice(0, 1)) +
-            "data: null\n\ndata: : keepalive\n\ndata:\n\n" +
-            wire(chunks.slice(1)) +
+        new Response(
+          `data: ${JSON.stringify(chunks[0])}\n\ndata: null\n\ndata: : keepalive\n\ndata:\n\n` +
+            chunks
+              .slice(1)
+              .map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`)
+              .join("") +
             "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } },
         ),
       ),
     )
@@ -336,14 +337,15 @@ describe("managed model execution", () => {
     }
     const response = await runModel(flaky, () =>
       Effect.succeed(
-        sseBody(
+        new Response(
           new ReadableStream<Uint8Array>({
             pull(controller) {
               if (state.sent) return controller.error(reset)
               state.sent = true
-              controller.enqueue(encoder.encode(wire(chunks.slice(0, 1))))
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunks[0])}\n\n`))
             },
           }),
+          { status: 200, headers: { "content-type": "text/event-stream" } },
         ),
       ),
     )
@@ -376,15 +378,20 @@ describe("managed model execution", () => {
     const state = { cancelled: false }
     const response = await runModel(call({ stream: true }), () =>
       Effect.succeed(
-        sseBody(
+        new Response(
           new ReadableStream<Uint8Array>({
             start(controller) {
-              controller.enqueue(new TextEncoder().encode(wire(chunks) + "data: [DONE]\n\n"))
+              controller.enqueue(
+                new TextEncoder().encode(
+                  chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
+                ),
+              )
             },
             cancel() {
               state.cancelled = true
             },
           }),
+          { headers: { "content-type": "text/event-stream" } },
         ),
       ),
     )
@@ -403,15 +410,16 @@ describe("managed model execution", () => {
       }
       const response = await runModel({ ...input, request: new Request(input.request, { signal: abort.signal }) }, () =>
         Effect.succeed(
-          sseBody(
+          new Response(
             new ReadableStream<Uint8Array>({
               start(controller) {
-                controller.enqueue(new TextEncoder().encode(wire(chunks.slice(0, 1))))
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(chunks[0])}\n\n`))
               },
               cancel() {
                 cancelled.resolve()
               },
             }),
+            { headers: { "content-type": "text/event-stream" } },
           ),
         ),
       )

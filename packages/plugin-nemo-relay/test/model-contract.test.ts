@@ -57,32 +57,6 @@ const call = (request = providerRequest()): SessionHttpCall => ({
   request,
 })
 
-const host = (
-  observed: ReturnType<typeof observations>,
-  api: RelayHost.Relay,
-  parent: ScopeHandle,
-  execute: RelayHost.Operation["run"] = (callback) => callback(),
-): RelayHost.Runtime => ({
-  relay: api,
-  scope: () => Effect.succeed(parent),
-  open: () => parent,
-  admit: () => true,
-  mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-  close: () => {},
-  lease: () =>
-    Effect.succeed({
-      parent,
-      run: execute,
-      mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
-      onCancel: (cancel) => {
-        observed.cancel = cancel
-      },
-      release: () => {
-        observed.releases++
-      },
-    }),
-})
-
 const run = (
   input: SessionHttpCall,
   bridge: Bridge,
@@ -90,9 +64,9 @@ const run = (
   signal?: AbortSignal,
   observed = observations(),
 ) => {
-  const runtime = host(
-    observed,
-    {
+  const parent = { uuid: "scope_model_unit" } as ScopeHandle
+  const runtime: RelayHost.Runtime = {
+    relay: {
       OpenAIChatCodec: relay.OpenAIChatCodec,
       OpenAIResponsesCodec: relay.OpenAIResponsesCodec,
       AnthropicMessagesCodec: relay.AnthropicMessagesCodec,
@@ -111,8 +85,24 @@ const run = (
         return bridge(input, callback)
       },
     } as unknown as RelayHost.Relay,
-    { uuid: "scope_model_unit" } as ScopeHandle,
-  )
+    scope: () => Effect.succeed(parent),
+    open: () => parent,
+    admit: () => true,
+    mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+    close: () => {},
+    lease: () =>
+      Effect.succeed({
+        parent,
+        run: (callback) => callback(),
+        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+        onCancel: (cancel) => {
+          observed.cancel = cancel
+        },
+        release: () => {
+          observed.releases++
+        },
+      }),
+  }
   return Effect.runPromiseExit(RelayModel.middleware(runtime, () => Effect.succeed(undefined))(input, next), { signal })
 }
 
@@ -121,9 +111,8 @@ const forward: Bridge = (input, next) => next(input, new AbortController().signa
 const native = (observed: ReturnType<typeof observations>) => {
   const stack = relay.createScopeStack()
   const parent = relay.withScopeStack(stack, () => relay.pushScope("physical-attempt-test", 0)) as ScopeHandle
-  const runtime = host(
-    observed,
-    {
+  const runtime: RelayHost.Runtime = {
+    relay: {
       ...relay,
       llmCallExecuteAsync: (...args: Parameters<typeof relay.llmCallExecuteAsync>) => {
         const result = relay.llmCallExecuteAsync(...args)
@@ -137,9 +126,22 @@ const native = (observed: ReturnType<typeof observations>) => {
         return result
       },
     } as unknown as RelayHost.Relay,
-    parent,
-    <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
-  )
+    scope: () => Effect.succeed(parent),
+    open: () => parent,
+    admit: () => true,
+    close: () => {},
+    mark: (_session, name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+    lease: () =>
+      Effect.succeed({
+        parent,
+        run: <A>(callback: () => A) => relay.withScopeStack(stack, callback) as A,
+        mark: (name, data) => observed.marks.push({ name, data: data as Record<string, unknown> }),
+        onCancel: () => {},
+        release: () => {
+          observed.releases++
+        },
+      }),
+  }
   return { runtime, parent, close: () => relay.withScopeStack(stack, () => relay.popScope(parent)) }
 }
 

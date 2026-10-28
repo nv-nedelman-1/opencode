@@ -90,7 +90,7 @@ test("interleaved executions retain independent host timings and outcomes", () =
     published(SessionEvent.Execution.Succeeded, { sessionID }, 180),
     published(SessionEvent.Execution.Interrupted, { sessionID: sibling, reason: "user" }, 200),
     published(SessionEvent.Execution.Succeeded, { sessionID }, 210),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.opened).toEqual([
     [sessionID, undefined, 100_000],
@@ -191,7 +191,7 @@ test("step, retry, and compaction observations whitelist host data without dupli
       { sessionID, reason: "auto", error: { type: "SECRET", message: "SECRET" } },
       270,
     ),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.marks[1][2]).toEqual({
     count: 1,
@@ -239,20 +239,22 @@ test("generic retries keep one observed step record and its earliest start", () 
       { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0), tokens },
       300,
     ),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.step.started")).toHaveLength(1)
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.completed")).toHaveLength(1)
   expect(fixture.marks[1][2]).toMatchObject({ duration_ms: 200 })
-  fixture.send(
-    published(
-      SessionEvent.Step.Failed,
-      {
-        sessionID,
-        assistantMessageID: SessionMessage.ID.make("msg_missing_start"),
-        error: { type: "aborted", message: "SECRET" },
-      },
-      320,
+  Effect.runSync(
+    fixture.observer.event(
+      published(
+        SessionEvent.Step.Failed,
+        {
+          sessionID,
+          assistantMessageID: SessionMessage.ID.make("msg_missing_start"),
+          error: { type: "aborted", message: "SECRET" },
+        },
+        320,
+      ),
     ),
   )
   expect(fixture.marks.filter((mark) => mark[1] === "opencode.agent.step.completed")[1]?.[2]).toEqual({
@@ -397,7 +399,7 @@ test("skill requests and successful loads are distinct from user activation and 
     published(Skill.Event.Updated, {}, 140),
     published(McpEvent.StatusChanged, { server: "SECRET" }, 150),
   ].forEach((event) => {
-    fixture.send(event)
+    Effect.runSync(fixture.observer.event(event))
     if (event.type === "session.tool.input.started")
       fixture.capture("call1", { origin: "builtin", execution: "local", category: "skill" })
   })
@@ -453,7 +455,7 @@ test("provider tools and concurrent host tools get distinct nonadditive host sum
       },
       130,
     ),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.marks.map((mark) => [mark[0], mark[1], mark[2]])).toEqual([
     [
@@ -512,7 +514,7 @@ test("V2 subagent tool calls and their permissions are classified as delegation"
       { sessionID, assistantMessageID, id: "call", executed: false, content: [{ type: "text", text: "SECRET" }] },
       130,
     ),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.marks.map((mark) => mark[2])).toEqual([
     { count: 1, family: "delegation" },
@@ -549,7 +551,7 @@ test("parallel permission and form waits use their own source timestamps and omi
     published(Permission.Event.Replied, { sessionID, requestID: permission, reply: "reject" }, 180),
     published(Form.Event.Replied, { id: form, sessionID: "global", answer: { SECRET: "SECRET" } }, 220),
     published(Form.Event.Cancelled, { id: Form.ID.create(), sessionID }, 230),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   expect(fixture.marks[2][2]).toEqual({ count: 1, resolution: "reject", family: "terminal", duration_ms: 80 })
   expect(fixture.marks[3][0]).toBeUndefined()
@@ -576,7 +578,7 @@ test("logical first output ignores empty fragments and stops once, while stream 
       { sessionID, assistantMessageID, finish: "tool-calls", cost: Money.USD.make(0), tokens },
       300,
     ),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   const first = fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")
   expect(first).toHaveLength(1)
@@ -612,7 +614,7 @@ test("multiple pending waits cancel independently before run closure and late re
     published(Permission.Event.Replied, { sessionID, requestID: permissions[0], reply: "reject" }, 210),
     published(Form.Event.Cancelled, { id: form, sessionID }, 220),
     published(SessionEvent.Execution.Interrupted, { sessionID, reason: "user" }, 230),
-  ].forEach(fixture.send)
+  ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
 
   const waits = fixture.marks.filter((mark) => mark[1].endsWith("wait.completed"))
   expect(waits.map((mark) => mark[2])).toEqual([
@@ -653,7 +655,7 @@ test.each([SessionEvent.Text.Ended, SessionEvent.Reasoning.Ended, SessionEvent.T
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 0, text: "" }, 120),
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 0, text: "SECRET" }, 200),
       published(definition, { sessionID, assistantMessageID, id: "call", ordinal: 1, text: "SECRET" }, 300),
-    ].forEach(fixture.send)
+    ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
     const first = fixture.marks.filter((mark) => mark[1] === "opencode.llm.logical.first_output")
     expect(first).toHaveLength(1)
     expect(first[0][2]).toMatchObject({
@@ -676,8 +678,8 @@ test("host billing counters use primary terminals and auxiliary charges, never c
     { sessionID, assistantMessageID, finish: "stop", cost: Money.USD.make(0.01), tokens },
     200,
   )
-  fixture.send(ended)
-  fixture.send(ended)
+  Effect.runSync(fixture.observer.event(ended))
+  Effect.runSync(fixture.observer.event(ended))
   Effect.runSync(
     fixture.observer.usage({
       sessionID,
@@ -689,11 +691,13 @@ test("host billing counters use primary terminals and auxiliary charges, never c
       costSource: "host_calculated",
     }),
   )
-  fixture.send(
-    published(
-      SessionEvent.Compaction.Ended,
-      { sessionID, reason: "auto", text: "SECRET", recent: "SECRET", cost: Money.USD.make(0.02), tokens },
-      300,
+  Effect.runSync(
+    fixture.observer.event(
+      published(
+        SessionEvent.Compaction.Ended,
+        { sessionID, reason: "auto", text: "SECRET", recent: "SECRET", cost: Money.USD.make(0.02), tokens },
+        300,
+      ),
     ),
   )
 
@@ -811,7 +815,7 @@ test("tool execution durations exclude input streaming and terminal families nev
         { sessionID, assistantMessageID, id, executed: false, content: [{ type: "text", text: "SECRET" }], metadata },
         200,
       ),
-    ].forEach(fixture.send)
+    ].forEach((event) => Effect.runSync(fixture.observer.event(event)))
     expect(fixture.marks.filter((mark) => mark[1] === "opencode.tool.completed")[index]?.[2]).toMatchObject({
       outcome: "success",
       duration_ms: 50,
@@ -823,7 +827,7 @@ test("tool execution durations exclude input streaming and terminal families nev
 
 test("run operation mix counts logical boundaries, not retries as extra steps, and keeps configured denies distinct", () => {
   const fixture = makeFixture()
-  const run = fixture.send
+  const run = (event: Parameters<typeof fixture.observer.event>[0]) => Effect.runSync(fixture.observer.event(event))
   run(published(SessionEvent.Execution.Started, { sessionID }, 100))
   ;[110, 120].forEach((started) =>
     run(
