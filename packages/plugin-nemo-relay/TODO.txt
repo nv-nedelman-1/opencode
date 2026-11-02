@@ -1,0 +1,71 @@
+NeMo Relay integration: open items
+Paths are relative to the OpenCode repo unless they name the Relay repo.
+
+Correctness
+- [ ] Explicit opt-in activation. Any OTEL_EXPORTER_OTLP_*ENDPOINT variable activates Relay
+      (packages/plugin-nemo-relay/src/host.ts, start), and OpenCode's own tracing is configured with
+      OTEL_EXPORTER_OTLP_ENDPOINT (packages/util/src/observability.ts). With the pinned
+      nemo-relay-node 0.10.0-rc.4, activation then blocks every model and tool call. See the README's
+      activation TODO: we should have one explicit opt-in, and one failure policy for every startup failure.
+- [ ] Give Relay a collector for streamed calls (src/model.ts, llmStreamCallExecute). The recorded
+      response is assembled from raw provider chunks before Relay's stream intercepts run, so a
+      rewritten or locally answered stream is recorded wrongly. We should pass the accumulator as the collector.
+- [ ] Honor Relay's AbortSignal in unary calls (src/model.ts, the llmCallExecuteAsync callback). Relay
+      passes (request, signal); we should combine the signal into the existing AbortSignal.any.
+- [ ] (unverified) src/tool.ts replaced(): decoding an intercept's substitute result ignores unknown
+      keys, so a substitute such as {answer: 42} becomes an empty tool result.
+
+Architecture
+- [ ] Packaging. packages/core depends on this plugin, so every OpenCode install pulls the native
+      binding. Relay keeps its other host integrations in its own repo (Relay: integrations/openclaw),
+      and OpenCode can load package plugins in-process. We should consider shipping this plugin as a package and
+      keeping only the generic seams in core.
+- [ ] Middleware composition is duplicated at both call sites (packages/core/src/session/model-request.ts,
+      packages/core/src/tool.ts). We may want to add one helper next to PluginHooks.trigger.
+- [ ] The Promise plugin API has no middleware, and the plugin READMEs still describe hooks only. We should add a
+      Promise adapter or document middleware as Effect-only, and name `http` experimental like
+      `experimental.ws.*`.
+- [ ] The five read-only hooks (context.usage, retry.decision, compaction.outcome, usage, permission
+      decision) break the convention that hooks are mutable (the event bus is OpenCode's read-only
+      channel), borrow Relay's metric vocabulary, and bring Object.freeze into core (0 uses before,
+      14 now). They exist only for the observation layer; we may want to drop them.
+
+Observation layer (src/observe.ts, src/metrics.ts, about 1,150 lines)
+- [ ] We need to decide its scope. Only the session scope open and close in observe.ts is required. Relay already
+      records per-call tokens, cost, duration, status, first-chunk time, tool scopes and session nesting.
+      Signals only this layer adds: logical steps versus physical attempts, retry decisions, permission
+      decisions and human waits, compaction outcomes, context pressure against the model's limit,
+      skill and prompt events, time to response headers.
+      Agent-recommended minimal keep-set: retry decisions, permission decisions and waits, compaction outcomes,
+      context pressure.
+- [ ] Remove signals Relay already records: opencode.llm.usage.recorded, opencode.tool.completed,
+      opencode.session.child.created, run durations. (unverified) There are 11 duplicate metrics.
+
+Redundant or verbose code
+- [ ] Use Relay's typed helpers (nemo-relay-node/typed) instead of the plugin's own codec selection
+      (src/model.ts: withCodec, callbacks, support).
+- [ ] Use Effect's SSE parser (effect/encoding/Sse, as packages/ai/src/route/framing.ts does) instead of
+      the parser in src/sse.ts.
+- [ ] Remove dead code: Runtime.scope in src/host.ts (unused); RelaySSE.read and RelaySSE.aggregate
+      (used only by tests).
+- [ ] Move or drop the provider-attempt telemetry in the model bridge (src/model.ts, ProviderAttempt).
+- [ ] Simplify defensive code in src/host.ts: repeated "runtime is stopping" checks, two identical bounded
+      dedupe sets, scope-stack forking written twice.
+- [ ] core: drop the Object.freeze snapshots, simplify the compaction-outcome plumbing (unverified: an
+      extra session history reload per compaction), and deduplicate types between the Effect and
+      Promise plugin APIs.
+- [ ] Relay (crates/node/src/api/mod.rs): builtin_codecs has five identical match arms. Accepting a codec
+      instance through codecDecode, which then requires codecEncode to be omitted, is awkward; a
+      dedicated codec parameter would be clearer.
+
+[Agent recommendation] Before upstreaming
+- [ ] Manage WebSocket model traffic. OpenCode's OpenAI, xAI and Azure provider plugins default to
+      WebSocket transport, which bypasses the http middleware. Until then, set "transport": "http" for
+      those providers.
+- [ ] Signed Bedrock (SigV4) requests are unmanaged. Manage them before signing, or re-sign afterwards.
+- [ ] Compiled CLI binaries don't embed the Relay addon; packages/cli/script/build.ts needs a change.
+- [ ] Trajectories are written only when a scope ends, so a killed process loses its trajectory. Fix in
+      Relay: periodic snapshots, or rebuilding trajectories from the ATOF event log.
+- [ ] Depend on a published Relay release with the pull-based stream bridge (0.11) instead of the
+      0.10.0-rc.4 pin, and upstream the codec-instance support to NVIDIA/NeMo-Relay.
+- [ ] Platform coverage beyond linux-x64 glibc, the only binding built so far.

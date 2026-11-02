@@ -203,9 +203,10 @@ function throughMiddleware(
         (sent) =>
           Effect.gen(function* () {
             const web = yield* HttpClientRequest.toWeb(sent)
-            const response = yield* Effect.tryPromise(async () =>
+            const response = yield* Effect.tryPromise(async (signal) =>
               send(web.url, {
                 ...init,
+                signal: init.signal ? AbortSignal.any([init.signal, signal]) : signal,
                 method: web.method,
                 headers: web.headers,
                 body: web.body ? await web.arrayBuffer() : undefined,
@@ -727,8 +728,15 @@ function streamLanguage(language: LanguageModelV3, options: LanguageModelV3CallO
       Effect.gen(function* () {
         const context = yield* Effect.context<never>()
         return yield* Effect.tryPromise({
-          try: () =>
-            http ? httpMiddleware.run({ http, context }, () => language.doStream(options)) : language.doStream(options),
+          try: (signal) => {
+            const request = {
+              ...options,
+              abortSignal: options.abortSignal ? AbortSignal.any([options.abortSignal, signal]) : signal,
+            }
+            return http
+              ? httpMiddleware.run({ http, context }, () => language.doStream(request))
+              : language.doStream(request)
+          },
           catch: (error) => llmError(error, "request"),
         })
       }).pipe(

@@ -25,3 +25,18 @@ export type ModelHooks<Spec, Failures extends Record<keyof Spec, unknown> = Reco
 ) => Effect.Effect<Registration, never, Scope.Scope>
 
 export type Transform<Input> = (callback: (input: Input) => void) => Effect.Effect<Registration, never, Scope.Scope>
+
+/**
+ * Registers an around-middleware. Unlike hooks, a middleware receives a `next` continuation for the
+ * operation it wraps. Middlewares nest in registration order: the first registered is outermost.
+ */
+export type Middleware<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  middleware: Spec[Name],
+) => Effect.Effect<Registration, never, Scope.Scope>
+
+export type ModelMiddleware<Spec> = <Name extends keyof Spec>(
+  name: Name,
+  middleware: Spec[Name],
+  options?: ModelHookOptions,
+) => Effect.Effect<Registration, never, Scope.Scope>

@@ -172,7 +172,25 @@ const layer = Layer.effect(
 
     const evaluateInput = Effect.fnUntraced(function* (input: AssertInput) {
       const rules = yield* configured(input.sessionID, input.agent)
-      if (denied(input, rules)) return { effect: "deny" as const, rules }
+      const observe = (effect: Permission.Effect, origin: "rules" | "hook") =>
+        hooks.trigger(
+          "permission",
+          "decision",
+          Object.freeze({
+            sessionID: input.sessionID,
+            agent: input.agent,
+            action: input.action,
+            resources: Object.freeze([...input.resources]),
+            ...(input.metadata ? { metadata: Object.freeze({ ...input.metadata }) } : {}),
+            ...(input.source ? { source: Object.freeze({ ...input.source }) } : {}),
+            effect,
+            origin,
+          }),
+        )
+      if (denied(input, rules)) {
+        yield* observe("deny", "rules")
+        return { effect: "deny" as const, rules }
+      }
       const all = [...rules, ...(yield* savedRules())]
       const effects = input.resources.map((resource) => evaluate(input.action, resource, all).effect)
       const effect: Permission.Effect = effects.includes("ask") ? "ask" : "allow"
@@ -185,6 +203,7 @@ const layer = Layer.effect(
         source: input.source,
         effect,
       })
+      yield* observe(event.effect, event.effect === effect ? "rules" : "hook")
       return { effect: event.effect, message: event.message, rules: all }
     })
 

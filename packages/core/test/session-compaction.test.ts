@@ -28,7 +28,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
 import { Shell } from "@opencode/schema/shell"
-import { DateTime, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
@@ -171,6 +171,13 @@ it.effect("auto compaction estimates current content against the buffered prompt
   Effect.gen(function* () {
     const compaction = yield* SessionCompaction.Service
     const session = yield* insertSession(Session.ID.make("ses_input_limit"))
+    const hooks = yield* PluginHooks.Service
+    const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+    yield* hooks.register("session", "compaction.outcome", (event) =>
+      Effect.sync(() => {
+        observed.push(event)
+      }),
+    )
     const input = (tokens: number, limit: { context: number; input?: number; output: number }) => ({
       session,
       model: SessionRunnerModel.resolved(model, {
@@ -208,6 +215,8 @@ it.effect("auto compaction estimates current content against the buffered prompt
     // 90% of the input limit, which takes precedence over the context window.
     const inputLimited = { context: 400_000, input: 272_000, output: 128_000 }
     expect(yield* due(input(244_799, inputLimited))).toBe(false)
+    expect(observed[0]).toMatchObject({ trigger: "auto", status: "skipped", before: 244_799, limit: 400_000 })
+    expect(observed[0]).not.toHaveProperty("after")
     expect(yield* due(input(244_800, inputLimited))).toBe(true)
     const native = (tokens: number, limit: { context: number; input?: number; output: number } = inputLimited) => {
       const selected = input(tokens, limit)
@@ -410,6 +419,18 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     const session = yield* insertSession(sessionID, { parent_id: parentID })
     const hooks = yield* PluginHooks.Service
     let hooked = 0
+    const observed: PluginHooks.Domains["session"]["compaction.outcome"][] = []
+    const usage: PluginHooks.Domains["session"]["usage"][] = []
+    yield* hooks.register("session", "compaction.outcome", (event) =>
+      Effect.sync(() => {
+        observed.push(event)
+      }),
+    )
+    yield* hooks.register("session", "usage", (event) =>
+      Effect.sync(() => {
+        usage.push(event)
+      }),
+    )
     yield* hooks.register("session", "compaction", (event) =>
       Effect.sync(() => {
         hooked = event.messages.length
@@ -448,6 +469,19 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     ])
 
     expect(requests).toHaveLength(1)
+    expect(usage).toHaveLength(1)
+    expect(usage[0]).toMatchObject({ source: "compaction", costSource: "host_calculated", cost: 0.0000233 })
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).toMatchObject({
+      trigger: "manual",
+      status: "completed",
+      limit: 200_000,
+      summaryEstimatedTokens: 7,
+      retainedEstimatedTokens: 0,
+    })
+    expect(observed[0]?.before).toBeGreaterThan(0)
+    expect(observed[0]?.after).toBeGreaterThan(0)
+    expect(observed[0]?.sourceEstimatedTokens).toBeGreaterThan(0)
     expect(requests[0]?.promptCacheKey).toBe(parentID)
     expect(requests[0]?.http?.headers).toEqual({
       "x-opencode-session-id": session.id,
@@ -546,6 +580,56 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
     ])
+  }),
+)
+
+it.effect("cancelling a slow terminal observer does not change an already completed compaction", () =>
+  Effect.gen(function* () {
+    const session = yield* insertSession(Session.ID.make("ses_compaction_observer_cancel"))
+    const hooks = yield* PluginHooks.Service
+    const compaction = yield* SessionCompaction.Service
+    const db = (yield* Database.Service).db
+    const observed: string[] = []
+    const completed = yield* Deferred.make<void>()
+    yield* hooks.register("session", "compaction.outcome", (event) =>
+      Effect.sync(() => {
+        observed.push(event.status)
+      }).pipe(
+        Effect.andThen(
+          event.status === "completed"
+            ? Deferred.succeed(completed, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void,
+        ),
+      ),
+    )
+    const pending = yield* compaction
+      .compact({
+        reason: "overflow",
+        context: loaded(session, [
+          SessionMessage.User.make({
+            id: SessionMessage.ID.create(),
+            type: "user",
+            text: "Summarize this conversation",
+            time: { created: DateTime.makeUnsafe(0) },
+          }),
+        ]),
+      })
+      .pipe(Effect.forkScoped)
+    yield* Deferred.await(completed)
+    yield* Fiber.interrupt(pending)
+    expect(observed).toEqual(["completed"])
+    const terminal = yield* db
+      .select({ type: EventTable.type })
+      .from(EventTable)
+      .where(eq(EventTable.aggregate_id, session.id))
+      .all()
+      .pipe(Effect.orDie)
+    expect(
+      terminal.filter((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Failed.type, 1)),
+    ).toEqual([])
+    expect(
+      terminal.filter((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Ended.type, 1)),
+    ).toHaveLength(1)
   }),
 )
 

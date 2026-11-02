@@ -256,6 +256,7 @@ const layer = Layer.effect(
               agent: loaded.agent.id,
               model: loaded.model.ref,
               hook: prepared.retry,
+              observe: prepared.retryDecision,
               retry: proposed,
             }),
           recoverContinuation,

@@ -37,6 +37,13 @@ export function calculateCost(costs: Model.Info["cost"], usage: TokenUsage.Info)
 
 export type Recorded = { readonly tokens: TokenUsage.Info; readonly cost: Money.USD }
 
+/** Observers receive a snapshot, not the mutable charge retained for later aggregation. */
+export const snapshot = (usage: Recorded): Recorded =>
+  Object.freeze({
+    cost: usage.cost,
+    tokens: Object.freeze({ ...usage.tokens, cache: Object.freeze({ ...usage.tokens.cache }) }),
+  })
+
 export const record = (usage: Usage | undefined, costs: Model.Info["cost"]): Recorded => {
   const normalized = tokens(usage)
   return { tokens: normalized, cost: calculateCost(costs, normalized) }

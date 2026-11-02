@@ -64,6 +64,7 @@ export interface Prepared<Event = SessionRequest> {
   readonly request: LLMRequest
   readonly options: StreamOptions
   readonly retry: (event: PluginHooks.Domains["session"]["retry"]) => Effect.Effect<void>
+  readonly retryDecision: (event: PluginHooks.Domains["session"]["retry.decision"]) => Effect.Effect<void>
   /** Runs a tool call against the tools this request advertised. */
   readonly executeTool: (
     input: Parameters<Tool.Snapshot["execute"]>[0],
@@ -239,6 +240,16 @@ export const layer = Layer.effect(
       const session = input.session
       const model = input.model
       const scope = { sessionID: session.id, agent: input.agent, model: model.ref, kind }
+      if (kind === "primary" && input.inputTokens)
+        yield* hooks.trigger(
+          "session",
+          "context.usage",
+          Object.freeze({
+            ...scope,
+            ...input.inputTokens,
+            ...(model.limit.context > 0 ? { limit: model.limit.context } : {}),
+          }),
+        )
       const tools = input.tools ?? {
         definitions: [],
         execute: () => new Tool.Error({ message: "Tools are not available for this request" }),
@@ -337,32 +348,46 @@ export const layer = Layer.effect(
       const hasHttpHooks =
         (yield* hooks.has("session", "http.request", model.ref.providerID)) ||
         (yield* hooks.has("session", "http.response", model.ref.providerID))
-      const http: StreamOptions["http"] = hasHttpHooks
-        ? (req, handler) =>
-            Effect.gen(function* () {
-              const before = yield* hooks.trigger("session", "http.request", {
-                ...scope,
-                request: yield* HttpClientRequest.toWeb(req),
-              })
-              let sent = HttpClientRequest.fromWeb(before.request)
-              if (before.request.body)
-                sent = HttpClientRequest.bodyUint8Array(
-                  sent,
-                  new Uint8Array(yield* Effect.promise(() => before.request.clone().arrayBuffer())),
-                  before.request.headers.get("content-type") ?? undefined,
-                )
-              const res = yield* handler(sent)
-              const after = yield* hooks.trigger("session", "http.response", {
-                ...scope,
-                request: before.request,
-                response: new Response(
-                  [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
-                  { status: res.status, headers: res.headers },
-                ),
-              })
-              return HttpClientResponse.fromWeb(sent, after.response)
-            }).pipe(Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))))
-        : undefined
+      const middlewares = yield* hooks.middlewares("session", "http", model.ref.providerID)
+      const call = { ...scope, protocol: request.model.route.protocol }
+      const http: StreamOptions["http"] =
+        hasHttpHooks || middlewares.length > 0
+          ? (req, handler) =>
+              Effect.gen(function* () {
+                const before = yield* hooks.trigger("session", "http.request", {
+                  ...scope,
+                  request: yield* HttpClientRequest.toWeb(req),
+                })
+                // A middleware may answer without sending, so the response belongs to the last request sent, if any.
+                let sent = req
+                const send = (input: Request) =>
+                  Effect.gen(function* () {
+                    sent = input.body
+                      ? HttpClientRequest.bodyUint8Array(
+                          HttpClientRequest.fromWeb(input),
+                          new Uint8Array(yield* Effect.promise(() => input.clone().arrayBuffer())),
+                          input.headers.get("content-type") ?? undefined,
+                        )
+                      : HttpClientRequest.fromWeb(input)
+                    const res = yield* handler(sent)
+                    return new Response(
+                      [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
+                      { status: res.status, headers: res.headers },
+                    )
+                  })
+                const response = yield* middlewares.reduceRight(
+                  (next: (input: Request) => Effect.Effect<Response, Error>, middleware) => (input: Request) =>
+                    middleware({ ...call, request: input }, next),
+                  send,
+                )(before.request)
+                const after = yield* hooks.trigger("session", "http.response", {
+                  ...scope,
+                  request: before.request,
+                  response,
+                })
+                return HttpClientResponse.fromWeb(sent, after.response)
+              }).pipe(Effect.mapError((cause) => (cause instanceof Error ? cause : new Error(String(cause)))))
+          : undefined
       // HTTP hooks wrap every HTTP request, including the WebSocket fallback path. The route decides
       // which transport actually carries the request, so both hook families are always offered.
       const webSocket =
@@ -397,6 +422,8 @@ export const layer = Layer.effect(
         options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
+        retryDecision: (event: Parameters<Prepared["retryDecision"]>[0]) =>
+          hooks.trigger("session", "retry.decision", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot
         // catch them and turn a "no" into model-visible output. Recover them here as failures.
         executeTool: (call: Parameters<Prepared["executeTool"]>[0]) =>

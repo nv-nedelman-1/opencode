@@ -471,6 +471,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
       reload: tools.reload,
       list: tools.list,
       hook: (name, callback) => hooks.register("tool", name, callback),
+      middleware: (name, middleware) => hooks.use("tool", name, middleware),
     },
     vcs: {
       get: () => response(vcs.info()),
@@ -533,6 +534,7 @@ export const make = Effect.fn("PluginHost.make")(function* (
     },
     session: {
       hook: (name, callback, options) => hooks.register("session", name, callback, options),
+      middleware: (name, middleware, options) => hooks.use("session", name, middleware, options),
       create: (input) =>
         sessions.create({
           id: input?.id,

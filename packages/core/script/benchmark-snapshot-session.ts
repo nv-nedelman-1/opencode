@@ -147,6 +147,7 @@ const run = (snapshots: Layer.Layer<Snapshot.Service>) =>
           model,
           prepared: {
             retry: () => Effect.void,
+            retryDecision: () => Effect.void,
             request: LLM.request({ model: model.model, prompt: "bench" }),
             options: {},
             executeTool: (input) =>
