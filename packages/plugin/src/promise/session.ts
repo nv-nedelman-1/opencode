@@ -80,6 +80,11 @@ export interface SessionHttpRequest {
   readonly model: Model.Ref
   readonly kind: SessionRequestKind
   request: Request
+  /**
+   * Set to answer the request with this response instead of sending it; `http.response` hooks still run with it.
+   * The event starts with `response: undefined`, so a plugin can check `"response" in event` for support.
+   */
+  response?: Response
 }
 
 export interface SessionHttpResponse {

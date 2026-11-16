@@ -129,6 +129,44 @@ describe("SessionModelRequest HTTP hooks", () => {
     }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
   )
 
+  it.effect("answers a request with a response an http.request hook supplies, without sending it", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const seen: string[] = []
+      yield* hooks.register("session", "http.request", (event) =>
+        Effect.sync(() => {
+          seen.push(`request:${"response" in event}`)
+          event.response = Response.json({ error: { message: "answered by plugin" } }, { status: 403 })
+        }),
+      )
+      yield* hooks.register("session", "http.response", (event) =>
+        Effect.sync(() => void seen.push(`response:${event.response.status}`)),
+      )
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+      const prepared = yield* requests.primary({
+        session,
+        agent: Agent.ID.make("build"),
+        model,
+        system: [],
+        messages: [],
+      })
+      const http = prepared.options.http
+      if (!http) throw new Error("Expected HTTP middleware")
+      let sent = 0
+      const response = yield* http(HttpClientRequest.post("https://example.test/v1/chat/completions"), (request) =>
+        Effect.sync(() => {
+          sent += 1
+          return HttpClientResponse.fromWeb(request, new Response("{}", { status: 200 }))
+        }),
+      )
+
+      expect(sent).toBe(0)
+      expect(response.status).toBe(403)
+      expect(yield* response.json).toEqual({ error: { message: "answered by plugin" } })
+      expect(seen).toEqual(["request:true", "response:403"])
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
   it.effect("keeps hook edits to a tool schema out of later requests", () =>
     Effect.gen(function* () {
       const hooks = yield* PluginHooks.Service

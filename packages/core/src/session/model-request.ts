@@ -339,7 +339,7 @@ export const layer = Layer.effect(
         ? (req, handler) =>
             Effect.gen(function* () {
               const request = yield* HttpClientRequest.toWeb(req)
-              const before = yield* hooks.trigger("session", "http.request", { ...scope, request })
+              const before = yield* hooks.trigger("session", "http.request", { ...scope, request, response: undefined })
               // A hook that kept the request object cannot have replaced its body, so the original body is sent as is.
               // Reading it back would hold a second full copy of the request, screenshots included, for the whole call.
               const sent =
@@ -352,14 +352,16 @@ export const layer = Layer.effect(
                         before.request.headers.get("content-type") ?? undefined,
                       )
                     : HttpClientRequest.fromWeb(before.request)
-              const res = yield* handler(sent)
+              const res = before.response ? undefined : yield* handler(sent)
               const after = yield* hooks.trigger("session", "http.response", {
                 ...scope,
                 request: before.request,
-                response: new Response(
-                  [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
-                  { status: res.status, headers: res.headers },
-                ),
+                response: res
+                  ? new Response(
+                      [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
+                      { status: res.status, headers: res.headers },
+                    )
+                  : before.response!,
               })
               return HttpClientResponse.fromWeb(sent, after.response)
             })
