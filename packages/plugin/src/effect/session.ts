@@ -82,6 +82,8 @@ export interface SessionHttpRequest {
   request: Request
   /**
    * Set to answer the request with this response instead of sending it; `http.response` hooks still run with it.
+   * Every `http.request` hook runs, in registration order, and the response left on the event after the last one
+   * is the answer: a later hook sees an earlier hook's response and can replace it, or clear it to send the request.
    * The event starts with `response: undefined`, so a plugin can check `"response" in event` for support.
    */
   response?: Response

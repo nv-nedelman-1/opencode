@@ -340,10 +340,12 @@ export const layer = Layer.effect(
             Effect.gen(function* () {
               const request = yield* HttpClientRequest.toWeb(req)
               const before = yield* hooks.trigger("session", "http.request", { ...scope, request, response: undefined })
+              // A request a hook answered is never sent, so its body is not read.
               // A hook that kept the request object cannot have replaced its body, so the original body is sent as is.
               // Reading it back would hold a second full copy of the request, screenshots included, for the whole call.
-              const sent =
-                before.request === request
+              const sent = before.response
+                ? HttpClientRequest.fromWeb(before.request)
+                : before.request === request
                   ? HttpClientRequest.setBody(HttpClientRequest.fromWeb(request), req.body)
                   : before.request.body
                     ? HttpClientRequest.bodyUint8Array(

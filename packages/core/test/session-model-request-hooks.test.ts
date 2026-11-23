@@ -7,6 +7,7 @@ import { Session } from "@opencode/schema/session"
 import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { Location } from "@opencode/core/location"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { PluginPromise } from "@opencode/core/plugin/promise"
 import { Project } from "@opencode/core/project"
 import { AbsolutePath } from "@opencode/core/schema"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
@@ -16,6 +17,7 @@ import { DateTime, Effect, Stream } from "effect"
 import { HttpClientRequest, HttpClientResponse } from "effect/http"
 import { testEffect } from "./lib/effect"
 import { PluginTestLayer } from "./plugin/fixture"
+import { host } from "./plugin/host"
 
 const it = testEffect(PluginTestLayer)
 
@@ -164,6 +166,107 @@ describe("SessionModelRequest HTTP hooks", () => {
       expect(response.status).toBe(403)
       expect(yield* response.json).toEqual({ error: { message: "answered by plugin" } })
       expect(seen).toEqual(["request:true", "response:403"])
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
+  // Sends one primary request through the HTTP middleware; `sent` counts the requests that reached the provider.
+  const sendPrimary = Effect.gen(function* () {
+    const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+    const prepared = yield* requests.primary({
+      session,
+      agent: Agent.ID.make("build"),
+      model,
+      system: [],
+      messages: [],
+    })
+    const http = prepared.options.http
+    if (!http) throw new Error("Expected HTTP middleware")
+    let sent = 0
+    const response = yield* http(HttpClientRequest.post("https://example.test/v1/chat/completions"), (request) =>
+      Effect.sync(() => {
+        sent += 1
+        return HttpClientResponse.fromWeb(request, new Response("{}", { status: 200 }))
+      }),
+    )
+    return { sent, status: response.status }
+  })
+
+  it.effect("does not read the body of a replaced request that a hook also answers", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      // A body that counts how often it is read; `highWaterMark: 0` keeps the stream from reading ahead on its own.
+      let reads = 0
+      const replaced = new Request("https://example.test/v1/chat/completions", {
+        method: "POST",
+        body: new ReadableStream(
+          {
+            pull(controller) {
+              reads += 1
+              controller.enqueue(new TextEncoder().encode('{"big":true}'))
+              controller.close()
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        duplex: "half",
+      })
+      let answered: Request | undefined
+      yield* hooks.register("session", "http.request", (event) =>
+        Effect.sync(() => {
+          event.request = replaced
+          event.response = new Response("{}", { status: 403 })
+        }),
+      )
+      yield* hooks.register("session", "http.response", (event) => Effect.sync(() => void (answered = event.request)))
+
+      expect(yield* sendPrimary).toEqual({ sent: 0, status: 403 })
+      expect(answered).toBe(replaced)
+      expect(reads).toBe(0)
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
+  it.effect("answers with the response the last http.request hook leaves, and sends when a later hook clears it", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      let later: "replace" | "clear" = "replace"
+      const seen: (number | undefined)[] = []
+      yield* hooks.register("session", "http.request", (event) =>
+        Effect.sync(() => void (event.response = new Response("{}", { status: 403 }))),
+      )
+      yield* hooks.register("session", "http.request", (event) =>
+        Effect.sync(() => {
+          seen.push(event.response?.status)
+          event.response = later === "replace" ? new Response("{}", { status: 429 }) : undefined
+        }),
+      )
+
+      expect(yield* sendPrimary).toEqual({ sent: 0, status: 429 })
+      later = "clear"
+      expect(yield* sendPrimary).toEqual({ sent: 1, status: 200 })
+      expect(seen).toEqual([403, 403])
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
+  it.effect("answers a request with a response a Promise plugin's http.request hook supplies", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      yield* PluginPromise.fromPromise({
+        id: "answering-plugin",
+        async setup(context) {
+          await context.session.hook("http.request", (event) => {
+            event.response = Response.json({ error: { message: "answered by plugin" } }, { status: 403 })
+          })
+        },
+      }).effect(
+        host({
+          session: {
+            ...host().session,
+            hook: (name, callback, options) => hooks.register("session", name, callback, options),
+          },
+        }),
+      )
+
+      expect(yield* sendPrimary).toEqual({ sent: 0, status: 403 })
     }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
   )
 
